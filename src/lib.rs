@@ -35,6 +35,21 @@ struct DurableState {
 }
 
 impl DurableState {
+    fn new(data_directory: &str, id: u32) -> DurableState {
+	let file = std::fs::File::options()
+	    .create(true)
+	    .read(true)
+	    .write(true)
+	    .open(format!("{}/server_{}.data", data_directory, id))
+	    .expect("Could not open data file.");
+	return DurableState{
+	    file: file,
+	    current_term: 0,
+	    voted_for: None,
+	    log: Vec::<LogEntry>::new(),
+	};
+    }
+    
     //        ON DISK FORMAT
     //
     // | Byte Range | Value       |
@@ -57,11 +72,19 @@ impl DurableState {
     // divisible by 4k.
 
     fn restore(&mut self) {
+	if let Ok(m) = self.file.metadata() {
+	    if m.len() == 0 {
+		return;
+	    }
+	} else {
+	    return;
+	}
+	
 	let mut metadata: [u8; 4096] = [0; 4096];
 	self.file.read_exact_at(&mut metadata[0..], 0).expect("Could not read server metadata.");
 
 	self.current_term = u64::from_le_bytes(metadata[0..8].try_into().unwrap());
-	let did_vote = metadata[9] == 1;
+	let did_vote = metadata[8] == 1;
 	if did_vote {
 	    self.voted_for = Some(u32::from_le_bytes(metadata[9..13].try_into().unwrap()));
 	}
@@ -72,8 +95,8 @@ impl DurableState {
 	    return;
 	}
 
-	self.file.seek(std::io::SeekFrom::Start(4096));
-	let reader = std::io::BufReader::new(self.file);
+	self.file.seek(std::io::SeekFrom::Start(4096)).unwrap();
+	let mut reader = std::io::BufReader::new(&self.file);
 	while self.log.len() < log_length {
 	    let mut log_entry = LogEntry{
 		term: 0,
@@ -96,23 +119,41 @@ impl DurableState {
    fn append(&mut self, term: u64, commands: Vec<Command>) {
        let n = commands.len();
 
-       // Write log length metadata.
-       self.file.write_all_at();
-
        // Write out all logs.
        for i in 0..n {
 	   self.log.push(LogEntry{
 	       term: term,
-	       command: commands[i],
+	       // TODO: Do we need this clone here?
+	       command: commands[i].clone(),
 	   });
        }
+
+       // Write log length metadata.
+       self.update(self.current_term, self.voted_for);
     }
 
     // Durably save non-log data.
-    fn update(&mut self, term: u64, voted_for, Option<u32>) {
+    fn update(&mut self, term: u64, voted_for: Option<u32>) {
 	self.current_term = term;
 	self.voted_for = voted_for;
 
+	let mut metadata: [u8; 4096] = [0; 4096];
+	metadata[0..8].copy_from_slice(&term.to_le_bytes());
+
+	if let Some(v) = voted_for {
+	    metadata[8] = 1;
+	    metadata[9..13].copy_from_slice(&v.to_le_bytes());
+	} else {
+	    metadata[8] = 0;
+	}
+
+	let log_length = self.log.len() as u64;
+	metadata[13..21].copy_from_slice(&log_length.to_le_bytes());
+
+	self.file.write_all_at(&metadata, 0).unwrap();
+
+	// fsync.
+	self.file.sync_all().unwrap();
     }
 }
 
@@ -207,24 +248,24 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
 
     }
 
-    pub fn start(&mut self) {
-	 std::thread::spawn(move || {
-	    let listener = std::net::TcpListener::bind("127.0.0.1:80")
-		.expect("Could not bind to port.");
+    // pub fn start(&mut self) {
+    // 	 std::thread::spawn(move || {
+    // 	    let listener = std::net::TcpListener::bind("127.0.0.1:80")
+    // 		.expect("Could not bind to port.");
 
-	    for stream in listener.incoming() {
-		let state = self.state.lock().unwrap();
-		if state.tcp_done {
-		    break;
-		}
-		drop(state);
+    // 	    for stream in listener.incoming() {
+    // 		let state = self.state.lock().unwrap();
+    // 		if state.tcp_done {
+    // 		    break;
+    // 		}
+    // 		drop(state);
 
-		if let std::io::Result::Ok(s) = stream {
-		    self.handle_request(s);
-		}
-	    }
-	});
-    }
+    // 		if let std::io::Result::Ok(s) = stream {
+    // 		    self.handle_request(s);
+    // 		}
+    // 	    }
+    // 	});
+    // }
 
     pub fn stop(&mut self) {
 	let mut state = self.state.lock().unwrap();
@@ -244,13 +285,7 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
 	    sm: sm,
 
 	    state: std::sync::Mutex::new(State{
-		durable_state: DurableState{
-		    file: std::fs::File::open(format!("{}/server_{}.data", data_directory, id))
-			.expect("Could not open data file."),
-		    current_term: 0,
-		    voted_for: None,
-		    log: Vec::<LogEntry>::new(),
-		},
+		durable_state: DurableState::new(data_directory, id),
 		volatile_state: VolatileState::new(cluster_size),
 
 		tcp_done: false,
@@ -259,6 +294,41 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
     }
 }
 
-fn main() {
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn init() -> String {
+	let dir = "test";
+	let _ = std::fs::remove_dir_all(dir); // Ok if this fails.
+	std::fs::create_dir_all(dir).unwrap();
+	return dir.to_owned();
+    }
+
+    #[test]
+    fn test_save_and_restore() {
+	let dir = init();
+
+	let mut durable_state = DurableState::new(dir.as_str(), 1);
+	durable_state.restore();
+	assert_eq!(durable_state.current_term, 0);
+	assert_eq!(durable_state.voted_for, None);
+	assert_eq!(durable_state.log.len(), 0);
+
+	durable_state.update(10234, Some(40592));
+	assert_eq!(durable_state.current_term, 10234);
+	assert_eq!(durable_state.voted_for, Some(40592));
+	assert_eq!(durable_state.log.len(), 0);
+	drop(durable_state);
+
+	let mut durable_state = DurableState::new(dir.as_str(), 1);
+	assert_eq!(durable_state.current_term, 0);
+	assert_eq!(durable_state.voted_for, None);
+	assert_eq!(durable_state.log.len(), 0);
+
+	durable_state.restore();
+	assert_eq!(durable_state.current_term, 10234);
+	assert_eq!(durable_state.voted_for, Some(40592));
+	assert_eq!(durable_state.log.len(), 0);
+    }
 }
