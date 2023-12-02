@@ -7,15 +7,13 @@ use std::os::unix::prelude::FileExt;
 
 const PAGESIZE: u64 = 4096;
 
-pub type Command = Vec<u8>;
-
 pub enum ApplyResult {
     NotALeader,
-    Ok(Vec<Command>),
+    Ok(Vec<Vec<u8>>),
 }
 
 pub trait StateMachine {
-    fn apply(self, messages: Vec<Command>) -> ApplyResult;
+    fn apply(self, messages: &[&[u8]]) -> ApplyResult;
 }
 
 pub struct Config {
@@ -24,7 +22,7 @@ pub struct Config {
 }
 
 struct LogEntry {
-    command: Command,
+    command: Vec<u8>,
     term: u64,
 }
 
@@ -62,12 +60,14 @@ impl DurableState {
     //
     // | Byte Range | Value          |
     // |------------|----------------|
-    // | 0 - 8      | Term           |
-    // | 8 - 9      | Did Vote       |
-    // | 9 - 13     | Voted For      |
-    // | 13 - 21    | Log Length     |
-    // | 21 - 29    | Next Log Entry |
-    // | 29 - 33    | Checksum       |
+    // | 0 - 4      | Magic Number   |
+    // | 4 - 8      | Format Version |
+    // | 8 - 16     | Term           |
+    // | 16 - 17    | Did Vote       |
+    // | 17 - 21    | Voted For      |
+    // | 21 - 29    | Log Length     |
+    // | 29 - 37    | Next Log Entry |
+    // | 37 - 41    | Checksum       |
     // | PAGESIZE - EOF | Log Entries    |
     //
     //           ON DISK LOG ENTRY FORMAT
@@ -96,17 +96,25 @@ impl DurableState {
             .read_exact_at(&mut metadata[0..], 0)
             .expect("Could not read server metadata.");
 
-        self.current_term = u64::from_le_bytes(metadata[0..8].try_into().unwrap());
-        let did_vote = metadata[8] == 1;
+	// Magic number check.
+	assert_eq!(metadata[0..4], 0xFABEF15E_u32.to_le_bytes());
+
+	// Version number check.
+	assert_eq!(metadata[4..8], 1_u32.to_le_bytes());
+
+        self.current_term = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
+        let did_vote = metadata[16] == 1;
         if did_vote {
-            self.voted_for = Some(u32::from_le_bytes(metadata[9..13].try_into().unwrap()));
+            self.voted_for = Some(u32::from_le_bytes(metadata[17..21].try_into().unwrap()));
         }
 
-        let log_length = u64::from_le_bytes(metadata[13..21].try_into().unwrap()) as usize;
+        let log_length = u64::from_le_bytes(metadata[21..29].try_into().unwrap()) as usize;
         self.log = Vec::with_capacity(log_length);
         if log_length == 0 {
             return;
         }
+
+	self.next_log_entry = u64::from_le_bytes(metadata[29..37].try_into().unwrap());
 
         // TODO: Checksum.
 
@@ -122,6 +130,7 @@ impl DurableState {
             reader.read_exact(&mut metadata[0..]).unwrap();
             log_entry.term = u64::from_le_bytes(metadata[0..8].try_into().unwrap());
             let command_length = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
+	    assert!(command_length > 0 && command_length < 20);
             log_entry.command.resize(command_length as usize, b'0');
 
             // TODO: Checksum.
@@ -137,7 +146,7 @@ impl DurableState {
     }
 
     // Durably add logs to disk.
-    fn append(&mut self, commands: Vec<Command>) {
+    fn append(&mut self, commands: &[&[u8]]) {
         self.file
             .seek(std::io::SeekFrom::Start(self.next_log_entry))
             .unwrap();
@@ -147,7 +156,7 @@ impl DurableState {
             let mut entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
-                command: command.clone(),
+                command: command.to_vec(),
             };
 
             let mut metadata: [u8; 20] = [0; 20];
@@ -162,13 +171,14 @@ impl DurableState {
 
             // Pad until the next page boundary.
             let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
-            self.next_log_entry += rest_before_page_boundary;
             // There's probably a more efficient way to do this.
             entry.command.resize(
                 entry.command.len() + rest_before_page_boundary as usize,
                 b'0',
             );
             self.file.write_all(&entry.command[0..]).unwrap();
+	    self.next_log_entry += 20 + entry.command.len() as u64;
+	    assert_eq!(self.next_log_entry % PAGESIZE, 0);
 
             self.log.push(entry);
         }
@@ -183,17 +193,24 @@ impl DurableState {
         self.voted_for = voted_for;
 
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
-        metadata[0..8].copy_from_slice(&term.to_le_bytes());
+	// Magic number.
+	metadata[0..4].copy_from_slice(&0xFABEF15E_u32.to_le_bytes());
+	// Version.
+	metadata[4..8].copy_from_slice(&1_u32.to_le_bytes());
+
+        metadata[8..16].copy_from_slice(&term.to_le_bytes());
 
         if let Some(v) = voted_for {
-            metadata[8] = 1;
-            metadata[9..13].copy_from_slice(&v.to_le_bytes());
+            metadata[16] = 1;
+            metadata[17..21].copy_from_slice(&v.to_le_bytes());
         } else {
-            metadata[8] = 0;
+            metadata[16] = 0;
         }
 
         let log_length = self.log.len() as u64;
-        metadata[13..21].copy_from_slice(&log_length.to_le_bytes());
+        metadata[21..29].copy_from_slice(&log_length.to_le_bytes());
+
+	metadata[29..37].copy_from_slice(&self.next_log_entry.to_le_bytes());
 
         // TODO: Checksum.
 
@@ -258,7 +275,7 @@ pub struct Server<SM: StateMachine + std::marker::Send> {
 }
 
 impl<SM: StateMachine + std::marker::Send> Server<SM> {
-    pub fn apply(&mut self, commands: Vec<Command>) -> ApplyResult {
+    pub fn apply(&mut self, commands: &[&[u8]]) -> ApplyResult {
         // Append commands to local durable state if leader.
         let mut state = self.state.lock().unwrap();
         if !matches!(state.volatile_state.condition, Condition::Leader) {
@@ -282,7 +299,7 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
 
         // Return results of messages.
         let state = self.state.lock().unwrap();
-        let mut results = Vec::<Command>::with_capacity(to_add);
+        let mut results = Vec::<Vec<u8>>::with_capacity(to_add);
         for log_entry in state.durable_state.log[prev_length..to_add].iter() {
             results.push(log_entry.command.clone());
         }
@@ -351,17 +368,22 @@ mod tests {
         dir: std::path::PathBuf,
     }
 
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     impl TmpDir {
         fn new() -> TmpDir {
-            let dir = format!("test{}", COUNTER.load(std::sync::atomic::Ordering::SeqCst));
-            COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = std::fs::remove_dir_all(&dir); // Ok if this fails.
-            std::fs::create_dir_all(&dir).unwrap();
-            return TmpDir { dir: dir.into() };
+	    let mut counter: u32 = 0;
+	    loop {
+		let dir = format!("test{}", counter);
+		// Atomically try to create a new directory.
+		if std::fs::create_dir(&dir).is_ok() {
+		    return TmpDir { dir: dir.into() };
+		}
+
+		counter += 1;
+	    }
         }
     }
 
+    // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.dir).unwrap();
@@ -398,14 +420,17 @@ mod tests {
     #[test]
     fn test_log_append() {
         let tmp = TmpDir::new();
-        let mut durable_state = DurableState::new(&tmp.dir, 1);
 
         let mut v = Vec::new();
         v.push(b"abcdef123456"[0..].into());
         v.push(b"foobar"[0..].into());
-        durable_state.append(v);
+
+	// Write two entries and shut down.
+        let mut durable_state = DurableState::new(&tmp.dir, 1);
+        durable_state.append(&v);
         drop(durable_state);
 
+	// Start up and restore. Should have two entries.
         let mut durable_state = DurableState::new(&tmp.dir, 1);
         durable_state.restore();
         assert_eq!(durable_state.log.len(), 2);
@@ -413,5 +438,22 @@ mod tests {
         assert_eq!(durable_state.log[0].command, b"abcdef123456"[0..]);
         assert_eq!(durable_state.log[1].term, 0);
         assert_eq!(durable_state.log[1].command, b"foobar"[0..]);
+
+	// Add in double the existing entries and shut down.
+	durable_state.append(&v);
+	drop(durable_state);
+
+	// Start up and restore. Should now have four entries.
+	let mut durable_state = DurableState::new(&tmp.dir, 1);
+        durable_state.restore();
+        assert_eq!(durable_state.log.len(), 4);
+        assert_eq!(durable_state.log[0].term, 0);
+        assert_eq!(durable_state.log[0].command, b"abcdef123456"[0..]);
+        assert_eq!(durable_state.log[1].term, 0);
+        assert_eq!(durable_state.log[1].command, b"foobar"[0..]);
+	assert_eq!(durable_state.log[2].term, 0);
+        assert_eq!(durable_state.log[2].command, b"abcdef123456"[0..]);
+        assert_eq!(durable_state.log[3].term, 0);
+        assert_eq!(durable_state.log[3].command, b"foobar"[0..]);
     }
 }
