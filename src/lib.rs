@@ -40,9 +40,9 @@ struct DurableState {
 }
 
 impl DurableState {
-    fn new(data_directory: &std::path::PathBuf, id: u32) -> DurableState {
-	let mut filename = data_directory.clone();
-	filename.push(format!("server_{}.data", id));
+    fn new(data_directory: &std::path::Path, id: u32) -> DurableState {
+        let mut filename = data_directory.to_path_buf();
+        filename.push(format!("server_{}.data", id));
         let file = std::fs::File::options()
             .create(true)
             .read(true)
@@ -322,7 +322,12 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
         state.durable_state.restore();
     }
 
-    pub fn new(id: u32, data_directory: &std::path::PathBuf, sm: SM, cluster: Vec<Config>) -> Server<SM> {
+    pub fn new(
+        id: u32,
+        data_directory: &std::path::Path,
+        sm: SM,
+        cluster: Vec<Config>,
+    ) -> Server<SM> {
         let cluster_size = cluster.len();
         Server {
             cluster,
@@ -343,27 +348,24 @@ mod tests {
     use super::*;
 
     struct TmpDir {
-	dir: std::path::PathBuf,
+        dir: std::path::Path,
     }
 
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     impl TmpDir {
-	fn new() -> TmpDir {
+        fn new() -> TmpDir {
             let dir = format!("test{}", COUNTER.load(std::sync::atomic::Ordering::SeqCst));
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = std::fs::remove_dir_all(&dir); // Ok if this fails.
             std::fs::create_dir_all(&dir).unwrap();
-            return TmpDir{
-		dir: dir.into(),
-	    };
-	}
+            return TmpDir { dir: dir.into() };
+        }
     }
 
     impl Drop for TmpDir {
-	fn drop(&mut self) {
-	    println!("HERE {:?}", self.dir);
-	    std::fs::remove_dir_all(&self.dir).unwrap();
-	}
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
     }
 
     #[test]
