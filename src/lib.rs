@@ -104,6 +104,8 @@ impl DurableState {
             return;
         }
 
+        // TODO: Checksum.
+
         self.file.seek(std::io::SeekFrom::Start(4096)).unwrap();
         let mut reader = std::io::BufReader::new(&self.file);
         while self.log.len() < log_length {
@@ -117,6 +119,8 @@ impl DurableState {
             log_entry.term = u64::from_le_bytes(metadata[0..8].try_into().unwrap());
             let command_length = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
             log_entry.command.resize(command_length as usize, b'0');
+
+            // TODO: Checksum.
 
             reader.read_exact(&mut log_entry.command[0..]).unwrap();
 
@@ -148,11 +152,14 @@ impl DurableState {
             let command_length = entry.command.len() as u64;
             metadata[8..16].copy_from_slice(&command_length.to_le_bytes());
 
+            // TODO: Checksum.
+
             self.file.write_all(&metadata[0..]).unwrap();
 
             // Pad until the next page boundary.
             let rest_before_page_boundary = 4096 - ((20 + command_length) % 4096);
             self.next_log_entry += rest_before_page_boundary;
+            // There's probably a more efficient way to do this.
             entry.command.resize(
                 entry.command.len() + rest_before_page_boundary as usize,
                 b'0',
@@ -183,6 +190,8 @@ impl DurableState {
 
         let log_length = self.log.len() as u64;
         metadata[13..21].copy_from_slice(&log_length.to_le_bytes());
+
+        // TODO: Checksum.
 
         self.file.write_all_at(&metadata, 0).unwrap();
 
