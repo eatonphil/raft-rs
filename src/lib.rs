@@ -40,12 +40,14 @@ struct DurableState {
 }
 
 impl DurableState {
-    fn new(data_directory: &str, id: u32) -> DurableState {
+    fn new(data_directory: &std::path::PathBuf, id: u32) -> DurableState {
+	let mut filename = data_directory.clone();
+	filename.push(format!("server_{}.data", id));
         let file = std::fs::File::options()
             .create(true)
             .read(true)
             .write(true)
-            .open(format!("{}/server_{}.data", data_directory, id))
+            .open(filename)
             .expect("Could not open data file.");
         DurableState {
             file,
@@ -320,7 +322,7 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
         state.durable_state.restore();
     }
 
-    pub fn new(id: u32, data_directory: &str, sm: SM, cluster: Vec<Config>) -> Server<SM> {
+    pub fn new(id: u32, data_directory: &std::path::PathBuf, sm: SM, cluster: Vec<Config>) -> Server<SM> {
         let cluster_size = cluster.len();
         Server {
             cluster,
@@ -340,20 +342,35 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
 mod tests {
     use super::*;
 
+    struct TmpDir {
+	dir: std::path::PathBuf,
+    }
+
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    fn init() -> String {
-        let dir = &format!("test{}", COUNTER.load(std::sync::atomic::Ordering::SeqCst));
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let _ = std::fs::remove_dir_all(dir); // Ok if this fails.
-        std::fs::create_dir_all(dir).unwrap();
-        return dir.to_owned();
+    impl TmpDir {
+	fn new() -> TmpDir {
+            let dir = format!("test{}", COUNTER.load(std::sync::atomic::Ordering::SeqCst));
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::fs::remove_dir_all(&dir); // Ok if this fails.
+            std::fs::create_dir_all(&dir).unwrap();
+            return TmpDir{
+		dir: dir.into(),
+	    };
+	}
+    }
+
+    impl Drop for TmpDir {
+	fn drop(&mut self) {
+	    println!("HERE {:?}", self.dir);
+	    std::fs::remove_dir_all(&self.dir).unwrap();
+	}
     }
 
     #[test]
     fn test_save_and_restore() {
-        let dir = init();
+        let tmp = TmpDir::new();
 
-        let mut durable_state = DurableState::new(dir.as_str(), 1);
+        let mut durable_state = DurableState::new(&tmp.dir, 1);
         durable_state.restore();
         assert_eq!(durable_state.current_term, 0);
         assert_eq!(durable_state.voted_for, None);
@@ -365,7 +382,7 @@ mod tests {
         assert_eq!(durable_state.log.len(), 0);
         drop(durable_state);
 
-        let mut durable_state = DurableState::new(dir.as_str(), 1);
+        let mut durable_state = DurableState::new(&tmp.dir, 1);
         assert_eq!(durable_state.current_term, 0);
         assert_eq!(durable_state.voted_for, None);
         assert_eq!(durable_state.log.len(), 0);
@@ -378,8 +395,8 @@ mod tests {
 
     #[test]
     fn test_log_append() {
-        let dir = init();
-        let mut durable_state = DurableState::new(dir.as_str(), 1);
+        let tmp = TmpDir::new();
+        let mut durable_state = DurableState::new(&tmp.dir, 1);
 
         let mut v = Vec::new();
         v.push(b"abcdef123456"[0..].into());
@@ -387,7 +404,7 @@ mod tests {
         durable_state.append(v);
         drop(durable_state);
 
-        let mut durable_state = DurableState::new(dir.as_str(), 1);
+        let mut durable_state = DurableState::new(&tmp.dir, 1);
         durable_state.restore();
         assert_eq!(durable_state.log.len(), 2);
         assert_eq!(durable_state.log[0].term, 0);
