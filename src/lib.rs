@@ -126,7 +126,7 @@ impl DurableState {
 
             reader.read_exact(&mut log_entry.command[0..]).unwrap();
 
-            // Drop everything until the next page boundary.
+            // Read (and drop) until the next page boundary.
             let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
             reader.consume(rest_before_page_boundary as usize);
 
