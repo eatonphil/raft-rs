@@ -348,7 +348,7 @@ mod tests {
     use super::*;
 
     struct TmpDir {
-        dir: std::path::Path,
+        dir: std::path::PathBuf,
     }
 
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
