@@ -45,13 +45,13 @@ impl DurableState {
             .write(true)
             .open(format!("{}/server_{}.data", data_directory, id))
             .expect("Could not open data file.");
-        return DurableState {
-            file: file,
+        DurableState {
+            file,
             next_log_entry: 4096,
             current_term: 0,
             voted_for: None,
             log: Vec::<LogEntry>::new(),
-        };
+        }
     }
 
     //        ON DISK FORMAT
@@ -130,18 +130,16 @@ impl DurableState {
 
     // Durably add logs to disk.
     fn append(&mut self, commands: Vec<Command>) {
-        let n = commands.len();
-
         self.file
             .seek(std::io::SeekFrom::Start(self.next_log_entry))
             .unwrap();
 
         // Write out all logs.
-        for i in 0..n {
+        for command in commands.iter() {
             let mut entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
-                command: commands[i].clone(),
+                command: command.clone(),
             };
 
             let mut metadata: [u8; 20] = [0; 20];
@@ -213,14 +211,14 @@ struct VolatileState {
 
 impl VolatileState {
     fn new(cluster_size: usize) -> VolatileState {
-        return VolatileState {
+        VolatileState {
             term: 0,
             condition: Condition::Follower,
             commit_index: 0,
             last_applied: 0,
             next_index: Vec::with_capacity(cluster_size),
             match_index: Vec::with_capacity(cluster_size),
-        };
+        }
     }
 
     fn reset(&mut self) {
@@ -276,10 +274,10 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
             results.push(log_entry.command.clone());
         }
         assert!(results.len() == to_add);
-        return ApplyResult::Ok(results);
+        ApplyResult::Ok(results)
     }
 
-    fn handle_request(&mut self, connection: std::net::TcpStream) {}
+    fn handle_request(&mut self, _connection: std::net::TcpStream) {}
 
     // pub fn start(&mut self) {
     // 	 std::thread::spawn(move || {
@@ -313,9 +311,9 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
 
     pub fn new(id: u32, data_directory: &str, sm: SM, cluster: Vec<Config>) -> Server<SM> {
         let cluster_size = cluster.len();
-        return Server {
-            cluster: cluster,
-            sm: sm,
+        Server {
+            cluster,
+            sm,
 
             state: std::sync::Mutex::new(State {
                 durable_state: DurableState::new(data_directory, id),
@@ -323,7 +321,7 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
 
                 tcp_done: false,
             }),
-        };
+        }
     }
 }
 
