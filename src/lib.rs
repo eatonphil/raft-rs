@@ -116,13 +116,13 @@ impl DurableState {
     }
 
     // Durably add logs to disk.
-   fn append(&mut self, term: u64, commands: Vec<Command>) {
+   fn append(&mut self, commands: Vec<Command>) {
        let n = commands.len();
 
        // Write out all logs.
        for i in 0..n {
 	   self.log.push(LogEntry{
-	       term: term,
+	       term: self.current_term,
 	       // TODO: Do we need this clone here?
 	       command: commands[i].clone(),
 	   });
@@ -221,7 +221,7 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
 	let prev_length = state.durable_state.log.len();
 	let to_add = commands.len();
 	let term = state.volatile_state.term;
-	state.durable_state.append(term, commands);
+	state.durable_state.append(commands);
 	drop(state);
 
 	// Wait for messages to be applied. Probably a better way.
@@ -298,8 +298,10 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
 mod tests {
     use super::*;
 
+    static COUNTER : std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     fn init() -> String {
-	let dir = "test";
+	let dir = &format!("test{}", COUNTER.load(std::sync::atomic::Ordering::SeqCst));
+	COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 	let _ = std::fs::remove_dir_all(dir); // Ok if this fails.
 	std::fs::create_dir_all(dir).unwrap();
 	return dir.to_owned();
@@ -330,5 +332,22 @@ mod tests {
 	assert_eq!(durable_state.current_term, 10234);
 	assert_eq!(durable_state.voted_for, Some(40592));
 	assert_eq!(durable_state.log.len(), 0);
+    }
+
+    #[test]
+    fn test_log_append() {
+	let dir = init();
+	let mut durable_state = DurableState::new(dir.as_str(), 1);
+
+	let mut v = Vec::new();
+	v.push(b"abcdef123456"[0..].into());
+	durable_state.append(v);
+	drop(durable_state);
+
+	let mut durable_state = DurableState::new(dir.as_str(), 1);
+	durable_state.restore();
+	assert_eq!(durable_state.log.len(), 1);
+	assert_eq!(durable_state.log[0].term, 0);
+	assert_eq!(durable_state.log[0].command, b"abcdef123456"[0..]);
     }
 }
