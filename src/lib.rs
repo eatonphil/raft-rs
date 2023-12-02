@@ -147,38 +147,53 @@ impl DurableState {
 
     // Durably add logs to disk.
     fn append(&mut self, commands: &[&[u8]]) {
+	// Why is this here? Why does it fail when set to the end of
+	// restore()?
         self.file
             .seek(std::io::SeekFrom::Start(self.next_log_entry))
             .unwrap();
 
-        // Write out all logs.
+	let mut buffer: [u8; PAGESIZE as usize];
+
+	// Write out all logs.
         for command in commands.iter() {
-            let mut entry = LogEntry {
+	    buffer = [0; PAGESIZE as usize];
+	    let entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
                 command: command.to_vec(),
             };
 
-            let mut metadata: [u8; 20] = [0; 20];
-            metadata[0..8].copy_from_slice(&entry.term.to_le_bytes());
+	    let command_length = entry.command.len() as u64;
 
-            let command_length = entry.command.len() as u64;
-            metadata[8..16].copy_from_slice(&command_length.to_le_bytes());
+            buffer[0..8].copy_from_slice(&entry.term.to_le_bytes());
+
+            buffer[8..16].copy_from_slice(&command_length.to_le_bytes());
 
             // TODO: Checksum.
 
-            self.file.write_all(&metadata[0..]).unwrap();
+	    let command_first_page = if command_length <= PAGESIZE - 20 {
+		command_length
+	    } else {
+		PAGESIZE - 20
+	    } as usize;
+	    buffer[20..20+command_first_page].copy_from_slice(&entry.command[0..command_first_page]);
+	    self.file.write_all(&buffer).unwrap();
+	    let mut pages = 1;
+	    let mut written = command_first_page;
+	    while written < entry.command.len() {
+		let to_write = if entry.command.len() - written > PAGESIZE as usize {
+		    PAGESIZE as usize
+		} else {
+		    entry.command.len() - written
+		};
+		buffer.copy_from_slice(&entry.command[written..to_write]);
+		self.file.write_all(&buffer).unwrap();
+		written += PAGESIZE as usize;
+		pages += 1;
+	    }
 
-            // Pad until the next page boundary.
-            let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
-            // There's probably a more efficient way to do this.
-            entry.command.resize(
-                entry.command.len() + rest_before_page_boundary as usize,
-                b'0',
-            );
-            self.file.write_all(&entry.command[0..]).unwrap();
-	    self.next_log_entry += 20 + entry.command.len() as u64;
-	    assert_eq!(self.next_log_entry % PAGESIZE, 0);
+	    self.next_log_entry += pages * PAGESIZE;
 
             self.log.push(entry);
         }
@@ -386,7 +401,7 @@ mod tests {
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.dir).unwrap();
+           // std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
@@ -427,6 +442,7 @@ mod tests {
 
 	// Write two entries and shut down.
         let mut durable_state = DurableState::new(&tmp.dir, 1);
+	durable_state.restore();
         durable_state.append(&v);
         drop(durable_state);
 
@@ -440,6 +456,7 @@ mod tests {
         assert_eq!(durable_state.log[1].command, b"foobar"[0..]);
 
 	// Add in double the existing entries and shut down.
+	v.reverse();
 	durable_state.append(&v);
 	drop(durable_state);
 
@@ -452,8 +469,8 @@ mod tests {
         assert_eq!(durable_state.log[1].term, 0);
         assert_eq!(durable_state.log[1].command, b"foobar"[0..]);
 	assert_eq!(durable_state.log[2].term, 0);
-        assert_eq!(durable_state.log[2].command, b"abcdef123456"[0..]);
-        assert_eq!(durable_state.log[3].term, 0);
-        assert_eq!(durable_state.log[3].command, b"foobar"[0..]);
+        assert_eq!(durable_state.log[2].command, b"foobar"[0..]);
+	assert_eq!(durable_state.log[3].term, 0);
+        assert_eq!(durable_state.log[3].command, b"abcdef123456"[0..]);
     }
 }
