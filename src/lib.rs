@@ -5,6 +5,8 @@ use std::io::Seek;
 use std::io::Write;
 use std::os::unix::prelude::FileExt;
 
+const PAGESIZE: u64 = 4096;
+
 pub type Command = Vec<u8>;
 
 pub enum ApplyResult {
@@ -47,7 +49,7 @@ impl DurableState {
             .expect("Could not open data file.");
         DurableState {
             file,
-            next_log_entry: 4096,
+            next_log_entry: PAGESIZE as u64,
             current_term: 0,
             voted_for: None,
             log: Vec::<LogEntry>::new(),
@@ -64,7 +66,7 @@ impl DurableState {
     // | 13 - 21    | Log Length     |
     // | 21 - 29    | Next Log Entry |
     // | 29 - 33    | Checksum       |
-    // | 4096 - EOF | Log Entries    |
+    // | PAGESIZE - EOF | Log Entries    |
     //
     //           ON DISK LOG ENTRY FORMAT
     //
@@ -87,7 +89,7 @@ impl DurableState {
             return;
         }
 
-        let mut metadata: [u8; 4096] = [0; 4096];
+        let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         self.file
             .read_exact_at(&mut metadata[0..], 0)
             .expect("Could not read server metadata.");
@@ -106,7 +108,7 @@ impl DurableState {
 
         // TODO: Checksum.
 
-        self.file.seek(std::io::SeekFrom::Start(4096)).unwrap();
+        self.file.seek(std::io::SeekFrom::Start(PAGESIZE as u64)).unwrap();
         let mut reader = std::io::BufReader::new(&self.file);
         while self.log.len() < log_length {
             let mut log_entry = LogEntry {
@@ -125,7 +127,7 @@ impl DurableState {
             reader.read_exact(&mut log_entry.command[0..]).unwrap();
 
             // Drop everything until the next page boundary.
-            let rest_before_page_boundary = 4096 - ((20 + command_length) % 4096);
+            let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
             reader.consume(rest_before_page_boundary as usize);
 
             self.log.push(log_entry);
@@ -157,7 +159,7 @@ impl DurableState {
             self.file.write_all(&metadata[0..]).unwrap();
 
             // Pad until the next page boundary.
-            let rest_before_page_boundary = 4096 - ((20 + command_length) % 4096);
+            let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
             self.next_log_entry += rest_before_page_boundary;
             // There's probably a more efficient way to do this.
             entry.command.resize(
@@ -178,7 +180,7 @@ impl DurableState {
         self.current_term = term;
         self.voted_for = voted_for;
 
-        let mut metadata: [u8; 4096] = [0; 4096];
+        let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         metadata[0..8].copy_from_slice(&term.to_le_bytes());
 
         if let Some(v) = voted_for {
