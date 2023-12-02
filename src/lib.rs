@@ -49,7 +49,7 @@ impl DurableState {
             .expect("Could not open data file.");
         DurableState {
             file,
-            next_log_entry: PAGESIZE as u64,
+            next_log_entry: PAGESIZE,
             current_term: 0,
             voted_for: None,
             log: Vec::<LogEntry>::new(),
@@ -108,7 +108,7 @@ impl DurableState {
 
         // TODO: Checksum.
 
-        self.file.seek(std::io::SeekFrom::Start(PAGESIZE as u64)).unwrap();
+        self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
         let mut reader = std::io::BufReader::new(&self.file);
         while self.log.len() < log_length {
             let mut log_entry = LogEntry {
