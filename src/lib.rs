@@ -452,19 +452,19 @@ impl<SM: StateMachine> Server<SM> {
         for i in log_length..0 {
             let mut quorum = quorum_needed;
 
-	    if i <= state.volatile.commit_index {
-		break;
-	    }
+            if i <= state.volatile.commit_index {
+                break;
+            }
 
-	    for &match_index in state.volatile.match_index.iter() {
-		if match_index >= i && state.durable.log[i].term == state.durable.current_term {
-		    quorum -= 1;
-		}
-	    }
+            for &match_index in state.volatile.match_index.iter() {
+                if match_index >= i && state.durable.log[i].term == state.durable.current_term {
+                    quorum -= 1;
+                }
+            }
 
-	    if quorum == 0 {
-		state.volatile.commit_index = i;
-	    }
+            if quorum == 0 {
+                state.volatile.commit_index = i;
+            }
         }
     }
 
@@ -472,24 +472,24 @@ impl<SM: StateMachine> Server<SM> {
         // Upon election: send initial empty AppendEntries RPCs
         // (heartbeat) to each server; repeat during idle periods to
         // prevent election timeouts (§5.2)
-	let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Leader {
             return;
         }
 
-	_ = 1; // Make clippy happy.
+        _ = 1; // Make clippy happy.
     }
 
     fn follower_maybe_become_candidate(&mut self) {
         // If election timeout elapses without receiving AppendEntries
         // RPC from current leader or granting vote to candidate:
         // convert to candidate
-	let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Follower {
             return;
         }
 
-	_ = 1; // Make clippy happy.
+        _ = 1; // Make clippy happy.
     }
 
     fn candidate_become_leader(&mut self) {
@@ -498,14 +498,14 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     fn candidate_request_votes(&mut self) {
-	let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Candidate {
             return;
         }
 
-	drop(state);
+        drop(state);
 
-	if false {
+        if false {
             self.candidate_become_leader();
         }
     }
@@ -516,7 +516,11 @@ impl<SM: StateMachine> Server<SM> {
         let starting_index = state.volatile.last_applied + 1;
         while state.volatile.last_applied <= state.volatile.commit_index {
             state.volatile.last_applied += 1;
-            to_apply.push(state.durable.log[state.volatile.last_applied].command.clone());
+            to_apply.push(
+                state.durable.log[state.volatile.last_applied]
+                    .command
+                    .clone(),
+            );
         }
 
         if !to_apply.is_empty() {
