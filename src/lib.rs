@@ -1,9 +1,10 @@
 use std::convert::TryInto;
-use std::io::BufRead;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
+use std::io::{BufRead, BufReader};
 use std::os::unix::prelude::FileExt;
+use std::time::Duration;
 
 const PAGESIZE: u64 = 4096;
 
@@ -18,7 +19,7 @@ pub trait StateMachine {
 
 pub struct Config {
     id: u32,
-    address: std::net::IpAddr,
+    address: std::net::SocketAddr,
 }
 
 struct LogEntry {
@@ -119,7 +120,7 @@ impl DurableState {
         // TODO: Checksum.
 
         self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
-        let mut reader = std::io::BufReader::new(&self.file);
+        let mut reader = BufReader::new(&self.file);
         while self.log.len() < log_length {
             let mut log_entry = LogEntry {
                 term: 0,
@@ -247,7 +248,6 @@ enum Condition {
 
 struct VolatileState {
     condition: Condition,
-    term: u64,
 
     commit_index: usize,
     last_applied: usize,
@@ -260,7 +260,6 @@ struct VolatileState {
 impl VolatileState {
     fn new(cluster_size: usize) -> VolatileState {
         VolatileState {
-            term: 0,
             condition: Condition::Follower,
             commit_index: 0,
             last_applied: 0,
@@ -287,6 +286,7 @@ struct State {
 
 pub struct Server<SM: StateMachine> {
     cluster: Vec<Config>,
+    cluster_index: usize, // For this Server.
     sm: SM,
 
     state: std::sync::Mutex<State>,
@@ -315,7 +315,7 @@ impl<SM: StateMachine> Server<SM> {
 
         // Wait for messages to be applied. Probably a better way.
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
             let state = self.state.lock().unwrap();
             if state.durable_state.log.len() >= prev_length + to_add {
                 break;
@@ -336,28 +336,28 @@ impl<SM: StateMachine> Server<SM> {
     fn handle_request_vote_request(
         &mut self,
         stream: std::net::TcpStream,
-        reader: std::io::BufReader<std::net::TcpStream>,
+        reader: BufReader<std::net::TcpStream>,
     ) {
     }
 
     fn handle_request_vote_response(
         &mut self,
         stream: std::net::TcpStream,
-        reader: std::io::BufReader<std::net::TcpStream>,
+        reader: BufReader<std::net::TcpStream>,
     ) {
     }
 
     fn handle_append_entries_request(
         &mut self,
         stream: std::net::TcpStream,
-        reader: std::io::BufReader<std::net::TcpStream>,
+        reader: BufReader<std::net::TcpStream>,
     ) {
     }
 
     fn handle_append_entries_response(
         &mut self,
         stream: std::net::TcpStream,
-        reader: std::io::BufReader<std::net::TcpStream>,
+        reader: BufReader<std::net::TcpStream>,
     ) {
     }
 
@@ -390,9 +390,9 @@ impl<SM: StateMachine> Server<SM> {
         let mut state = self.state.lock().unwrap();
         let mut metadata: [u8; 10] = [0; 10];
         stream
-            .set_read_timeout(Some(std::time::Duration::from_millis(5000)))
+            .set_read_timeout(Some(Duration::from_millis(2000)))
             .unwrap();
-        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
 
         if let Err(e) = reader.read_exact(&mut metadata) {
             if matches!(e.kind(), std::io::ErrorKind::WouldBlock)
@@ -411,7 +411,7 @@ impl<SM: StateMachine> Server<SM> {
             state.volatile_state.condition = Condition::Follower;
         }
 
-        drop(state);
+        drop(state); // Release the lock on self.state.
 
         if message_type == RequestResponseType::RequestVoteRequest as u16 {
             self.handle_request_vote_request(stream, reader);
@@ -463,9 +463,11 @@ impl<SM: StateMachine> Server<SM> {
         let stop = std::sync::Arc::new(std::sync::Mutex::new(false));
         let thread_stop = stop.clone();
 
+        let address = self.cluster[self.cluster_index].address;
+
         std::thread::spawn(move || {
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:80").expect("Could not bind to port.");
+            let listener = std::net::TcpListener::bind(address)
+                .expect("Could not bind to configured address.");
 
             for stream in listener.incoming() {
                 let stop = thread_stop.lock().unwrap();
@@ -473,7 +475,7 @@ impl<SM: StateMachine> Server<SM> {
                     break;
                 }
 
-                if let std::io::Result::Ok(s) = stream {
+                if let Ok(s) = stream {
                     thread_tx.send(s).unwrap();
                 }
             }
@@ -511,7 +513,6 @@ impl<SM: StateMachine> Server<SM> {
         // Prevent server from accepting any more log entries.
         state.volatile_state.condition = Condition::Follower;
         state.tcp_done = true;
-        drop(state);
     }
 
     pub fn restore(&self) {
@@ -526,8 +527,13 @@ impl<SM: StateMachine> Server<SM> {
         cluster: Vec<Config>,
     ) -> Server<SM> {
         let cluster_size = cluster.len();
+        let cluster_index = cluster
+            .iter()
+            .position(|c| c.id == id)
+            .expect("Server ID must point to valid ID within cluster config.");
         Server {
             cluster,
+            cluster_index,
             sm,
 
             state: std::sync::Mutex::new(State {
@@ -566,7 +572,7 @@ mod tests {
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-            // std::fs::remove_dir_all(&self.dir).unwrap();
+            std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
