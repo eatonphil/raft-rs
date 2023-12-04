@@ -12,3 +12,5 @@ test*
 
 #/target
 /Cargo.lock
+
+*profraw
