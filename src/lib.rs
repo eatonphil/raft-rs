@@ -327,7 +327,6 @@ impl<SM: StateMachine> Server<SM> {
             return ApplyResult::NotALeader;
         }
 
-        let prev_length = state.durable.log.len();
         let to_add = commands.len();
         let receivers = state.durable.append(commands);
         drop(state);
@@ -347,29 +346,29 @@ impl<SM: StateMachine> Server<SM> {
 
     fn handle_request_vote_request(
         &mut self,
-        stream: std::net::TcpStream,
-        reader: BufReader<std::net::TcpStream>,
+        _stream: std::net::TcpStream,
+        _reader: BufReader<std::net::TcpStream>,
     ) {
     }
 
     fn handle_request_vote_response(
         &mut self,
-        stream: std::net::TcpStream,
-        reader: BufReader<std::net::TcpStream>,
+        _stream: std::net::TcpStream,
+        _reader: BufReader<std::net::TcpStream>,
     ) {
     }
 
     fn handle_append_entries_request(
         &mut self,
-        stream: std::net::TcpStream,
-        reader: BufReader<std::net::TcpStream>,
+        _stream: std::net::TcpStream,
+        _reader: BufReader<std::net::TcpStream>,
     ) {
     }
 
     fn handle_append_entries_response(
         &mut self,
-        stream: std::net::TcpStream,
-        reader: BufReader<std::net::TcpStream>,
+        _stream: std::net::TcpStream,
+        _reader: BufReader<std::net::TcpStream>,
     ) {
     }
 
@@ -477,6 +476,8 @@ impl<SM: StateMachine> Server<SM> {
         if state.volatile.condition != Condition::Leader {
             return;
         }
+
+	_ = 1; // Make clippy happy.
     }
 
     fn follower_maybe_become_candidate(&mut self) {
@@ -487,6 +488,8 @@ impl<SM: StateMachine> Server<SM> {
         if state.volatile.condition != Condition::Follower {
             return;
         }
+
+	_ = 1; // Make clippy happy.
     }
 
     fn candidate_become_leader(&mut self) {
@@ -516,7 +519,7 @@ impl<SM: StateMachine> Server<SM> {
             to_apply.push(state.durable.log[state.volatile.last_applied].command.clone());
         }
 
-        if to_apply.len() > 0 {
+        if !to_apply.is_empty() {
             let results = self.sm.apply(to_apply);
             for (i, result) in results.into_iter().enumerate() {
                 if let Some(sender) = &state.durable.log[starting_index + i].response_sender {
