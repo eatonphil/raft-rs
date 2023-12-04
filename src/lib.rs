@@ -456,7 +456,14 @@ impl<SM: StateMachine> Server<SM> {
                 break;
             }
 
-            for &match_index in state.volatile.match_index.iter() {
+            for (i, &match_index) in state.volatile.match_index.iter().enumerate() {
+                // self always counts as committed, so skip it as the
+                // count. quorum_needed already takes self into
+                // consideration (`len() / 2` not `len() / 2 + 1`).
+                if i == self.cluster_index {
+                    continue;
+                }
+
                 if match_index >= i && state.durable.log[i].term == state.durable.current_term {
                     quorum -= 1;
                 }
@@ -534,6 +541,8 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     pub fn start(&mut self) {
+        self.restore();
+
         let (tx, rx): (
             std::sync::mpsc::Sender<std::net::TcpStream>,
             std::sync::mpsc::Receiver<std::net::TcpStream>,
