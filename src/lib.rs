@@ -2,11 +2,45 @@ use std::convert::TryInto;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::os::unix::prelude::FileExt;
 use std::time::Duration;
 
 const PAGESIZE: u64 = 4096;
+
+const POLYNOMIAL: u32 = 0xEDB88320;
+struct CRC32 {
+    result: u32,
+}
+
+impl CRC32 {
+    fn new() -> CRC32 {
+	return CRC32 {
+	    result: 0xFFFFFFFF,
+	};
+    }
+
+    fn update(&mut self, input: &[u8]) {
+	let len = input.len();
+	for i in 0..len {
+            self.result ^= input[i] as u32;
+
+            for i in 0..8 {
+		self.result = (self.result >> 1) ^ (self.result & 1) * POLYNOMIAL;
+            }
+	}	
+    }
+
+    fn sum(&self) -> u32 {
+	return !self.result;
+    }
+}
+
+fn crc32(input: &[u8]) -> u32 {
+    let mut c = CRC32::new();
+    c.update(input);
+    return c.sum();
+}
 
 pub enum ApplyResult {
     NotALeader,
@@ -32,6 +66,32 @@ struct LogEntry {
     command: Vec<u8>,
     term: u64,
 }
+
+//        ON DISK FORMAT
+//
+// | Byte Range     | Value          |
+// |----------------|----------------|
+// |        0 - 4   | Magic Number   |
+// |        4 - 8   | Format Version |
+// |        8 - 16  | Term           |
+// |       16 - 17  | Did Vote       |
+// |       17 - 21  | Voted For      |
+// |       21 - 29  | Log Length     |
+// |       29 - 37  | Next Log Entry |
+// |       37 - 41  | Checksum       |
+// | PAGESIZE - EOF | Log Entries    |
+//
+//           ON DISK LOG ENTRY FORMAT
+//
+// | Byte Range                      | Value          |
+// |---------------------------------|----------------|
+// |  0 - 4                          | Checksum       |
+// |  4 - 12                         | Term           |
+// | 12 - 20                         | Command Length |
+// | 20 - (20 + $Command Length)     | Command        |
+//
+// After Command, the file will be padding until the next boundary
+// divisible by 4k.
 
 struct DurableState {
     // Backing file.
@@ -62,32 +122,6 @@ impl DurableState {
             log: Vec::<LogEntry>::new(),
         }
     }
-
-    //        ON DISK FORMAT
-    //
-    // | Byte Range     | Value          |
-    // |----------------|----------------|
-    // |        0 - 4   | Magic Number   |
-    // |        4 - 8   | Format Version |
-    // |        8 - 16  | Term           |
-    // |       16 - 17  | Did Vote       |
-    // |       17 - 21  | Voted For      |
-    // |       21 - 29  | Log Length     |
-    // |       29 - 37  | Next Log Entry |
-    // |       37 - 41  | Checksum       |
-    // | PAGESIZE - EOF | Log Entries    |
-    //
-    //           ON DISK LOG ENTRY FORMAT
-    //
-    // | Byte Range                  | Value          |
-    // |-----------------------------|----------------|
-    // |  0 - 8                      | Term           |
-    // |  8 - 16                     | Command Length |
-    // | 16 - 20                     | Checksum       |
-    // | 20 - (20 + $Command Length) | Command        |
-    //
-    // After Command, the file will be padding until the next boundary
-    // divisible by 4k.
 
     fn restore(&mut self) {
         if let Ok(m) = self.file.metadata() {
@@ -123,7 +157,10 @@ impl DurableState {
 
         self.next_log_entry = u64::from_le_bytes(metadata[29..37].try_into().unwrap());
 
-        // TODO: Checksum.
+	let checksum = u32::from_le_bytes(metadata[37..41].try_into().unwrap());
+        if checksum != crc32(&metadata[0..37]) {
+            panic!("Bad checksum for data file.");
+        }
 
         self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
         let mut reader = BufReader::new(&self.file);
@@ -136,14 +173,20 @@ impl DurableState {
 
             let mut metadata: [u8; 20] = [0; 20];
             reader.read_exact(&mut metadata[0..]).unwrap();
-            log_entry.term = u64::from_le_bytes(metadata[0..8].try_into().unwrap());
-            let command_length = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
-            assert!(command_length > 0 && command_length < 20);
+            log_entry.term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
+            let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
             log_entry.command.resize(command_length as usize, b'0');
 
-            // TODO: Checksum.
+	    let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
+	    let mut actual_checksum = CRC32::new();
+	    actual_checksum.update(&metadata[4..]);
+            reader.read_exact(&mut log_entry.command).unwrap();
 
-            reader.read_exact(&mut log_entry.command[0..]).unwrap();
+	    actual_checksum.update(&log_entry.command);
+	    println!("{:?} + {:?}: {}", &metadata[4..], log_entry.command, actual_checksum.sum());
+	    if stored_checksum != actual_checksum.sum() {
+		panic!("Bad checksum for data file.");
+            }
 
             // Read (and drop) until the next page boundary.
             let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
@@ -185,11 +228,14 @@ impl DurableState {
             buffer = [0; PAGESIZE as usize];
             let command_length = entry.command.len() as u64;
 
-            buffer[0..8].copy_from_slice(&entry.term.to_le_bytes());
+            buffer[4..12].copy_from_slice(&entry.term.to_le_bytes());
 
-            buffer[8..16].copy_from_slice(&command_length.to_le_bytes());
+            buffer[12..20].copy_from_slice(&command_length.to_le_bytes());
 
-            // TODO: Checksum.
+	    let mut checksum = CRC32::new();
+	    checksum.update(&buffer[4..20]);
+	    checksum.update(&entry.command);
+	    buffer[0..4].copy_from_slice(&checksum.sum().to_le_bytes());
 
             let command_first_page = if command_length <= PAGESIZE - 20 {
                 command_length
@@ -249,7 +295,8 @@ impl DurableState {
 
         metadata[29..37].copy_from_slice(&self.next_log_entry.to_le_bytes());
 
-        // TODO: Checksum.
+	let checksum = crc32(&metadata[0..37]);
+	metadata[37..41].copy_from_slice(&checksum.to_le_bytes());
 
         self.file.write_all_at(&metadata, 0).unwrap();
 
@@ -311,12 +358,250 @@ pub struct Server<SM: StateMachine> {
     state: std::sync::Mutex<State>,
 }
 
-#[derive(Copy, Clone)]
-enum RequestResponseType {
+//             REQUEST WIRE PROTOCOL
+//
+// | Byte Range | Value                                         |
+// |------------|-----------------------------------------------|
+// |  0         | Ok                                            |
+// |  1         | Request Type                                  |
+// |  6 - 14    | Term                                          |
+// | 14 - 18    | Leader Id / Candidate Id                      |
+// | 18 - 26    | Prev Log Index / Last Log Index               |
+// | 26 - 34    | Prev Log Term / Last Log Term                 |
+// | 34 - 42    | (Request Vote) Checksum / Leader Commit Index |
+// | 42 - 50    | Entries Length                                |
+// | 50 - 54    | (Append Entries) Checksum                     |
+// | 54 - EOM   | Entries                                       |
+//
+//             ENTRIES WIRE PROTOCOL
+//
+// See: ON DISK LOG ENTRY FORMAT.
+//
+//             RESPONSE WIRE PROTOCOL
+//
+// | Byte Range   | Value                  |
+// |--------------|------------------------|
+// |  0           | Ok                     |
+// |  1           | Response Type          |
+// |  8 - 16      | Term                   |
+// |  16          | Success / Vote Granted |
+// |  17 - 21     | Checksum               |
+
+struct RequestVoteRequest {
+    term: u64,
+    candidate_id: u32,
+    last_log_index: usize,
+    last_log_term: u64,
+}
+
+impl RequestVoteRequest {
+    fn decode<T: std::io::Read>(
+        mut reader: BufReader<T>,
+        metadata: [u8; 10],
+        term: u64,
+    ) -> Option<RPCBody> {
+        let mut buffer: [u8; 38] = [0; 38];
+        buffer[0..metadata.len()].copy_from_slice(&metadata);
+        reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
+
+        let checksum = u32::from_le_bytes(buffer[34..38].try_into().unwrap());
+        if checksum != crc32(&buffer[0..34]) {
+            return None;
+        }
+
+        let candidate_id = u32::from_le_bytes(buffer[14..18].try_into().unwrap());
+        let last_log_index = u64::from_le_bytes(buffer[18..26].try_into().unwrap());
+        let last_log_term = u64::from_le_bytes(buffer[26..34].try_into().unwrap());
+
+        return Some(RPCBody::RequestVoteRequest(RequestVoteRequest {
+            term: term,
+            candidate_id: candidate_id,
+            last_log_index: last_log_index as usize,
+            last_log_term: last_log_term,
+        }));
+    }
+
+    fn encode<T: std::io::Write>(&self, writer: BufWriter<T>) {
+        // TODO;
+    }
+}
+
+struct RequestVoteResponse {
+    term: u64,
+    vote_granted: bool,
+}
+
+impl RequestVoteResponse {
+    fn decode<T: std::io::Read>(
+        mut reader: BufReader<T>,
+        metadata: [u8; 10],
+        term: u64,
+    ) -> Option<RPCBody> {
+        let mut buffer: [u8; 21] = [0; 21];
+        buffer[0..metadata.len()].copy_from_slice(&metadata);
+        reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
+
+        let checksum = u32::from_le_bytes(buffer[17..21].try_into().unwrap());
+        if checksum != crc32(&buffer[0..17]) {
+            return None;
+        }
+
+        return Some(RPCBody::RequestVoteResponse(RequestVoteResponse {
+            term: term,
+            vote_granted: buffer[16] == 1,
+        }));
+    }
+
+    fn encode<T: std::io::Write>(&self, writer: BufWriter<T>) {
+        // TODO;
+    }
+}
+
+struct AppendEntriesRequest {
+    term: u64,
+    leader_id: u32,
+    prev_log_index: usize,
+    prev_log_term: u64,
+    entries: Vec<LogEntry>,
+    leader_commit: usize,
+}
+
+impl AppendEntriesRequest {
+    fn decode<T: std::io::Read>(
+        mut reader: BufReader<T>,
+        metadata: [u8; 10],
+        term: u64,
+    ) -> Option<RPCBody> {
+        let mut buffer: [u8; 54] = [0; 54];
+        buffer[0..metadata.len()].copy_from_slice(&metadata);
+        reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
+
+        let checksum = u32::from_le_bytes(buffer[50..54].try_into().unwrap());
+        if checksum != crc32(&buffer[0..50]) {
+            return None;
+        }
+
+        let leader_id = u32::from_le_bytes(buffer[14..18].try_into().unwrap());
+        let prev_log_index = u64::from_le_bytes(buffer[18..26].try_into().unwrap());
+        let prev_log_term = u64::from_le_bytes(buffer[26..34].try_into().unwrap());
+        let leader_commit = u64::from_le_bytes(buffer[34..42].try_into().unwrap());
+        let entries_length = u64::from_le_bytes(buffer[42..50].try_into().unwrap());
+        let entries = Vec::<LogEntry>::with_capacity(entries_length as usize);
+
+        return Some(RPCBody::AppendEntriesRequest(AppendEntriesRequest {
+            term: term,
+            leader_id: leader_id,
+            prev_log_index: prev_log_index as usize,
+            prev_log_term: prev_log_term,
+            leader_commit: leader_commit as usize,
+            entries: entries,
+        }));
+    }
+
+    fn encode<T: std::io::Write>(&self, writer: BufWriter<T>) {
+        // TODO;
+    }
+}
+
+struct AppendEntriesResponse {
+    term: u64,
+    success: bool,
+}
+
+impl AppendEntriesResponse {
+    fn decode<T: std::io::Read>(
+        mut reader: BufReader<T>,
+        metadata: [u8; 10],
+        term: u64,
+    ) -> Option<RPCBody> {
+        let mut buffer: [u8; 21] = [0; 21];
+        buffer[0..metadata.len()].copy_from_slice(&metadata);
+        reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
+
+        let checksum = u32::from_le_bytes(buffer[17..21].try_into().unwrap());
+        if checksum != crc32(&buffer[0..17]) {
+            return None;
+        }
+
+        return Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+            term: term,
+            success: buffer[16] == 1,
+        }));
+    }
+
+    fn encode<T: std::io::Write>(&self, writer: BufWriter<T>) {
+        // TODO;
+    }
+}
+
+enum RPCBodyKind {
     RequestVoteRequest = 0,
     RequestVoteResponse = 1,
     AppendEntriesRequest = 2,
     AppendEntriesResponse = 3,
+}
+
+enum RPCBody {
+    RequestVoteRequest(RequestVoteRequest),
+    RequestVoteResponse(RequestVoteResponse),
+    AppendEntriesRequest(AppendEntriesRequest),
+    AppendEntriesResponse(AppendEntriesResponse),
+}
+
+struct RPCMessage {
+    ok: bool,
+    term: u64,
+    body: RPCBody,
+}
+
+impl RPCMessage {
+    fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
+        let mut metadata: [u8; 10] = [0; 10];
+        if let Err(e) = reader.read_exact(&mut metadata) {
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut
+            {
+                return None;
+            }
+
+            panic!("Could not read request: {:#?}.", e);
+        }
+
+        // Drop any request or response that doesn't have the Ok byte set.
+        if metadata[0] != 1 {
+            return None;
+        }
+
+        let message_type = metadata[1];
+        let term = u64::from_le_bytes(metadata[2..10].try_into().unwrap());
+        let body = if message_type == RPCBodyKind::RequestVoteRequest as u8 {
+            RequestVoteRequest::decode(reader, metadata, term)
+        } else if message_type == RPCBodyKind::RequestVoteResponse as u8 {
+            RequestVoteResponse::decode(reader, metadata, term)
+        } else if message_type == RPCBodyKind::AppendEntriesRequest as u8 {
+            AppendEntriesRequest::decode(reader, metadata, term)
+        } else if message_type == RPCBodyKind::AppendEntriesResponse as u8 {
+            AppendEntriesResponse::decode(reader, metadata, term)
+        } else {
+            panic!("Unknown request type: {}.", message_type);
+        };
+
+        let goodbody = if let Some(goodbody) = body {
+            goodbody
+        } else {
+            return None;
+        };
+
+        return Some(RPCMessage {
+            ok: true,
+            term,
+            body: goodbody,
+        });
+    }
+
+    fn encode<T: std::io::Write>(writer: BufWriter<T>, term: u64, body: RPCBody) {
+        // TODO: fill in.
+    }
 }
 
 impl<SM: StateMachine> Server<SM> {
@@ -347,96 +632,87 @@ impl<SM: StateMachine> Server<SM> {
 
     fn handle_request_vote_request(
         &mut self,
-        _stream: std::net::TcpStream,
-        _reader: BufReader<std::net::TcpStream>,
+        stream: BufWriter<std::net::TcpStream>,
+        _request: RequestVoteRequest,
     ) {
+        // TODO: fill in.
+
+        let state = self.state.lock().unwrap();
+        RequestVoteResponse {
+            term: state.durable.current_term,
+            vote_granted: false,
+        }
+        .encode(stream);
     }
 
     fn handle_request_vote_response(
         &mut self,
-        _stream: std::net::TcpStream,
-        _reader: BufReader<std::net::TcpStream>,
+        _stream: BufWriter<std::net::TcpStream>,
+        _response: RequestVoteResponse,
     ) {
+        // TODO: fill in.
     }
 
     fn handle_append_entries_request(
         &mut self,
-        _stream: std::net::TcpStream,
-        _reader: BufReader<std::net::TcpStream>,
+        stream: BufWriter<std::net::TcpStream>,
+        request: AppendEntriesRequest,
     ) {
+        let state = self.state.lock().unwrap();
+        if request.term < state.durable.current_term {
+            AppendEntriesResponse {
+                term: state.durable.current_term,
+                success: false,
+            }
+            .encode(stream);
+            return;
+        }
+
+        // TODO: fill in.
+
+        AppendEntriesResponse {
+            term: state.durable.current_term,
+            success: true,
+        }
+        .encode(stream);
     }
 
     fn handle_append_entries_response(
         &mut self,
-        _stream: std::net::TcpStream,
-        _reader: BufReader<std::net::TcpStream>,
+        _stream: BufWriter<std::net::TcpStream>,
+        _response: AppendEntriesResponse,
     ) {
+        // TODO: fill in.
     }
 
-    //             REQUEST WIRE PROTOCOL
-    //
-    // | Byte Range | Value                           |
-    // |------------|---------------------------------|
-    // |  0         | Request Type                    |
-    // |  1 - 9     | Term                            |
-    // |  9 - 13    | Leader Id / Candidate Id        |
-    // | 13 - 21    | Prev Log Index / Last Log Index |
-    // | 21 - 29    | Prev Log Term / Last Log Term   |
-    // | 29 - 37    | Leader Commit Index             |
-    // | 37 - 45    | Entries Length                  |
-    // | 45 - EOM   | Entries                         |
-    //
-    //             ENTRIES WIRE PROTOCOL
-    //
-    // See: ON DISK LOG ENTRY FORMAT.
-    //
-    //             RESPONSE WIRE PROTOCOL
-    //
-    // | Byte Range | Value                  |
-    // |------------|------------------------|
-    // | 0          | Ok                     |
-    // | 1 - 3      | Response Type          |
-    // | 2 - 10     | Term                   |
-    // | 10         | Success / Vote Granted |
-
     fn handle_request(&mut self, stream: std::net::TcpStream) {
-        let mut state = self.state.lock().unwrap();
-        let mut metadata: [u8; 10] = [0; 10];
         stream
             .set_read_timeout(Some(Duration::from_millis(2000)))
             .unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let reader = BufReader::new(stream.try_clone().unwrap());
 
-        if let Err(e) = reader.read_exact(&mut metadata) {
-            if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut
-            {
-                return;
-            }
+        let message = if let Some(message) = RPCMessage::decode(reader) {
+            message
+        } else {
+            return;
+        };
 
-            panic!("{:#?}", e);
-        }
-
-        let message_type = u16::from_le_bytes(metadata[0..2].try_into().unwrap());
-
-        let term = u64::from_le_bytes(metadata[2..10].try_into().unwrap());
-        if term > state.durable.current_term {
+        let mut state = self.state.lock().unwrap();
+        if message.term > state.durable.current_term {
             let voted_for = state.durable.voted_for;
-            state.durable.update(term, voted_for);
+            state.durable.update(message.term, voted_for);
             state.volatile.condition = Condition::Follower;
         }
 
         drop(state); // Release the lock on self.state.
 
-        if message_type == RequestResponseType::RequestVoteRequest as u16 {
-            self.handle_request_vote_request(stream, reader);
-        } else if message_type == RequestResponseType::RequestVoteResponse as u16 {
-            self.handle_request_vote_response(stream, reader);
-        } else if message_type == RequestResponseType::AppendEntriesRequest as u16 {
-            self.handle_append_entries_request(stream, reader);
-        } else if message_type == RequestResponseType::AppendEntriesResponse as u16 {
-            self.handle_append_entries_response(stream, reader);
-        }
+        let bufwriter = BufWriter::new(stream);
+        match message.body {
+            RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(bufwriter, r),
+            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(bufwriter, r),
+            RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(bufwriter, r),
+            RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(bufwriter, r),
+        };
     }
 
     fn leader_maybe_new_quorum(&mut self) {
@@ -736,5 +1012,18 @@ mod tests {
         assert_eq!(durable.log[2].command, b"foobar"[0..]);
         assert_eq!(durable.log[3].term, 0);
         assert_eq!(durable.log[3].command, b"abcdef123456"[0..]);
+    }
+
+    #[test]
+    fn test_crc32() {
+        let input = vec![
+	    ("", 0),
+	    ("sadkjflksadfjsdklfjsdlkfjasdflaksdjfalskdfjasldkfjasdlfasdf", 0x633DFF42),
+	    ("What a great little message.", 0xAEABCE75),
+	    ("f;lkjasdf;lkasdfasd", 0xF570C312),
+	];
+	for (input, output) in input.into_iter() {
+            assert_eq!(crc32(input.as_bytes()), output);
+	}
     }
 }
