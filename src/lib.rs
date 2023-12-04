@@ -327,14 +327,15 @@ impl<SM: StateMachine> Server<SM> {
             return ApplyResult::NotALeader;
         }
 
-        let to_add = commands.len();
         let receivers = state.durable.append(commands);
         drop(state);
 
         // Wait for messages to be applied.
+        let to_add = commands.len();
         let mut results = Vec::<Vec<u8>>::with_capacity(to_add);
         for r in receivers {
             for result in r.try_iter() {
+                // TODO: Is this clone() necessary?
                 results.push(result.clone());
             }
         }
@@ -526,6 +527,7 @@ impl<SM: StateMachine> Server<SM> {
             to_apply.push(
                 state.durable.log[state.volatile.last_applied]
                     .command
+                    // TODO: Is this clone necessary?
                     .clone(),
             );
         }
@@ -534,6 +536,7 @@ impl<SM: StateMachine> Server<SM> {
             let results = self.sm.apply(to_apply);
             for (i, result) in results.into_iter().enumerate() {
                 if let Some(sender) = &state.durable.log[starting_index + i].response_sender {
+                    // TODO: Is this clone necessary?
                     sender.send(result.clone()).unwrap();
                 }
             }
