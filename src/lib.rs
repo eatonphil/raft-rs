@@ -928,7 +928,7 @@ impl CRC32C {
     }
 
     fn sum(&self) -> u32 {
-        return self.result ^ !0;
+        self.result ^ !0
     }
 }
 
