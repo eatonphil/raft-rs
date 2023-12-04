@@ -96,7 +96,7 @@ impl LogEntry {
             } else {
                 self.command.len() - written
             };
-            buffer.copy_from_slice(&self.command[written..to_write]);
+            buffer[0..to_write].copy_from_slice(&self.command[written..written + to_write]);
             writer.write_all(buffer).unwrap();
             written += PAGESIZE as usize;
             pages += 1;
@@ -1120,13 +1120,19 @@ mod tests {
 
         // Add in double the existing entries and shut down.
         v.reverse();
+        let longcommand = "a".repeat(10_000);
+        let longcommand2 = "a".repeat(PAGESIZE as usize);
+        let longcommand3 = "a".repeat(1 + PAGESIZE as usize);
+        v.push(longcommand.as_bytes());
+        v.push(longcommand2.as_bytes());
+        v.push(longcommand3.as_bytes());
         durable.append(&v);
         drop(durable);
 
         // Start up and restore. Should now have four entries.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
-        assert_eq!(durable.log.len(), 4);
+        assert_eq!(durable.log.len(), 7);
         assert_eq!(durable.log[0].term, 0);
         assert_eq!(durable.log[0].command, b"abcdef123456"[0..]);
         assert_eq!(durable.log[1].term, 0);
@@ -1135,6 +1141,12 @@ mod tests {
         assert_eq!(durable.log[2].command, b"foobar"[0..]);
         assert_eq!(durable.log[3].term, 0);
         assert_eq!(durable.log[3].command, b"abcdef123456"[0..]);
+        assert_eq!(durable.log[4].term, 0);
+        assert_eq!(durable.log[4].command, longcommand.as_bytes());
+        assert_eq!(durable.log[5].term, 0);
+        assert_eq!(durable.log[5].command, longcommand2.as_bytes());
+        assert_eq!(durable.log[6].term, 0);
+        assert_eq!(durable.log[6].command, longcommand3.as_bytes());
     }
 
     #[test]
@@ -1277,8 +1289,15 @@ mod tests {
             ("What a great little message.", 0x165AD1D7),
             ("f;lkjasdf;lkasdfasd", 0x4EA35847),
         ];
-        for (input, output) in input.into_iter() {
-            assert_eq!(crc32c(input.as_bytes()), output);
+        for (input, output) in input.iter() {
+            assert_eq!(crc32c(input.as_bytes()), *output);
+
+            // Test streaming (*multiple* calls to update()) too.
+            let mut c = CRC32C::new();
+            for &byte in input.as_bytes().iter() {
+                c.update(&[byte]);
+            }
+            assert_eq!(c.sum(), *output);
         }
     }
 }
