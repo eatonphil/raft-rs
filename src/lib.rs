@@ -392,7 +392,7 @@ impl<SM: StateMachine> Server<SM> {
         stream
             .set_read_timeout(Some(std::time::Duration::from_millis(5000)))
             .unwrap();
-        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+;        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
 
         if let Err(e) = reader.read_exact(&mut metadata) {
             if matches!(e.kind(), std::io::ErrorKind::WouldBlock)
@@ -409,7 +409,6 @@ impl<SM: StateMachine> Server<SM> {
             let voted_for = state.durable_state.voted_for;
             state.durable_state.update(term, voted_for);
             state.volatile_state.condition = Condition::Follower;
-            return;
         }
 
         drop(state);
