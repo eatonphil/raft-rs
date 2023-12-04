@@ -876,6 +876,10 @@ impl<SM: StateMachine> Server<SM> {
     }
 }
 
+// CRC32C is a port of (what seems to be) FreeBSD's public-domain
+// implementation:
+// https://web.mit.edu/freebsd/head/sys/libkern/crc32.c.
+
 struct CRC32C {
     result: u32,
 }
