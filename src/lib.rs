@@ -14,7 +14,7 @@ pub enum ApplyResult {
 }
 
 pub trait StateMachine {
-    fn apply(self, messages: &[&[u8]]) -> ApplyResult;
+    fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>>;
 }
 
 pub struct Config {
@@ -23,6 +23,12 @@ pub struct Config {
 }
 
 struct LogEntry {
+    // In-memory channel for sending results back to a user of the
+    // library. Will always be `None` when a log is read back from
+    // disk.
+    response_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+
+    // Actual data.
     command: Vec<u8>,
     term: u64,
 }
@@ -123,6 +129,7 @@ impl DurableState {
         let mut reader = BufReader::new(&self.file);
         while self.log.len() < log_length {
             let mut log_entry = LogEntry {
+                response_sender: None,
                 term: 0,
                 command: Vec::new(),
             };
@@ -147,7 +154,7 @@ impl DurableState {
     }
 
     // Durably add logs to disk.
-    fn append(&mut self, commands: &[&[u8]]) {
+    fn append(&mut self, commands: &[&[u8]]) -> Vec<std::sync::mpsc::Receiver<Vec<u8>>> {
         // Why is this here? Why does it fail when set to the end of
         // restore()?
         self.file
@@ -155,13 +162,24 @@ impl DurableState {
             .unwrap();
 
         let mut buffer: [u8; PAGESIZE as usize];
+        let mut receivers =
+            Vec::<std::sync::mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
 
         // Write out all logs.
         for command in commands.iter() {
+            let (sender, receiver): (
+                std::sync::mpsc::Sender<Vec<u8>>,
+                std::sync::mpsc::Receiver<Vec<u8>>,
+            ) = std::sync::mpsc::channel();
+
+            receivers.push(receiver);
+
             let entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
                 command: command.to_vec(),
+
+                response_sender: Some(sender),
             };
 
             buffer = [0; PAGESIZE as usize];
@@ -203,6 +221,7 @@ impl DurableState {
 
         // Write log length metadata.
         self.update(self.current_term, self.voted_for);
+        return receivers;
     }
 
     // Durably save non-log data.
@@ -239,7 +258,7 @@ impl DurableState {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 enum Condition {
     Leader,
     Follower,
@@ -280,8 +299,8 @@ impl VolatileState {
 struct State {
     tcp_done: bool,
 
-    durable_state: DurableState,
-    volatile_state: VolatileState,
+    durable: DurableState,
+    volatile: VolatileState,
 }
 
 pub struct Server<SM: StateMachine> {
@@ -304,31 +323,24 @@ impl<SM: StateMachine> Server<SM> {
     pub fn apply(&mut self, commands: &[&[u8]]) -> ApplyResult {
         // Append commands to local durable state if leader.
         let mut state = self.state.lock().unwrap();
-        if !matches!(state.volatile_state.condition, Condition::Leader) {
+        if state.volatile.condition != Condition::Leader {
             return ApplyResult::NotALeader;
         }
 
-        let prev_length = state.durable_state.log.len();
+        let prev_length = state.durable.log.len();
         let to_add = commands.len();
-        state.durable_state.append(commands);
+        let receivers = state.durable.append(commands);
         drop(state);
 
-        // Wait for messages to be applied. Probably a better way.
-        loop {
-            std::thread::sleep(Duration::from_millis(10));
-            let state = self.state.lock().unwrap();
-            if state.durable_state.log.len() >= prev_length + to_add {
-                break;
+        // Wait for messages to be applied.
+        let mut results = Vec::<Vec<u8>>::with_capacity(to_add);
+        for r in receivers {
+            for result in r.try_iter() {
+                results.push(result.clone());
             }
         }
         // TODO: Handle taking too long.
 
-        // Return results of messages.
-        let state = self.state.lock().unwrap();
-        let mut results = Vec::<Vec<u8>>::with_capacity(to_add);
-        for log_entry in state.durable_state.log[prev_length..to_add].iter() {
-            results.push(log_entry.command.clone());
-        }
         assert!(results.len() == to_add);
         ApplyResult::Ok(results)
     }
@@ -365,14 +377,14 @@ impl<SM: StateMachine> Server<SM> {
     //
     // | Byte Range | Value                           |
     // |------------|---------------------------------|
-    // |  0 - 2     | Request Type                    |
-    // |  2 - 10    | Term                            |
-    // | 10 - 14    | Leader Id / Candidate Id        |
-    // | 14 - 22    | Prev Log Index / Last Log Index |
-    // | 22 - 30    | Prev Log Term / Last Log Term   |
-    // | 30 - 38    | Leader Commit Index             |
-    // | 38 - 46    | Entries Length                  |
-    // | 46 - EOM   | Entries                         |
+    // |  0         | Request Type                    |
+    // |  1 - 9     | Term                            |
+    // |  9 - 13    | Leader Id / Candidate Id        |
+    // | 13 - 21    | Prev Log Index / Last Log Index |
+    // | 21 - 29    | Prev Log Term / Last Log Term   |
+    // | 29 - 37    | Leader Commit Index             |
+    // | 37 - 45    | Entries Length                  |
+    // | 45 - EOM   | Entries                         |
     //
     //             ENTRIES WIRE PROTOCOL
     //
@@ -382,7 +394,8 @@ impl<SM: StateMachine> Server<SM> {
     //
     // | Byte Range | Value                  |
     // |------------|------------------------|
-    // | 0 - 2      | Response Type          |
+    // | 0          | Ok                     |
+    // | 1 - 3      | Response Type          |
     // | 2 - 10     | Term                   |
     // | 10         | Success / Vote Granted |
 
@@ -395,20 +408,22 @@ impl<SM: StateMachine> Server<SM> {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
 
         if let Err(e) = reader.read_exact(&mut metadata) {
-            if matches!(e.kind(), std::io::ErrorKind::WouldBlock)
-                || matches!(e.kind(), std::io::ErrorKind::TimedOut)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut
             {
                 return;
             }
+
+            panic!("{:#?}", e);
         }
 
         let message_type = u16::from_le_bytes(metadata[0..2].try_into().unwrap());
 
         let term = u64::from_le_bytes(metadata[2..10].try_into().unwrap());
-        if term > state.durable_state.current_term {
-            let voted_for = state.durable_state.voted_for;
-            state.durable_state.update(term, voted_for);
-            state.volatile_state.condition = Condition::Follower;
+        if term > state.durable.current_term {
+            let voted_for = state.durable.voted_for;
+            state.durable.update(term, voted_for);
+            state.volatile.condition = Condition::Follower;
         }
 
         drop(state); // Release the lock on self.state.
@@ -428,28 +443,86 @@ impl<SM: StateMachine> Server<SM> {
         // If there exists an N such that N > commitIndex, a majority
         // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
         // set commitIndex = N (§5.3, §5.4).
+        let quorum_needed = self.cluster.len() / 2;
+        let mut state = self.state.lock().unwrap();
+        if state.volatile.condition != Condition::Leader {
+            return;
+        }
+
+        let log_length = state.durable.log.len();
+        for i in log_length..0 {
+            let mut quorum = quorum_needed;
+
+	    if i <= state.volatile.commit_index {
+		break;
+	    }
+
+	    for &match_index in state.volatile.match_index.iter() {
+		if match_index >= i && state.durable.log[i].term == state.durable.current_term {
+		    quorum -= 1;
+		}
+	    }
+
+	    if quorum == 0 {
+		state.volatile.commit_index = i;
+	    }
+        }
     }
 
     fn leader_send_heartbeat(&mut self) {
         // Upon election: send initial empty AppendEntries RPCs
         // (heartbeat) to each server; repeat during idle periods to
         // prevent election timeouts (§5.2)
+	let state = self.state.lock().unwrap();
+        if state.volatile.condition != Condition::Leader {
+            return;
+        }
     }
 
     fn follower_maybe_become_candidate(&mut self) {
         // If election timeout elapses without receiving AppendEntries
         // RPC from current leader or granting vote to candidate:
         // convert to candidate
+	let state = self.state.lock().unwrap();
+        if state.volatile.condition != Condition::Follower {
+            return;
+        }
     }
 
     fn candidate_become_leader(&mut self) {
         let mut state = self.state.lock().unwrap();
-        state.volatile_state.reset();
+        state.volatile.reset();
     }
 
     fn candidate_request_votes(&mut self) {
-        if false {
+	let state = self.state.lock().unwrap();
+        if state.volatile.condition != Condition::Candidate {
+            return;
+        }
+
+	drop(state);
+
+	if false {
             self.candidate_become_leader();
+        }
+    }
+
+    fn apply_entries(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        let mut to_apply = Vec::<Vec<u8>>::new();
+        let starting_index = state.volatile.last_applied + 1;
+        while state.volatile.last_applied <= state.volatile.commit_index {
+            state.volatile.last_applied += 1;
+            to_apply.push(state.durable.log[state.volatile.last_applied].command.clone());
+        }
+
+        if to_apply.len() > 0 {
+            let results = self.sm.apply(to_apply);
+            for (i, result) in results.into_iter().enumerate() {
+                if let Some(sender) = &state.durable.log[starting_index + i].response_sender {
+                    sender.send(result.clone()).unwrap();
+                }
+            }
         }
     }
 
@@ -483,7 +556,6 @@ impl<SM: StateMachine> Server<SM> {
 
         loop {
             let state = self.state.lock().unwrap();
-            let condition = state.volatile_state.condition;
             if state.tcp_done {
                 let mut stop = stop.lock().unwrap();
                 *stop = true;
@@ -491,16 +563,18 @@ impl<SM: StateMachine> Server<SM> {
             }
             drop(state);
 
-            if matches!(condition, Condition::Leader) {
-                self.leader_send_heartbeat();
-                self.leader_maybe_new_quorum();
-            } else if matches!(condition, Condition::Follower) {
-                self.follower_maybe_become_candidate();
-            } else if matches!(condition, Condition::Candidate) {
-                self.candidate_request_votes();
-            }
+            // Leader operations.
+            self.leader_send_heartbeat();
+            self.leader_maybe_new_quorum();
 
-            // TODO: Apply entries where lastCommit > lastApplied.
+            // Follower operations.
+            self.follower_maybe_become_candidate();
+
+            // Candidate operations.
+            self.candidate_request_votes();
+
+            // All condition operations.
+            self.apply_entries();
 
             for s in rx.try_iter() {
                 self.handle_request(s);
@@ -511,13 +585,13 @@ impl<SM: StateMachine> Server<SM> {
     pub fn stop(&mut self) {
         let mut state = self.state.lock().unwrap();
         // Prevent server from accepting any more log entries.
-        state.volatile_state.condition = Condition::Follower;
+        state.volatile.condition = Condition::Follower;
         state.tcp_done = true;
     }
 
     pub fn restore(&self) {
         let mut state = self.state.lock().unwrap();
-        state.durable_state.restore();
+        state.durable.restore();
     }
 
     pub fn new(
@@ -537,8 +611,8 @@ impl<SM: StateMachine> Server<SM> {
             sm,
 
             state: std::sync::Mutex::new(State {
-                durable_state: DurableState::new(data_directory, id),
-                volatile_state: VolatileState::new(cluster_size),
+                durable: DurableState::new(data_directory, id),
+                volatile: VolatileState::new(cluster_size),
 
                 tcp_done: false,
             }),
@@ -580,27 +654,27 @@ mod tests {
     fn test_save_and_restore() {
         let tmp = TmpDir::new();
 
-        let mut durable_state = DurableState::new(&tmp.dir, 1);
-        durable_state.restore();
-        assert_eq!(durable_state.current_term, 0);
-        assert_eq!(durable_state.voted_for, None);
-        assert_eq!(durable_state.log.len(), 0);
+        let mut durable = DurableState::new(&tmp.dir, 1);
+        durable.restore();
+        assert_eq!(durable.current_term, 0);
+        assert_eq!(durable.voted_for, None);
+        assert_eq!(durable.log.len(), 0);
 
-        durable_state.update(10234, Some(40592));
-        assert_eq!(durable_state.current_term, 10234);
-        assert_eq!(durable_state.voted_for, Some(40592));
-        assert_eq!(durable_state.log.len(), 0);
-        drop(durable_state);
+        durable.update(10234, Some(40592));
+        assert_eq!(durable.current_term, 10234);
+        assert_eq!(durable.voted_for, Some(40592));
+        assert_eq!(durable.log.len(), 0);
+        drop(durable);
 
-        let mut durable_state = DurableState::new(&tmp.dir, 1);
-        assert_eq!(durable_state.current_term, 0);
-        assert_eq!(durable_state.voted_for, None);
-        assert_eq!(durable_state.log.len(), 0);
+        let mut durable = DurableState::new(&tmp.dir, 1);
+        assert_eq!(durable.current_term, 0);
+        assert_eq!(durable.voted_for, None);
+        assert_eq!(durable.log.len(), 0);
 
-        durable_state.restore();
-        assert_eq!(durable_state.current_term, 10234);
-        assert_eq!(durable_state.voted_for, Some(40592));
-        assert_eq!(durable_state.log.len(), 0);
+        durable.restore();
+        assert_eq!(durable.current_term, 10234);
+        assert_eq!(durable.voted_for, Some(40592));
+        assert_eq!(durable.log.len(), 0);
     }
 
     #[test]
@@ -612,36 +686,36 @@ mod tests {
         v.push(b"foobar"[0..].into());
 
         // Write two entries and shut down.
-        let mut durable_state = DurableState::new(&tmp.dir, 1);
-        durable_state.restore();
-        durable_state.append(&v);
-        drop(durable_state);
+        let mut durable = DurableState::new(&tmp.dir, 1);
+        durable.restore();
+        durable.append(&v);
+        drop(durable);
 
         // Start up and restore. Should have two entries.
-        let mut durable_state = DurableState::new(&tmp.dir, 1);
-        durable_state.restore();
-        assert_eq!(durable_state.log.len(), 2);
-        assert_eq!(durable_state.log[0].term, 0);
-        assert_eq!(durable_state.log[0].command, b"abcdef123456"[0..]);
-        assert_eq!(durable_state.log[1].term, 0);
-        assert_eq!(durable_state.log[1].command, b"foobar"[0..]);
+        let mut durable = DurableState::new(&tmp.dir, 1);
+        durable.restore();
+        assert_eq!(durable.log.len(), 2);
+        assert_eq!(durable.log[0].term, 0);
+        assert_eq!(durable.log[0].command, b"abcdef123456"[0..]);
+        assert_eq!(durable.log[1].term, 0);
+        assert_eq!(durable.log[1].command, b"foobar"[0..]);
 
         // Add in double the existing entries and shut down.
         v.reverse();
-        durable_state.append(&v);
-        drop(durable_state);
+        durable.append(&v);
+        drop(durable);
 
         // Start up and restore. Should now have four entries.
-        let mut durable_state = DurableState::new(&tmp.dir, 1);
-        durable_state.restore();
-        assert_eq!(durable_state.log.len(), 4);
-        assert_eq!(durable_state.log[0].term, 0);
-        assert_eq!(durable_state.log[0].command, b"abcdef123456"[0..]);
-        assert_eq!(durable_state.log[1].term, 0);
-        assert_eq!(durable_state.log[1].command, b"foobar"[0..]);
-        assert_eq!(durable_state.log[2].term, 0);
-        assert_eq!(durable_state.log[2].command, b"foobar"[0..]);
-        assert_eq!(durable_state.log[3].term, 0);
-        assert_eq!(durable_state.log[3].command, b"abcdef123456"[0..]);
+        let mut durable = DurableState::new(&tmp.dir, 1);
+        durable.restore();
+        assert_eq!(durable.log.len(), 4);
+        assert_eq!(durable.log[0].term, 0);
+        assert_eq!(durable.log[0].command, b"abcdef123456"[0..]);
+        assert_eq!(durable.log[1].term, 0);
+        assert_eq!(durable.log[1].command, b"foobar"[0..]);
+        assert_eq!(durable.log[2].term, 0);
+        assert_eq!(durable.log[2].command, b"foobar"[0..]);
+        assert_eq!(durable.log[3].term, 0);
+        assert_eq!(durable.log[3].command, b"abcdef123456"[0..]);
     }
 }
