@@ -22,17 +22,6 @@ pub struct Config {
     address: std::net::SocketAddr,
 }
 
-struct LogEntry {
-    // In-memory channel for sending results back to a user of the
-    // library. Will always be `None` when a log is read back from
-    // disk.
-    response_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>,
-
-    // Actual data.
-    command: Vec<u8>,
-    term: u64,
-}
-
 //        ON DISK FORMAT
 //
 // | Byte Range     | Value          |
@@ -58,6 +47,96 @@ struct LogEntry {
 //
 // After Command, the file will be padding until the next boundary
 // divisible by 4k.
+
+#[derive(Debug)]
+struct LogEntry {
+    // In-memory channel for sending results back to a user of the
+    // library. Will always be `None` when a log is read back from
+    // disk.
+    response_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+
+    // Actual data.
+    command: Vec<u8>,
+    term: u64,
+}
+
+impl PartialEq for LogEntry {
+    fn eq(&self, other: &Self) -> bool {
+        return self.command == other.command && self.term == other.term;
+    }
+}
+
+impl LogEntry {
+    fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) -> u64 {
+        *buffer = [0; PAGESIZE as usize];
+        let command_length = self.command.len() as u64;
+
+        buffer[4..12].copy_from_slice(&self.term.to_le_bytes());
+
+        buffer[12..20].copy_from_slice(&command_length.to_le_bytes());
+
+        let mut checksum = CRC32C::new();
+        checksum.update(&buffer[4..20]);
+        checksum.update(&self.command);
+        buffer[0..4].copy_from_slice(&checksum.sum().to_le_bytes());
+
+        let command_first_page = if command_length <= PAGESIZE - 20 {
+            command_length
+        } else {
+            PAGESIZE - 20
+        } as usize;
+        buffer[20..20 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
+        writer.write_all(buffer).unwrap();
+
+        let mut pages = 1;
+        let mut written = command_first_page;
+        while written < self.command.len() {
+            let to_write = if self.command.len() - written > PAGESIZE as usize {
+                PAGESIZE as usize
+            } else {
+                self.command.len() - written
+            };
+            buffer.copy_from_slice(&self.command[written..to_write]);
+            writer.write_all(buffer).unwrap();
+            written += PAGESIZE as usize;
+            pages += 1;
+        }
+
+        return pages;
+    }
+
+    fn decode(reader: &mut BufReader<impl std::io::Read>) -> Option<LogEntry> {
+        let mut metadata: [u8; 20] = [0; 20];
+        reader.read_exact(&mut metadata).unwrap();
+        let term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
+        let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
+
+        let mut command = Vec::<u8>::with_capacity(command_length as usize);
+        command.resize(command_length as usize, b'0');
+
+        let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
+        let mut actual_checksum = CRC32C::new();
+        actual_checksum.update(&metadata[4..]);
+
+        assert_eq!(command.len(), command_length as usize);
+        reader.read_exact(&mut command).unwrap();
+        actual_checksum.update(&command);
+
+        if stored_checksum != actual_checksum.sum() {
+            return None;
+        }
+
+        // Read (and drop) until the next page boundary.
+        let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
+        reader.consume(rest_before_page_boundary as usize);
+
+        return Some(LogEntry {
+            term,
+            command,
+            response_sender: None,
+        });
+    }
+}
 
 struct DurableState {
     // Backing file.
@@ -129,35 +208,13 @@ impl DurableState {
         }
 
         self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
-        let mut reader = BufReader::new(&self.file);
+        let reader = &mut BufReader::new(&self.file);
         while self.log.len() < log_length {
-            let mut log_entry = LogEntry {
-                response_sender: None,
-                term: 0,
-                command: Vec::new(),
-            };
-
-            let mut metadata: [u8; 20] = [0; 20];
-            reader.read_exact(&mut metadata[0..]).unwrap();
-            log_entry.term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
-            let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
-            log_entry.command.resize(command_length as usize, b'0');
-
-            let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
-            let mut actual_checksum = CRC32C::new();
-            actual_checksum.update(&metadata[4..]);
-            reader.read_exact(&mut log_entry.command).unwrap();
-
-            actual_checksum.update(&log_entry.command);
-            if stored_checksum != actual_checksum.sum() {
-                panic!("Bad checksum for data file.");
+            if let Some(e) = LogEntry::decode(reader) {
+                self.log.push(e);
+            } else {
+                panic!("Could not read log from data file.");
             }
-
-            // Read (and drop) until the next page boundary.
-            let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
-            reader.consume(rest_before_page_boundary as usize);
-
-            self.log.push(log_entry);
         }
     }
 
@@ -169,7 +226,7 @@ impl DurableState {
             .seek(std::io::SeekFrom::Start(self.next_log_entry))
             .unwrap();
 
-        let mut buffer: [u8; PAGESIZE as usize];
+        let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         let mut receivers =
             Vec::<std::sync::mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
 
@@ -190,40 +247,7 @@ impl DurableState {
                 response_sender: Some(sender),
             };
 
-            buffer = [0; PAGESIZE as usize];
-            let command_length = entry.command.len() as u64;
-
-            buffer[4..12].copy_from_slice(&entry.term.to_le_bytes());
-
-            buffer[12..20].copy_from_slice(&command_length.to_le_bytes());
-
-            let mut checksum = CRC32C::new();
-            checksum.update(&buffer[4..20]);
-            checksum.update(&entry.command);
-            buffer[0..4].copy_from_slice(&checksum.sum().to_le_bytes());
-
-            let command_first_page = if command_length <= PAGESIZE - 20 {
-                command_length
-            } else {
-                PAGESIZE - 20
-            } as usize;
-            buffer[20..20 + command_first_page]
-                .copy_from_slice(&entry.command[0..command_first_page]);
-            self.file.write_all(&buffer).unwrap();
-
-            let mut pages = 1;
-            let mut written = command_first_page;
-            while written < entry.command.len() {
-                let to_write = if entry.command.len() - written > PAGESIZE as usize {
-                    PAGESIZE as usize
-                } else {
-                    entry.command.len() - written
-                };
-                buffer.copy_from_slice(&entry.command[written..to_write]);
-                self.file.write_all(&buffer).unwrap();
-                written += PAGESIZE as usize;
-                pages += 1;
-            }
+            let pages = entry.encode(&mut buffer, &self.file);
 
             self.next_log_entry += pages * PAGESIZE;
 
@@ -329,14 +353,14 @@ pub struct Server<SM: StateMachine> {
 // |------------|-----------------------------------------------|
 // |  0         | Ok                                            |
 // |  1         | Request Type                                  |
-// |  6 - 14    | Term                                          |
-// | 14 - 18    | Leader Id / Candidate Id                      |
-// | 18 - 26    | Prev Log Index / Last Log Index               |
-// | 26 - 34    | Prev Log Term / Last Log Term                 |
-// | 34 - 42    | (Request Vote) Checksum / Leader Commit Index |
-// | 42 - 50    | Entries Length                                |
-// | 50 - 54    | (Append Entries) Checksum                     |
-// | 54 - EOM   | Entries                                       |
+// |  2 - 10    | Term                                          |
+// | 10 - 14    | Leader Id / Candidate Id                      |
+// | 14 - 22    | Prev Log Index / Last Log Index               |
+// | 22 - 30    | Prev Log Term / Last Log Term                 |
+// | 30 - 38    | (Request Vote) Checksum / Leader Commit Index |
+// | 38 - 46    | Entries Length                                |
+// | 46 - 50    | (Append Entries) Checksum                     |
+// | 50 - EOM   | Entries                                       |
 //
 //             ENTRIES WIRE PROTOCOL
 //
@@ -348,10 +372,55 @@ pub struct Server<SM: StateMachine> {
 // |--------------|------------------------|
 // |  0           | Ok                     |
 // |  1           | Response Type          |
-// |  8 - 16      | Term                   |
-// |  16          | Success / Vote Granted |
-// |  17 - 21     | Checksum               |
+// |  2 - 10      | Term                   |
+// |  10          | Success / Vote Granted |
+// |  11 - 15     | Checksum               |
 
+struct RPCMessageEncoder<T: std::io::Write> {
+    writer: BufWriter<T>,
+    written: Vec<u8>,
+}
+
+impl<T: std::io::Write> RPCMessageEncoder<T> {
+    fn new(writer: BufWriter<T>) -> RPCMessageEncoder<T> {
+        RPCMessageEncoder {
+            writer,
+            written: vec![],
+        }
+    }
+
+    fn metadata(&mut self, kind: u8, term: u64) {
+        assert_eq!(self.written.len(), 0);
+
+        self.written.push(1); // OK byte.
+
+        self.written.push(kind);
+
+        for byte in term.to_le_bytes().into_iter() {
+            self.written.push(byte);
+        }
+
+        self.writer.write_all(&self.written).unwrap();
+    }
+
+    fn data(&mut self, data: &[u8]) {
+        let offset = self.written.len();
+        for &byte in data {
+            self.written.push(byte);
+        }
+
+        self.writer.write_all(&self.written[offset..]).unwrap();
+    }
+
+    fn done(&mut self) {
+        let checksum = crc32c(&self.written);
+
+        self.writer.write_all(&checksum.to_le_bytes()).unwrap();
+        self.writer.flush().unwrap();
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct RequestVoteRequest {
     term: u64,
     candidate_id: u32,
@@ -365,18 +434,18 @@ impl RequestVoteRequest {
         metadata: [u8; 10],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 38] = [0; 38];
+        let mut buffer: [u8; 34] = [0; 34];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[34..38].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..34]) {
+        let checksum = u32::from_le_bytes(buffer[30..34].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..30]) {
             return None;
         }
 
-        let candidate_id = u32::from_le_bytes(buffer[14..18].try_into().unwrap());
-        let last_log_index = u64::from_le_bytes(buffer[18..26].try_into().unwrap());
-        let last_log_term = u64::from_le_bytes(buffer[26..34].try_into().unwrap());
+        let candidate_id = u32::from_le_bytes(buffer[10..14].try_into().unwrap());
+        let last_log_index = u64::from_le_bytes(buffer[14..22].try_into().unwrap());
+        let last_log_term = u64::from_le_bytes(buffer[22..30].try_into().unwrap());
 
         Some(RPCBody::RequestVoteRequest(RequestVoteRequest {
             term,
@@ -386,11 +455,16 @@ impl RequestVoteRequest {
         }))
     }
 
-    fn encode<T: std::io::Write>(&self, _writer: BufWriter<T>) {
-        // TODO;
+    fn encode<T: std::io::Write>(&self, encoder: &mut RPCMessageEncoder<T>) {
+        encoder.metadata(RPCBodyKind::RequestVoteRequest as u8, self.term);
+        encoder.data(&self.candidate_id.to_le_bytes());
+        encoder.data(&(self.last_log_index as u64).to_le_bytes());
+        encoder.data(&self.last_log_term.to_le_bytes());
+        encoder.done();
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct RequestVoteResponse {
     term: u64,
     vote_granted: bool,
@@ -402,26 +476,29 @@ impl RequestVoteResponse {
         metadata: [u8; 10],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 21] = [0; 21];
+        let mut buffer: [u8; 15] = [0; 15];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[17..21].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..17]) {
+        let checksum = u32::from_le_bytes(buffer[11..15].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..11]) {
             return None;
         }
 
         Some(RPCBody::RequestVoteResponse(RequestVoteResponse {
             term,
-            vote_granted: buffer[16] == 1,
+            vote_granted: buffer[10] == 1,
         }))
     }
 
-    fn encode<T: std::io::Write>(&self, _writer: BufWriter<T>) {
-        // TODO;
+    fn encode<T: std::io::Write>(&self, encoder: &mut RPCMessageEncoder<T>) {
+        encoder.metadata(RPCBodyKind::RequestVoteResponse as u8, self.term);
+        encoder.data(&[self.vote_granted as u8]);
+        encoder.done();
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct AppendEntriesRequest {
     term: u64,
     leader_id: u32,
@@ -437,21 +514,29 @@ impl AppendEntriesRequest {
         metadata: [u8; 10],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 54] = [0; 54];
+        let mut buffer: [u8; 50] = [0; 50];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[50..54].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..50]) {
+        let checksum = u32::from_le_bytes(buffer[46..50].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..46]) {
             return None;
         }
 
-        let leader_id = u32::from_le_bytes(buffer[14..18].try_into().unwrap());
-        let prev_log_index = u64::from_le_bytes(buffer[18..26].try_into().unwrap());
-        let prev_log_term = u64::from_le_bytes(buffer[26..34].try_into().unwrap());
-        let leader_commit = u64::from_le_bytes(buffer[34..42].try_into().unwrap());
-        let entries_length = u64::from_le_bytes(buffer[42..50].try_into().unwrap());
-        let entries = Vec::<LogEntry>::with_capacity(entries_length as usize);
+        let leader_id = u32::from_le_bytes(buffer[10..14].try_into().unwrap());
+        let prev_log_index = u64::from_le_bytes(buffer[14..22].try_into().unwrap());
+        let prev_log_term = u64::from_le_bytes(buffer[22..30].try_into().unwrap());
+        let leader_commit = u64::from_le_bytes(buffer[30..38].try_into().unwrap());
+        let entries_length = u64::from_le_bytes(buffer[38..46].try_into().unwrap()) as usize;
+        let mut entries = Vec::<LogEntry>::with_capacity(entries_length);
+
+        while entries.len() < entries_length {
+            if let Some(e) = LogEntry::decode(&mut reader) {
+                entries.push(e);
+            } else {
+                return None;
+            }
+        }
 
         Some(RPCBody::AppendEntriesRequest(AppendEntriesRequest {
             term,
@@ -463,11 +548,23 @@ impl AppendEntriesRequest {
         }))
     }
 
-    fn encode<T: std::io::Write>(&self, _writer: BufWriter<T>) {
-        // TODO;
+    fn encode<T: std::io::Write>(&self, encoder: &mut RPCMessageEncoder<T>) {
+        encoder.metadata(RPCBodyKind::AppendEntriesRequest as u8, self.term);
+        encoder.data(&self.leader_id.to_le_bytes());
+        encoder.data(&(self.prev_log_index as u64).to_le_bytes());
+        encoder.data(&self.prev_log_term.to_le_bytes());
+        encoder.data(&(self.leader_commit as u64).to_le_bytes());
+        encoder.data(&(self.entries.len() as u64).to_le_bytes());
+        encoder.done();
+
+        let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
+        for entry in self.entries.iter() {
+            entry.encode(&mut buffer, &mut encoder.writer);
+        }
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct AppendEntriesResponse {
     term: u64,
     success: bool,
@@ -479,23 +576,25 @@ impl AppendEntriesResponse {
         metadata: [u8; 10],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 21] = [0; 21];
+        let mut buffer: [u8; 15] = [0; 15];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[17..21].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..17]) {
+        let checksum = u32::from_le_bytes(buffer[11..15].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..11]) {
             return None;
         }
 
         Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
             term,
-            success: buffer[16] == 1,
+            success: buffer[10] == 1,
         }))
     }
 
-    fn encode<T: std::io::Write>(&self, _writer: BufWriter<T>) {
-        // TODO;
+    fn encode<T: std::io::Write>(&self, encoder: &mut RPCMessageEncoder<T>) {
+        encoder.metadata(RPCBodyKind::AppendEntriesResponse as u8, self.term);
+        encoder.data(&[self.success as u8]);
+        encoder.done();
     }
 }
 
@@ -506,6 +605,7 @@ enum RPCBodyKind {
     AppendEntriesResponse = 3,
 }
 
+#[derive(Debug, PartialEq)]
 enum RPCBody {
     RequestVoteRequest(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
@@ -513,6 +613,7 @@ enum RPCBody {
     AppendEntriesResponse(AppendEntriesResponse),
 }
 
+#[derive(Debug, PartialEq)]
 struct RPCMessage {
     ok: bool,
     term: u64,
@@ -551,17 +652,11 @@ impl RPCMessage {
             panic!("Unknown request type: {}.", message_type);
         };
 
-        let goodbody = body?;
-
         Some(RPCMessage {
             ok: true,
             term,
-            body: goodbody,
+            body: body?,
         })
-    }
-
-    fn encode<T: std::io::Write>(_writer: BufWriter<T>, _term: u64, _body: RPCBody) {
-        // TODO: fill in.
     }
 }
 
@@ -591,33 +686,33 @@ impl<SM: StateMachine> Server<SM> {
         ApplyResult::Ok(results)
     }
 
-    fn handle_request_vote_request(
+    fn handle_request_vote_request<T: std::io::Write>(
         &mut self,
-        stream: BufWriter<std::net::TcpStream>,
         _request: RequestVoteRequest,
+        encoder: &mut RPCMessageEncoder<T>,
     ) {
         // TODO: fill in.
 
         let state = self.state.lock().unwrap();
         RequestVoteResponse {
             term: state.durable.current_term,
-            vote_granted: false,
+            vote_granted: true,
         }
-        .encode(stream);
+        .encode(encoder);
     }
 
-    fn handle_request_vote_response(
+    fn handle_request_vote_response<T: std::io::Write>(
         &mut self,
-        _stream: BufWriter<std::net::TcpStream>,
         _response: RequestVoteResponse,
+        _encoder: &mut RPCMessageEncoder<T>,
     ) {
         // TODO: fill in.
     }
 
-    fn handle_append_entries_request(
+    fn handle_append_entries_request<T: std::io::Write>(
         &mut self,
-        stream: BufWriter<std::net::TcpStream>,
         request: AppendEntriesRequest,
+        encoder: &mut RPCMessageEncoder<T>,
     ) {
         let state = self.state.lock().unwrap();
         if request.term < state.durable.current_term {
@@ -625,7 +720,7 @@ impl<SM: StateMachine> Server<SM> {
                 term: state.durable.current_term,
                 success: false,
             }
-            .encode(stream);
+            .encode(encoder);
             return;
         }
 
@@ -635,13 +730,13 @@ impl<SM: StateMachine> Server<SM> {
             term: state.durable.current_term,
             success: true,
         }
-        .encode(stream);
+        .encode(encoder);
     }
 
-    fn handle_append_entries_response(
+    fn handle_append_entries_response<T: std::io::Write>(
         &mut self,
-        _stream: BufWriter<std::net::TcpStream>,
         _response: AppendEntriesResponse,
+        _encoder: &mut RPCMessageEncoder<T>,
     ) {
         // TODO: fill in.
     }
@@ -668,11 +763,12 @@ impl<SM: StateMachine> Server<SM> {
         drop(state); // Release the lock on self.state.
 
         let bufwriter = BufWriter::new(stream);
+        let encoder = &mut RPCMessageEncoder::new(bufwriter);
         match message.body {
-            RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(bufwriter, r),
-            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(bufwriter, r),
-            RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(bufwriter, r),
-            RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(bufwriter, r),
+            RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r, encoder),
+            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r, encoder),
+            RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r, encoder),
+            RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r, encoder),
         };
     }
 
@@ -1042,6 +1138,135 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_decode_append_entries_request() {
+        let mut file = Vec::new();
+        let aer = AppendEntriesRequest {
+            term: 1023,
+            leader_id: 2132,
+            prev_log_index: 1823,
+            prev_log_term: 193,
+            entries: vec![
+                LogEntry {
+                    term: 88,
+                    command: "hey there".into(),
+                    response_sender: None,
+                },
+                LogEntry {
+                    term: 90,
+                    command: "blub".into(),
+                    response_sender: None,
+                },
+            ],
+            leader_commit: 95,
+        };
+        let mut cursor = std::io::Cursor::new(&mut file);
+        let bufwriter = BufWriter::new(&mut cursor);
+        let mut encoder = RPCMessageEncoder::new(bufwriter);
+        aer.encode(&mut encoder);
+
+        drop(encoder);
+        drop(cursor);
+
+        let mut cursor = std::io::Cursor::new(&mut file);
+        let bufreader = BufReader::new(&mut cursor);
+        let result = RPCMessage::decode(bufreader);
+        assert_eq!(
+            result,
+            Some(RPCMessage {
+                ok: true,
+                term: aer.term,
+                body: RPCBody::AppendEntriesRequest(aer),
+            })
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_append_entries_response() {
+        let mut file = Vec::new();
+        let rvr = AppendEntriesResponse {
+            term: 1023,
+            success: true,
+        };
+        let mut cursor = std::io::Cursor::new(&mut file);
+        let bufwriter = BufWriter::new(&mut cursor);
+        let mut encoder = RPCMessageEncoder::new(bufwriter);
+        rvr.encode(&mut encoder);
+
+        drop(encoder);
+        drop(cursor);
+
+        let mut cursor = std::io::Cursor::new(&mut file);
+        let bufreader = BufReader::new(&mut cursor);
+        let result = RPCMessage::decode(bufreader);
+        assert_eq!(
+            result,
+            Some(RPCMessage {
+                ok: true,
+                term: rvr.term,
+                body: RPCBody::AppendEntriesResponse(rvr),
+            })
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_request_vote_request() {
+        let mut file = Vec::new();
+        let rvr = RequestVoteRequest {
+            term: 1023,
+            candidate_id: 2132,
+            last_log_index: 1823,
+            last_log_term: 193,
+        };
+        let mut cursor = std::io::Cursor::new(&mut file);
+        let bufwriter = BufWriter::new(&mut cursor);
+        let mut encoder = RPCMessageEncoder::new(bufwriter);
+        rvr.encode(&mut encoder);
+
+        drop(encoder);
+        drop(cursor);
+
+        let mut cursor = std::io::Cursor::new(&mut file);
+        let bufreader = BufReader::new(&mut cursor);
+        let result = RPCMessage::decode(bufreader);
+        assert_eq!(
+            result,
+            Some(RPCMessage {
+                ok: true,
+                term: rvr.term,
+                body: RPCBody::RequestVoteRequest(rvr),
+            })
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_request_vote_response() {
+        let mut file = Vec::new();
+        let rvr = RequestVoteResponse {
+            term: 1023,
+            vote_granted: true,
+        };
+        let mut cursor = std::io::Cursor::new(&mut file);
+        let bufwriter = BufWriter::new(&mut cursor);
+        let mut encoder = RPCMessageEncoder::new(bufwriter);
+        rvr.encode(&mut encoder);
+
+        drop(encoder);
+        drop(cursor);
+
+        let mut cursor = std::io::Cursor::new(&mut file);
+        let bufreader = BufReader::new(&mut cursor);
+        let result = RPCMessage::decode(bufreader);
+        assert_eq!(
+            result,
+            Some(RPCMessage {
+                ok: true,
+                term: rvr.term,
+                body: RPCBody::RequestVoteResponse(rvr),
+            })
+        );
+    }
+
+    #[test]
     fn test_crc32c() {
         let input = vec![
             ("", 0),
@@ -1053,7 +1278,6 @@ mod tests {
             ("f;lkjasdf;lkasdfasd", 0x4EA35847),
         ];
         for (input, output) in input.into_iter() {
-            println!("For {:?}.{} == {}", input, crc32c(input.as_bytes()), output);
             assert_eq!(crc32c(input.as_bytes()), output);
         }
     }
