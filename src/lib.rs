@@ -333,20 +333,32 @@ impl<SM: StateMachine> Server<SM> {
         ApplyResult::Ok(results)
     }
 
-    fn handle_request_vote_request(&mut self, stream: std::net::TcpStream, reader: std::io::BufReader<std::net::TcpStream>) {
-	
+    fn handle_request_vote_request(
+        &mut self,
+        stream: std::net::TcpStream,
+        reader: std::io::BufReader<std::net::TcpStream>,
+    ) {
     }
 
-    fn handle_request_vote_response(&mut self, stream: std::net::TcpStream, reader: std::io::BufReader<std::net::TcpStream>) {
-	
+    fn handle_request_vote_response(
+        &mut self,
+        stream: std::net::TcpStream,
+        reader: std::io::BufReader<std::net::TcpStream>,
+    ) {
     }
 
-    fn handle_append_entries_request(&mut self, stream: std::net::TcpStream, reader: std::io::BufReader<std::net::TcpStream>) {
-	
+    fn handle_append_entries_request(
+        &mut self,
+        stream: std::net::TcpStream,
+        reader: std::io::BufReader<std::net::TcpStream>,
+    ) {
     }
 
-    fn handle_append_entries_response(&mut self, stream: std::net::TcpStream, reader: std::io::BufReader<std::net::TcpStream>) {
-	
+    fn handle_append_entries_response(
+        &mut self,
+        stream: std::net::TcpStream,
+        reader: std::io::BufReader<std::net::TcpStream>,
+    ) {
     }
 
     //             REQUEST WIRE PROTOCOL
@@ -382,7 +394,7 @@ impl<SM: StateMachine> Server<SM> {
             .unwrap();
         let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
 
-	if let Err(e) = reader.read_exact(&mut metadata) {
+        if let Err(e) = reader.read_exact(&mut metadata) {
             if matches!(e.kind(), std::io::ErrorKind::WouldBlock)
                 || matches!(e.kind(), std::io::ErrorKind::TimedOut)
             {
@@ -397,39 +409,49 @@ impl<SM: StateMachine> Server<SM> {
             let voted_for = state.durable_state.voted_for;
             state.durable_state.update(term, voted_for);
             state.volatile_state.condition = Condition::Follower;
-	    return;
+            return;
         }
 
-	drop(state);
+        drop(state);
 
-	if message_type == RequestResponseType::RequestVoteRequest as u16 {
-	    self.handle_request_vote_request(stream, reader);
-	} else if message_type == RequestResponseType::RequestVoteResponse as u16 {
-	    self.handle_request_vote_response(stream, reader);
-	} else if message_type == RequestResponseType::AppendEntriesRequest as u16 {
-	    self.handle_request_vote_request(stream, reader);
-	} else if message_type == RequestResponseType::AppendEntriesResponse as u16 {
-	    self.handle_request_vote_response(stream, reader);
-	}
+        if message_type == RequestResponseType::RequestVoteRequest as u16 {
+            self.handle_request_vote_request(stream, reader);
+        } else if message_type == RequestResponseType::RequestVoteResponse as u16 {
+            self.handle_request_vote_response(stream, reader);
+        } else if message_type == RequestResponseType::AppendEntriesRequest as u16 {
+            self.handle_append_entries_request(stream, reader);
+        } else if message_type == RequestResponseType::AppendEntriesResponse as u16 {
+            self.handle_append_entries_response(stream, reader);
+        }
+    }
+
+    fn leader_maybe_new_quorum(&mut self) {
+        // If there exists an N such that N > commitIndex, a majority
+        // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+        // set commitIndex = N (§5.3, §5.4).
     }
 
     fn leader_send_heartbeat(&mut self) {
-	
+        // Upon election: send initial empty AppendEntries RPCs
+        // (heartbeat) to each server; repeat during idle periods to
+        // prevent election timeouts (§5.2)
     }
 
     fn follower_maybe_become_candidate(&mut self) {
-	
+        // If election timeout elapses without receiving AppendEntries
+        // RPC from current leader or granting vote to candidate:
+        // convert to candidate
     }
 
     fn candidate_become_leader(&mut self) {
-	let mut state = self.state.lock().unwrap();
-	state.volatile_state.reset();
+        let mut state = self.state.lock().unwrap();
+        state.volatile_state.reset();
     }
 
     fn candidate_request_votes(&mut self) {
-	if false {
-	    self.candidate_become_leader();
-	}
+        if false {
+            self.candidate_become_leader();
+        }
     }
 
     pub fn start(&mut self) {
@@ -469,11 +491,12 @@ impl<SM: StateMachine> Server<SM> {
             drop(state);
 
             if matches!(condition, Condition::Leader) {
-		self.leader_send_heartbeat();
+                self.leader_send_heartbeat();
+                self.leader_maybe_new_quorum();
             } else if matches!(condition, Condition::Follower) {
-		self.follower_maybe_become_candidate();
+                self.follower_maybe_become_candidate();
             } else if matches!(condition, Condition::Candidate) {
-		self.candidate_request_votes();
+                self.candidate_request_votes();
             }
 
             // TODO: Apply entries where lastCommit > lastApplied.
