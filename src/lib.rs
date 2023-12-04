@@ -1152,130 +1152,164 @@ mod tests {
     #[test]
     fn test_encode_decode_append_entries_request() {
         let mut file = Vec::new();
-        let aer = AppendEntriesRequest {
-            term: 1023,
-            leader_id: 2132,
-            prev_log_index: 1823,
-            prev_log_term: 193,
-            entries: vec![
-                LogEntry {
-                    term: 88,
-                    command: "hey there".into(),
-                    response_sender: None,
-                },
-                LogEntry {
-                    term: 90,
-                    command: "blub".into(),
-                    response_sender: None,
-                },
-            ],
-            leader_commit: 95,
-        };
-        let mut cursor = std::io::Cursor::new(&mut file);
-        let bufwriter = BufWriter::new(&mut cursor);
-        let mut encoder = RPCMessageEncoder::new(bufwriter);
-        aer.encode(&mut encoder);
+        let tests = vec![
+            AppendEntriesRequest {
+                term: 1023,
+                leader_id: 2132,
+                prev_log_index: 1823,
+                prev_log_term: 193,
+                entries: vec![
+                    LogEntry {
+                        term: 88,
+                        command: "hey there".into(),
+                        response_sender: None,
+                    },
+                    LogEntry {
+                        term: 90,
+                        command: "blub".into(),
+                        response_sender: None,
+                    },
+                ],
+                leader_commit: 95,
+            },
+            AppendEntriesRequest {
+                term: 1023,
+                leader_id: 2132,
+                prev_log_index: 1823,
+                prev_log_term: 193,
+                entries: vec![],
+                leader_commit: 95,
+            },
+        ];
 
-        drop(encoder);
-        drop(cursor);
+        for aer in tests.into_iter() {
+            let mut cursor = std::io::Cursor::new(&mut file);
+            let bufwriter = BufWriter::new(&mut cursor);
+            let mut encoder = RPCMessageEncoder::new(bufwriter);
+            aer.encode(&mut encoder);
 
-        let mut cursor = std::io::Cursor::new(&mut file);
-        let bufreader = BufReader::new(&mut cursor);
-        let result = RPCMessage::decode(bufreader);
-        assert_eq!(
-            result,
-            Some(RPCMessage {
-                ok: true,
-                term: aer.term,
-                body: RPCBody::AppendEntriesRequest(aer),
-            })
-        );
+            drop(encoder);
+            drop(cursor);
+
+            let mut cursor = std::io::Cursor::new(&mut file);
+            let bufreader = BufReader::new(&mut cursor);
+            let result = RPCMessage::decode(bufreader);
+            assert_eq!(
+                result,
+                Some(RPCMessage {
+                    ok: true,
+                    term: aer.term,
+                    body: RPCBody::AppendEntriesRequest(aer),
+                })
+            );
+        }
     }
 
     #[test]
     fn test_encode_decode_append_entries_response() {
         let mut file = Vec::new();
-        let rvr = AppendEntriesResponse {
-            term: 1023,
-            success: true,
-        };
-        let mut cursor = std::io::Cursor::new(&mut file);
-        let bufwriter = BufWriter::new(&mut cursor);
-        let mut encoder = RPCMessageEncoder::new(bufwriter);
-        rvr.encode(&mut encoder);
+        let tests = vec![
+            AppendEntriesResponse {
+                term: 1023,
+                success: true,
+            },
+            AppendEntriesResponse {
+                term: 1023,
+                success: false,
+            },
+        ];
 
-        drop(encoder);
-        drop(cursor);
+        for aer in tests.into_iter() {
+            let mut cursor = std::io::Cursor::new(&mut file);
+            let bufwriter = BufWriter::new(&mut cursor);
+            let mut encoder = RPCMessageEncoder::new(bufwriter);
+            aer.encode(&mut encoder);
 
-        let mut cursor = std::io::Cursor::new(&mut file);
-        let bufreader = BufReader::new(&mut cursor);
-        let result = RPCMessage::decode(bufreader);
-        assert_eq!(
-            result,
-            Some(RPCMessage {
-                ok: true,
-                term: rvr.term,
-                body: RPCBody::AppendEntriesResponse(rvr),
-            })
-        );
+            drop(encoder);
+            drop(cursor);
+
+            let mut cursor = std::io::Cursor::new(&mut file);
+            let bufreader = BufReader::new(&mut cursor);
+            let result = RPCMessage::decode(bufreader);
+            assert_eq!(
+                result,
+                Some(RPCMessage {
+                    ok: true,
+                    term: aer.term,
+                    body: RPCBody::AppendEntriesResponse(aer),
+                })
+            );
+        }
     }
 
     #[test]
     fn test_encode_decode_request_vote_request() {
         let mut file = Vec::new();
-        let rvr = RequestVoteRequest {
+        let tests = vec![RequestVoteRequest {
             term: 1023,
             candidate_id: 2132,
             last_log_index: 1823,
             last_log_term: 193,
-        };
-        let mut cursor = std::io::Cursor::new(&mut file);
-        let bufwriter = BufWriter::new(&mut cursor);
-        let mut encoder = RPCMessageEncoder::new(bufwriter);
-        rvr.encode(&mut encoder);
+        }];
 
-        drop(encoder);
-        drop(cursor);
+        for rvr in tests.into_iter() {
+            let mut cursor = std::io::Cursor::new(&mut file);
+            let bufwriter = BufWriter::new(&mut cursor);
+            let mut encoder = RPCMessageEncoder::new(bufwriter);
+            rvr.encode(&mut encoder);
 
-        let mut cursor = std::io::Cursor::new(&mut file);
-        let bufreader = BufReader::new(&mut cursor);
-        let result = RPCMessage::decode(bufreader);
-        assert_eq!(
-            result,
-            Some(RPCMessage {
-                ok: true,
-                term: rvr.term,
-                body: RPCBody::RequestVoteRequest(rvr),
-            })
-        );
+            drop(encoder);
+            drop(cursor);
+
+            let mut cursor = std::io::Cursor::new(&mut file);
+            let bufreader = BufReader::new(&mut cursor);
+            let result = RPCMessage::decode(bufreader);
+            assert_eq!(
+                result,
+                Some(RPCMessage {
+                    ok: true,
+                    term: rvr.term,
+                    body: RPCBody::RequestVoteRequest(rvr),
+                })
+            );
+        }
     }
 
     #[test]
     fn test_encode_decode_request_vote_response() {
-        let mut file = Vec::new();
-        let rvr = RequestVoteResponse {
-            term: 1023,
-            vote_granted: true,
-        };
-        let mut cursor = std::io::Cursor::new(&mut file);
-        let bufwriter = BufWriter::new(&mut cursor);
-        let mut encoder = RPCMessageEncoder::new(bufwriter);
-        rvr.encode(&mut encoder);
+        let tests = vec![
+            RequestVoteResponse {
+                term: 1023,
+                vote_granted: true,
+            },
+            RequestVoteResponse {
+                term: 1023,
+                vote_granted: false,
+            },
+        ];
 
-        drop(encoder);
-        drop(cursor);
+        for rvr in tests.into_iter() {
+            let mut file = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut file);
+            let bufwriter = BufWriter::new(&mut cursor);
+            let mut encoder = RPCMessageEncoder::new(bufwriter);
+            rvr.encode(&mut encoder);
 
-        let mut cursor = std::io::Cursor::new(&mut file);
-        let bufreader = BufReader::new(&mut cursor);
-        let result = RPCMessage::decode(bufreader);
-        assert_eq!(
-            result,
-            Some(RPCMessage {
-                ok: true,
-                term: rvr.term,
-                body: RPCBody::RequestVoteResponse(rvr),
-            })
-        );
+            drop(encoder);
+            drop(cursor);
+
+            let mut cursor = std::io::Cursor::new(&mut file);
+            let bufreader = BufReader::new(&mut cursor);
+            let result = RPCMessage::decode(bufreader);
+            assert_eq!(
+                result,
+                Some(RPCMessage {
+                    ok: true,
+                    term: rvr.term,
+                    body: RPCBody::RequestVoteResponse(rvr),
+                })
+            );
+        }
     }
 
     #[test]
