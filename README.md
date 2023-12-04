@@ -18,3 +18,9 @@ Non-goals (for now):
 ```console
 $ cargo test
 ```
+
+## References
+
+- The Raft Paper: [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf)
+- Diego Ongaro's Thesis: [Consensus: Bridging Theory and Practice](https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
+- Diego Ongaro's TLA+ spec: [TLA+ specification for the Raft consensus algorithm](https://github.com/ongardie/raft.tla)
