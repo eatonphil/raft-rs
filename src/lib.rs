@@ -15,29 +15,28 @@ struct CRC32 {
 
 impl CRC32 {
     fn new() -> CRC32 {
-        return CRC32 { result: 0xFFFFFFFF };
+        CRC32 { result: 0xFFFFFFFF }
     }
 
     fn update(&mut self, input: &[u8]) {
-        let len = input.len();
-        for i in 0..len {
-            self.result ^= input[i] as u32;
+        for byte in input.iter() {
+            self.result ^= *byte as u32;
 
             for _ in 0..8 {
-                self.result = (self.result >> 1) ^ (self.result & 1) * POLYNOMIAL;
+                self.result = (self.result >> 1) ^ ((self.result & 1) * POLYNOMIAL);
             }
         }
     }
 
     fn sum(&self) -> u32 {
-        return !self.result;
+        !self.result
     }
 }
 
 fn crc32(input: &[u8]) -> u32 {
     let mut c = CRC32::new();
     c.update(input);
-    return c.sum();
+    c.sum()
 }
 
 pub enum ApplyResult {
@@ -410,15 +409,15 @@ impl RequestVoteRequest {
         let last_log_index = u64::from_le_bytes(buffer[18..26].try_into().unwrap());
         let last_log_term = u64::from_le_bytes(buffer[26..34].try_into().unwrap());
 
-        return Some(RPCBody::RequestVoteRequest(RequestVoteRequest {
-            term: term,
-            candidate_id: candidate_id,
+        Some(RPCBody::RequestVoteRequest(RequestVoteRequest {
+            term,
+            candidate_id,
             last_log_index: last_log_index as usize,
-            last_log_term: last_log_term,
-        }));
+            last_log_term,
+        }))
     }
 
-    fn encode<T: std::io::Write>(&self, writer: BufWriter<T>) {
+    fn encode<T: std::io::Write>(&self, _writer: BufWriter<T>) {
         // TODO;
     }
 }
@@ -443,13 +442,13 @@ impl RequestVoteResponse {
             return None;
         }
 
-        return Some(RPCBody::RequestVoteResponse(RequestVoteResponse {
-            term: term,
+        Some(RPCBody::RequestVoteResponse(RequestVoteResponse {
+            term,
             vote_granted: buffer[16] == 1,
-        }));
+        }))
     }
 
-    fn encode<T: std::io::Write>(&self, writer: BufWriter<T>) {
+    fn encode<T: std::io::Write>(&self, _writer: BufWriter<T>) {
         // TODO;
     }
 }
@@ -485,17 +484,17 @@ impl AppendEntriesRequest {
         let entries_length = u64::from_le_bytes(buffer[42..50].try_into().unwrap());
         let entries = Vec::<LogEntry>::with_capacity(entries_length as usize);
 
-        return Some(RPCBody::AppendEntriesRequest(AppendEntriesRequest {
-            term: term,
-            leader_id: leader_id,
+        Some(RPCBody::AppendEntriesRequest(AppendEntriesRequest {
+            term,
+            leader_id,
             prev_log_index: prev_log_index as usize,
-            prev_log_term: prev_log_term,
+            prev_log_term,
             leader_commit: leader_commit as usize,
-            entries: entries,
-        }));
+            entries,
+        }))
     }
 
-    fn encode<T: std::io::Write>(&self, writer: BufWriter<T>) {
+    fn encode<T: std::io::Write>(&self, _writer: BufWriter<T>) {
         // TODO;
     }
 }
@@ -520,13 +519,13 @@ impl AppendEntriesResponse {
             return None;
         }
 
-        return Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-            term: term,
+        Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+            term,
             success: buffer[16] == 1,
-        }));
+        }))
     }
 
-    fn encode<T: std::io::Write>(&self, writer: BufWriter<T>) {
+    fn encode<T: std::io::Write>(&self, _writer: BufWriter<T>) {
         // TODO;
     }
 }
@@ -583,20 +582,16 @@ impl RPCMessage {
             panic!("Unknown request type: {}.", message_type);
         };
 
-        let goodbody = if let Some(goodbody) = body {
-            goodbody
-        } else {
-            return None;
-        };
+        let goodbody = body?;
 
-        return Some(RPCMessage {
+        Some(RPCMessage {
             ok: true,
             term,
             body: goodbody,
-        });
+        })
     }
 
-    fn encode<T: std::io::Write>(writer: BufWriter<T>, term: u64, body: RPCBody) {
+    fn encode<T: std::io::Write>(_writer: BufWriter<T>, _term: u64, _body: RPCBody) {
         // TODO: fill in.
     }
 }
