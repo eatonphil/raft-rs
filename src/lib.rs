@@ -457,8 +457,8 @@ impl<SM: StateMachine> Server<SM> {
             }
 
             for (i, &match_index) in state.volatile.match_index.iter().enumerate() {
-                // self always counts as committed, so skip it as the
-                // count. quorum_needed already takes self into
+                // self always counts as part of quorum, so skip it in
+                // the count. quorum_needed already takes self into
                 // consideration (`len() / 2` not `len() / 2 + 1`).
                 if i == self.cluster_index {
                     continue;
