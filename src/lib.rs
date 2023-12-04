@@ -221,7 +221,7 @@ impl DurableState {
 
         // Write log length metadata.
         self.update(self.current_term, self.voted_for);
-        return receivers;
+        receivers
     }
 
     // Durably save non-log data.
