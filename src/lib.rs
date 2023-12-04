@@ -58,24 +58,24 @@ impl DurableState {
 
     //        ON DISK FORMAT
     //
-    // | Byte Range | Value          |
-    // |------------|----------------|
-    // | 0 - 4      | Magic Number   |
-    // | 4 - 8      | Format Version |
-    // | 8 - 16     | Term           |
-    // | 16 - 17    | Did Vote       |
-    // | 17 - 21    | Voted For      |
-    // | 21 - 29    | Log Length     |
-    // | 29 - 37    | Next Log Entry |
-    // | 37 - 41    | Checksum       |
+    // | Byte Range     | Value          |
+    // |----------------|----------------|
+    // |        0 - 4   | Magic Number   |
+    // |        4 - 8   | Format Version |
+    // |        8 - 16  | Term           |
+    // |       16 - 17  | Did Vote       |
+    // |       17 - 21  | Voted For      |
+    // |       21 - 29  | Log Length     |
+    // |       29 - 37  | Next Log Entry |
+    // |       37 - 41  | Checksum       |
     // | PAGESIZE - EOF | Log Entries    |
     //
     //           ON DISK LOG ENTRY FORMAT
     //
     // | Byte Range                  | Value          |
     // |-----------------------------|----------------|
-    // | 0 - 8                       | Term           |
-    // | 8 - 16                      | Command Length |
+    // |  0 - 8                      | Term           |
+    // |  8 - 16                     | Command Length |
     // | 16 - 20                     | Checksum       |
     // | 20 - (20 + $Command Length) | Command        |
     //
@@ -292,6 +292,14 @@ pub struct Server<SM: StateMachine> {
     state: std::sync::Mutex<State>,
 }
 
+#[derive(Copy, Clone)]
+enum RequestResponseType {
+    RequestVoteRequest = 0,
+    RequestVoteResponse = 1,
+    AppendEntriesRequest = 2,
+    AppendEntriesResponse = 3,
+}
+
 impl<SM: StateMachine> Server<SM> {
     pub fn apply(&mut self, commands: &[&[u8]]) -> ApplyResult {
         // Append commands to local durable state if leader.
@@ -325,12 +333,28 @@ impl<SM: StateMachine> Server<SM> {
         ApplyResult::Ok(results)
     }
 
+    fn handle_request_vote_request(&mut self, stream: std::net::TcpStream, reader: std::io::BufReader<std::net::TcpStream>) {
+	
+    }
+
+    fn handle_request_vote_response(&mut self, stream: std::net::TcpStream, reader: std::io::BufReader<std::net::TcpStream>) {
+	
+    }
+
+    fn handle_append_entries_request(&mut self, stream: std::net::TcpStream, reader: std::io::BufReader<std::net::TcpStream>) {
+	
+    }
+
+    fn handle_append_entries_response(&mut self, stream: std::net::TcpStream, reader: std::io::BufReader<std::net::TcpStream>) {
+	
+    }
+
     //             REQUEST WIRE PROTOCOL
     //
     // | Byte Range | Value                           |
     // |------------|---------------------------------|
-    // | 0 - 2      | Request Type                    |
-    // | 2 - 10     | Term                            |
+    // |  0 - 2     | Request Type                    |
+    // |  2 - 10    | Term                            |
     // | 10 - 14    | Leader Id / Candidate Id        |
     // | 14 - 22    | Prev Log Index / Last Log Index |
     // | 22 - 30    | Prev Log Term / Last Log Term   |
@@ -352,32 +376,60 @@ impl<SM: StateMachine> Server<SM> {
 
     fn handle_request(&mut self, stream: std::net::TcpStream) {
         let mut state = self.state.lock().unwrap();
-        let mut buffer: [u8; 38] = [0; 38];
+        let mut metadata: [u8; 10] = [0; 10];
         stream
             .set_read_timeout(Some(std::time::Duration::from_millis(5000)))
             .unwrap();
-        let mut reader = std::io::BufReader::new(stream);
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
 
-        loop {
-            if let Err(e) = reader.read_exact(&mut buffer) {
-                if matches!(e.kind(), std::io::ErrorKind::WouldBlock)
-                    || matches!(e.kind(), std::io::ErrorKind::TimedOut)
-                {
-                    return;
-                }
+	if let Err(e) = reader.read_exact(&mut metadata) {
+            if matches!(e.kind(), std::io::ErrorKind::WouldBlock)
+                || matches!(e.kind(), std::io::ErrorKind::TimedOut)
+            {
+                return;
             }
-
-            let response_type = u16::from_le_bytes(buffer[0..2].try_into().unwrap());
-
-            let term = u64::from_le_bytes(buffer[2..10].try_into().unwrap());
-            if term > state.durable_state.current_term {
-                let voted_for = state.durable_state.voted_for;
-                state.durable_state.update(term, voted_for);
-                state.volatile_state.condition = Condition::Follower;
-            }
-
-            let success = buffer[10] == 1;
         }
+
+        let message_type = u16::from_le_bytes(metadata[0..2].try_into().unwrap());
+
+        let term = u64::from_le_bytes(metadata[2..10].try_into().unwrap());
+        if term > state.durable_state.current_term {
+            let voted_for = state.durable_state.voted_for;
+            state.durable_state.update(term, voted_for);
+            state.volatile_state.condition = Condition::Follower;
+	    return;
+        }
+
+	drop(state);
+
+	if message_type == RequestResponseType::RequestVoteRequest as u16 {
+	    self.handle_request_vote_request(stream, reader);
+	} else if message_type == RequestResponseType::RequestVoteResponse as u16 {
+	    self.handle_request_vote_response(stream, reader);
+	} else if message_type == RequestResponseType::AppendEntriesRequest as u16 {
+	    self.handle_request_vote_request(stream, reader);
+	} else if message_type == RequestResponseType::AppendEntriesResponse as u16 {
+	    self.handle_request_vote_response(stream, reader);
+	}
+    }
+
+    fn leader_send_heartbeat(&mut self) {
+	
+    }
+
+    fn follower_maybe_become_candidate(&mut self) {
+	
+    }
+
+    fn candidate_become_leader(&mut self) {
+	let mut state = self.state.lock().unwrap();
+	state.volatile_state.reset();
+    }
+
+    fn candidate_request_votes(&mut self) {
+	if false {
+	    self.candidate_become_leader();
+	}
     }
 
     pub fn start(&mut self) {
@@ -417,11 +469,11 @@ impl<SM: StateMachine> Server<SM> {
             drop(state);
 
             if matches!(condition, Condition::Leader) {
-                // Send out heartbeat.
+		self.leader_send_heartbeat();
             } else if matches!(condition, Condition::Follower) {
-                // If no heartbeat received, become candidate.
+		self.follower_maybe_become_candidate();
             } else if matches!(condition, Condition::Candidate) {
-                // Request votes.
+		self.candidate_request_votes();
             }
 
             // TODO: Apply entries where lastCommit > lastApplied.
