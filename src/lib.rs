@@ -15,24 +15,22 @@ struct CRC32 {
 
 impl CRC32 {
     fn new() -> CRC32 {
-	return CRC32 {
-	    result: 0xFFFFFFFF,
-	};
+        return CRC32 { result: 0xFFFFFFFF };
     }
 
     fn update(&mut self, input: &[u8]) {
-	let len = input.len();
-	for i in 0..len {
+        let len = input.len();
+        for i in 0..len {
             self.result ^= input[i] as u32;
 
-            for i in 0..8 {
-		self.result = (self.result >> 1) ^ (self.result & 1) * POLYNOMIAL;
+            for _ in 0..8 {
+                self.result = (self.result >> 1) ^ (self.result & 1) * POLYNOMIAL;
             }
-	}	
+        }
     }
 
     fn sum(&self) -> u32 {
-	return !self.result;
+        return !self.result;
     }
 }
 
@@ -157,7 +155,7 @@ impl DurableState {
 
         self.next_log_entry = u64::from_le_bytes(metadata[29..37].try_into().unwrap());
 
-	let checksum = u32::from_le_bytes(metadata[37..41].try_into().unwrap());
+        let checksum = u32::from_le_bytes(metadata[37..41].try_into().unwrap());
         if checksum != crc32(&metadata[0..37]) {
             panic!("Bad checksum for data file.");
         }
@@ -177,15 +175,14 @@ impl DurableState {
             let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
             log_entry.command.resize(command_length as usize, b'0');
 
-	    let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
-	    let mut actual_checksum = CRC32::new();
-	    actual_checksum.update(&metadata[4..]);
+            let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
+            let mut actual_checksum = CRC32::new();
+            actual_checksum.update(&metadata[4..]);
             reader.read_exact(&mut log_entry.command).unwrap();
 
-	    actual_checksum.update(&log_entry.command);
-	    println!("{:?} + {:?}: {}", &metadata[4..], log_entry.command, actual_checksum.sum());
-	    if stored_checksum != actual_checksum.sum() {
-		panic!("Bad checksum for data file.");
+            actual_checksum.update(&log_entry.command);
+            if stored_checksum != actual_checksum.sum() {
+                panic!("Bad checksum for data file.");
             }
 
             // Read (and drop) until the next page boundary.
@@ -232,10 +229,10 @@ impl DurableState {
 
             buffer[12..20].copy_from_slice(&command_length.to_le_bytes());
 
-	    let mut checksum = CRC32::new();
-	    checksum.update(&buffer[4..20]);
-	    checksum.update(&entry.command);
-	    buffer[0..4].copy_from_slice(&checksum.sum().to_le_bytes());
+            let mut checksum = CRC32::new();
+            checksum.update(&buffer[4..20]);
+            checksum.update(&entry.command);
+            buffer[0..4].copy_from_slice(&checksum.sum().to_le_bytes());
 
             let command_first_page = if command_length <= PAGESIZE - 20 {
                 command_length
@@ -295,8 +292,8 @@ impl DurableState {
 
         metadata[29..37].copy_from_slice(&self.next_log_entry.to_le_bytes());
 
-	let checksum = crc32(&metadata[0..37]);
-	metadata[37..41].copy_from_slice(&checksum.to_le_bytes());
+        let checksum = crc32(&metadata[0..37]);
+        metadata[37..41].copy_from_slice(&checksum.to_le_bytes());
 
         self.file.write_all_at(&metadata, 0).unwrap();
 
@@ -1017,13 +1014,16 @@ mod tests {
     #[test]
     fn test_crc32() {
         let input = vec![
-	    ("", 0),
-	    ("sadkjflksadfjsdklfjsdlkfjasdflaksdjfalskdfjasldkfjasdlfasdf", 0x633DFF42),
-	    ("What a great little message.", 0xAEABCE75),
-	    ("f;lkjasdf;lkasdfasd", 0xF570C312),
-	];
-	for (input, output) in input.into_iter() {
+            ("", 0),
+            (
+                "sadkjflksadfjsdklfjsdlkfjasdflaksdjfalskdfjasldkfjasdlfasdf",
+                0x633DFF42,
+            ),
+            ("What a great little message.", 0xAEABCE75),
+            ("f;lkjasdf;lkasdfasd", 0xF570C312),
+        ];
+        for (input, output) in input.into_iter() {
             assert_eq!(crc32(input.as_bytes()), output);
-	}
+        }
     }
 }
