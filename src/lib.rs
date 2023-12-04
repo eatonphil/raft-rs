@@ -96,11 +96,11 @@ impl DurableState {
             .read_exact_at(&mut metadata[0..], 0)
             .expect("Could not read server metadata.");
 
-	// Magic number check.
-	assert_eq!(metadata[0..4], 0xFABEF15E_u32.to_le_bytes());
+        // Magic number check.
+        assert_eq!(metadata[0..4], 0xFABEF15E_u32.to_le_bytes());
 
-	// Version number check.
-	assert_eq!(metadata[4..8], 1_u32.to_le_bytes());
+        // Version number check.
+        assert_eq!(metadata[4..8], 1_u32.to_le_bytes());
 
         self.current_term = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
         let did_vote = metadata[16] == 1;
@@ -114,7 +114,7 @@ impl DurableState {
             return;
         }
 
-	self.next_log_entry = u64::from_le_bytes(metadata[29..37].try_into().unwrap());
+        self.next_log_entry = u64::from_le_bytes(metadata[29..37].try_into().unwrap());
 
         // TODO: Checksum.
 
@@ -130,7 +130,7 @@ impl DurableState {
             reader.read_exact(&mut metadata[0..]).unwrap();
             log_entry.term = u64::from_le_bytes(metadata[0..8].try_into().unwrap());
             let command_length = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
-	    assert!(command_length > 0 && command_length < 20);
+            assert!(command_length > 0 && command_length < 20);
             log_entry.command.resize(command_length as usize, b'0');
 
             // TODO: Checksum.
@@ -147,24 +147,24 @@ impl DurableState {
 
     // Durably add logs to disk.
     fn append(&mut self, commands: &[&[u8]]) {
-	// Why is this here? Why does it fail when set to the end of
-	// restore()?
+        // Why is this here? Why does it fail when set to the end of
+        // restore()?
         self.file
             .seek(std::io::SeekFrom::Start(self.next_log_entry))
             .unwrap();
 
-	let mut buffer: [u8; PAGESIZE as usize];
+        let mut buffer: [u8; PAGESIZE as usize];
 
-	// Write out all logs.
+        // Write out all logs.
         for command in commands.iter() {
-	    buffer = [0; PAGESIZE as usize];
-	    let entry = LogEntry {
+            let entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
                 command: command.to_vec(),
             };
 
-	    let command_length = entry.command.len() as u64;
+            buffer = [0; PAGESIZE as usize];
+            let command_length = entry.command.len() as u64;
 
             buffer[0..8].copy_from_slice(&entry.term.to_le_bytes());
 
@@ -172,28 +172,30 @@ impl DurableState {
 
             // TODO: Checksum.
 
-	    let command_first_page = if command_length <= PAGESIZE - 20 {
-		command_length
-	    } else {
-		PAGESIZE - 20
-	    } as usize;
-	    buffer[20..20+command_first_page].copy_from_slice(&entry.command[0..command_first_page]);
-	    self.file.write_all(&buffer).unwrap();
-	    let mut pages = 1;
-	    let mut written = command_first_page;
-	    while written < entry.command.len() {
-		let to_write = if entry.command.len() - written > PAGESIZE as usize {
-		    PAGESIZE as usize
-		} else {
-		    entry.command.len() - written
-		};
-		buffer.copy_from_slice(&entry.command[written..to_write]);
-		self.file.write_all(&buffer).unwrap();
-		written += PAGESIZE as usize;
-		pages += 1;
-	    }
+            let command_first_page = if command_length <= PAGESIZE - 20 {
+                command_length
+            } else {
+                PAGESIZE - 20
+            } as usize;
+            buffer[20..20 + command_first_page]
+                .copy_from_slice(&entry.command[0..command_first_page]);
+            self.file.write_all(&buffer).unwrap();
 
-	    self.next_log_entry += pages * PAGESIZE;
+            let mut pages = 1;
+            let mut written = command_first_page;
+            while written < entry.command.len() {
+                let to_write = if entry.command.len() - written > PAGESIZE as usize {
+                    PAGESIZE as usize
+                } else {
+                    entry.command.len() - written
+                };
+                buffer.copy_from_slice(&entry.command[written..to_write]);
+                self.file.write_all(&buffer).unwrap();
+                written += PAGESIZE as usize;
+                pages += 1;
+            }
+
+            self.next_log_entry += pages * PAGESIZE;
 
             self.log.push(entry);
         }
@@ -208,10 +210,10 @@ impl DurableState {
         self.voted_for = voted_for;
 
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
-	// Magic number.
-	metadata[0..4].copy_from_slice(&0xFABEF15E_u32.to_le_bytes());
-	// Version.
-	metadata[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        // Magic number.
+        metadata[0..4].copy_from_slice(&0xFABEF15E_u32.to_le_bytes());
+        // Version.
+        metadata[4..8].copy_from_slice(&1_u32.to_le_bytes());
 
         metadata[8..16].copy_from_slice(&term.to_le_bytes());
 
@@ -225,7 +227,7 @@ impl DurableState {
         let log_length = self.log.len() as u64;
         metadata[21..29].copy_from_slice(&log_length.to_le_bytes());
 
-	metadata[29..37].copy_from_slice(&self.next_log_entry.to_le_bytes());
+        metadata[29..37].copy_from_slice(&self.next_log_entry.to_le_bytes());
 
         // TODO: Checksum.
 
@@ -236,6 +238,7 @@ impl DurableState {
     }
 }
 
+#[derive(Copy, Clone)]
 enum Condition {
     Leader,
     Follower,
@@ -282,14 +285,14 @@ struct State {
     volatile_state: VolatileState,
 }
 
-pub struct Server<SM: StateMachine + std::marker::Send> {
+pub struct Server<SM: StateMachine> {
     cluster: Vec<Config>,
     sm: SM,
 
     state: std::sync::Mutex<State>,
 }
 
-impl<SM: StateMachine + std::marker::Send> Server<SM> {
+impl<SM: StateMachine> Server<SM> {
     pub fn apply(&mut self, commands: &[&[u8]]) -> ApplyResult {
         // Append commands to local durable state if leader.
         let mut state = self.state.lock().unwrap();
@@ -322,29 +325,117 @@ impl<SM: StateMachine + std::marker::Send> Server<SM> {
         ApplyResult::Ok(results)
     }
 
-    fn handle_request(&mut self, _connection: std::net::TcpStream) {}
+    //             REQUEST WIRE PROTOCOL
+    //
+    // | Byte Range | Value                           |
+    // |------------|---------------------------------|
+    // | 0 - 2      | Request Type                    |
+    // | 2 - 10     | Term                            |
+    // | 10 - 14    | Leader Id / Candidate Id        |
+    // | 14 - 22    | Prev Log Index / Last Log Index |
+    // | 22 - 30    | Prev Log Term / Last Log Term   |
+    // | 30 - 38    | Leader Commit Index             |
+    // | 38 - 46    | Entries Length                  |
+    // | 46 - EOM   | Entries                         |
+    //
+    //             ENTRIES WIRE PROTOCOL
+    //
+    // See: ON DISK LOG ENTRY FORMAT.
+    //
+    //             RESPONSE WIRE PROTOCOL
+    //
+    // | Byte Range | Value                  |
+    // |------------|------------------------|
+    // | 0 - 2      | Response Type          |
+    // | 2 - 10     | Term                   |
+    // | 10         | Success / Vote Granted |
 
-    // pub fn start(&mut self) {
-    // 	 std::thread::spawn(move || {
-    // 	    let listener = std::net::TcpListener::bind("127.0.0.1:80")
-    // 		.expect("Could not bind to port.");
+    fn handle_request(&mut self, stream: std::net::TcpStream) {
+        let mut state = self.state.lock().unwrap();
+        let mut buffer: [u8; 38] = [0; 38];
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(5000)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(stream);
 
-    // 	    for stream in listener.incoming() {
-    // 		let state = self.state.lock().unwrap();
-    // 		if state.tcp_done {
-    // 		    break;
-    // 		}
-    // 		drop(state);
+        loop {
+            if let Err(e) = reader.read_exact(&mut buffer) {
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock)
+                    || matches!(e.kind(), std::io::ErrorKind::TimedOut)
+                {
+                    return;
+                }
+            }
 
-    // 		if let std::io::Result::Ok(s) = stream {
-    // 		    self.handle_request(s);
-    // 		}
-    // 	    }
-    // 	});
-    // }
+            let response_type = u16::from_le_bytes(buffer[0..2].try_into().unwrap());
+
+            let term = u64::from_le_bytes(buffer[2..10].try_into().unwrap());
+            if term > state.durable_state.current_term {
+                let voted_for = state.durable_state.voted_for;
+                state.durable_state.update(term, voted_for);
+                state.volatile_state.condition = Condition::Follower;
+            }
+
+            let success = buffer[10] == 1;
+        }
+    }
+
+    pub fn start(&mut self) {
+        let (tx, rx): (
+            std::sync::mpsc::Sender<std::net::TcpStream>,
+            std::sync::mpsc::Receiver<std::net::TcpStream>,
+        ) = std::sync::mpsc::channel();
+
+        let thread_tx = tx.clone();
+        let stop = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let thread_stop = stop.clone();
+
+        std::thread::spawn(move || {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:80").expect("Could not bind to port.");
+
+            for stream in listener.incoming() {
+                let stop = thread_stop.lock().unwrap();
+                if *stop {
+                    break;
+                }
+
+                if let std::io::Result::Ok(s) = stream {
+                    thread_tx.send(s).unwrap();
+                }
+            }
+        });
+
+        loop {
+            let state = self.state.lock().unwrap();
+            let condition = state.volatile_state.condition;
+            if state.tcp_done {
+                let mut stop = stop.lock().unwrap();
+                *stop = true;
+                break;
+            }
+            drop(state);
+
+            if matches!(condition, Condition::Leader) {
+                // Send out heartbeat.
+            } else if matches!(condition, Condition::Follower) {
+                // If no heartbeat received, become candidate.
+            } else if matches!(condition, Condition::Candidate) {
+                // Request votes.
+            }
+
+            // TODO: Apply entries where lastCommit > lastApplied.
+
+            for s in rx.try_iter() {
+                self.handle_request(s);
+            }
+        }
+    }
 
     pub fn stop(&mut self) {
         let mut state = self.state.lock().unwrap();
+        // Prevent server from accepting any more log entries.
+        state.volatile_state.condition = Condition::Follower;
         state.tcp_done = true;
         drop(state);
     }
@@ -385,23 +476,23 @@ mod tests {
 
     impl TmpDir {
         fn new() -> TmpDir {
-	    let mut counter: u32 = 0;
-	    loop {
-		let dir = format!("test{}", counter);
-		// Atomically try to create a new directory.
-		if std::fs::create_dir(&dir).is_ok() {
-		    return TmpDir { dir: dir.into() };
-		}
+            let mut counter: u32 = 0;
+            loop {
+                let dir = format!("test{}", counter);
+                // Atomically try to create a new directory.
+                if std::fs::create_dir(&dir).is_ok() {
+                    return TmpDir { dir: dir.into() };
+                }
 
-		counter += 1;
-	    }
+                counter += 1;
+            }
         }
     }
 
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-           // std::fs::remove_dir_all(&self.dir).unwrap();
+            // std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
@@ -440,13 +531,13 @@ mod tests {
         v.push(b"abcdef123456"[0..].into());
         v.push(b"foobar"[0..].into());
 
-	// Write two entries and shut down.
+        // Write two entries and shut down.
         let mut durable_state = DurableState::new(&tmp.dir, 1);
-	durable_state.restore();
+        durable_state.restore();
         durable_state.append(&v);
         drop(durable_state);
 
-	// Start up and restore. Should have two entries.
+        // Start up and restore. Should have two entries.
         let mut durable_state = DurableState::new(&tmp.dir, 1);
         durable_state.restore();
         assert_eq!(durable_state.log.len(), 2);
@@ -455,22 +546,22 @@ mod tests {
         assert_eq!(durable_state.log[1].term, 0);
         assert_eq!(durable_state.log[1].command, b"foobar"[0..]);
 
-	// Add in double the existing entries and shut down.
-	v.reverse();
-	durable_state.append(&v);
-	drop(durable_state);
+        // Add in double the existing entries and shut down.
+        v.reverse();
+        durable_state.append(&v);
+        drop(durable_state);
 
-	// Start up and restore. Should now have four entries.
-	let mut durable_state = DurableState::new(&tmp.dir, 1);
+        // Start up and restore. Should now have four entries.
+        let mut durable_state = DurableState::new(&tmp.dir, 1);
         durable_state.restore();
         assert_eq!(durable_state.log.len(), 4);
         assert_eq!(durable_state.log[0].term, 0);
         assert_eq!(durable_state.log[0].command, b"abcdef123456"[0..]);
         assert_eq!(durable_state.log[1].term, 0);
         assert_eq!(durable_state.log[1].command, b"foobar"[0..]);
-	assert_eq!(durable_state.log[2].term, 0);
+        assert_eq!(durable_state.log[2].term, 0);
         assert_eq!(durable_state.log[2].command, b"foobar"[0..]);
-	assert_eq!(durable_state.log[3].term, 0);
+        assert_eq!(durable_state.log[3].term, 0);
         assert_eq!(durable_state.log[3].command, b"abcdef123456"[0..]);
     }
 }
