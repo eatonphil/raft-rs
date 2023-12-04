@@ -62,7 +62,7 @@ struct LogEntry {
 
 impl PartialEq for LogEntry {
     fn eq(&self, other: &Self) -> bool {
-        return self.command == other.command && self.term == other.term;
+        self.command == other.command && self.term == other.term
     }
 }
 
@@ -102,7 +102,7 @@ impl LogEntry {
             pages += 1;
         }
 
-        return pages;
+        pages
     }
 
     fn decode(reader: &mut BufReader<impl std::io::Read>) -> Option<LogEntry> {
@@ -130,11 +130,11 @@ impl LogEntry {
         let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
         reader.consume(rest_before_page_boundary as usize);
 
-        return Some(LogEntry {
+        Some(LogEntry {
             term,
             command,
             response_sender: None,
-        });
+        })
     }
 }
 
