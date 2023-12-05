@@ -160,15 +160,17 @@ impl DurableState {
     }
 
     fn restore(&mut self) {
+        // Create basic structure if the file was just created and is
+        // empty.
         if let Ok(m) = self.file.metadata() {
             if m.len() == 0 {
                 self.update(0, None);
             }
         }
 
-	// Seek before returning so that we're in the right place to
-	// start appending.
-	self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
+        // Seek before returning so that we're in the right place to
+        // start appending.
+        self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
 
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         self.file
