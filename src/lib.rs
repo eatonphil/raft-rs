@@ -1,3 +1,6 @@
+// References:
+// [0] In Search of an Understandable Consensus Algorithm (Extended Version) -- https://raft.github.io/raft.pdf
+
 use std::convert::TryInto;
 use std::io::Read;
 use std::io::Seek;
@@ -17,11 +20,6 @@ pub trait StateMachine {
     fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>>;
 }
 
-pub struct Config {
-    id: u32,
-    address: std::net::SocketAddr,
-}
-
 //        ON DISK FORMAT
 //
 // | Byte Range     | Value          |
@@ -38,12 +36,12 @@ pub struct Config {
 //
 //           ON DISK LOG ENTRY FORMAT
 //
-// | Byte Range                      | Value          |
-// |---------------------------------|----------------|
-// |  0 - 4                          | Checksum       |
-// |  4 - 12                         | Term           |
-// | 12 - 20                         | Command Length |
-// | 20 - (20 + $Command Length)     | Command        |
+// | Byte Range                  | Value           |
+// |-----------------------------|-----------------|
+// |  0 - 4                      | Checksum        |
+// |  4 - 12                     | Term            |
+// | 12 - 20                     | Command Length  |
+// | 20 - (20 + $Command Length) | Command         |
 //
 // After Command, the file will be padding until the next boundary
 // divisible by 4k.
@@ -337,6 +335,11 @@ struct State {
 
     durable: DurableState,
     volatile: VolatileState,
+}
+
+pub struct Config {
+    id: u32,
+    address: std::net::SocketAddr,
 }
 
 pub struct Server<SM: StateMachine> {
@@ -671,6 +674,8 @@ impl<SM: StateMachine> Server<SM> {
         let receivers = state.durable.append(commands);
         drop(state);
 
+	// TODO: Should support batches of messages all checksummed together.
+
         // Wait for messages to be applied.
         let to_add = commands.len();
         let mut results = Vec::<Vec<u8>>::with_capacity(to_add);
@@ -688,12 +693,37 @@ impl<SM: StateMachine> Server<SM> {
 
     fn handle_request_vote_request<T: std::io::Write>(
         &mut self,
-        _request: RequestVoteRequest,
+        request: RequestVoteRequest,
         encoder: &mut RPCMessageEncoder<T>,
     ) {
-        // TODO: fill in.
-
         let state = self.state.lock().unwrap();
+	let false_request = RequestVoteResponse{
+	    term: state.durable.current_term,
+	    vote_granted: false,
+	};
+
+	if request.term < state.durable.current_term {
+	    false_request.encode(encoder);
+	    return;
+	}
+
+	let canvote = if let Some(id) = state.durable.voted_for {
+	    id == request.candidate_id
+	} else {
+	    true
+	};
+	if !canvote {
+	    false_request.encode(encoder);
+	    return;
+	}
+
+	// "Raft determines which of two logs is more up-to-date
+	// by comparing the index and term of the last entries in the
+	// logs. If the logs have last entries with different terms, then
+	// the log with the later term is more up-to-date. If the logs
+	// end with the same term, then whichever log is longer is
+	// more up-to-date." - Reference [0] Page 8
+	
         RequestVoteResponse {
             term: state.durable.current_term,
             vote_granted: true,
@@ -773,9 +803,9 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     fn leader_maybe_new_quorum(&mut self) {
-        // If there exists an N such that N > commitIndex, a majority
+        // "If there exists an N such that N > commitIndex, a majority
         // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
-        // set commitIndex = N (§5.3, §5.4).
+        // set commitIndex = N (§5.3, §5.4)." - Reference [0] Page 4
         let quorum_needed = self.cluster.len() / 2;
         let mut state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Leader {
@@ -815,9 +845,9 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     fn leader_send_heartbeat(&mut self) {
-        // Upon election: send initial empty AppendEntries RPCs
+        // "Upon election: send initial empty AppendEntries RPCs
         // (heartbeat) to each server; repeat during idle periods to
-        // prevent election timeouts (§5.2)
+        // prevent election timeouts (§5.2)." - Reference [0] Page 4
         let state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Leader {
             return;
@@ -827,9 +857,9 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     fn follower_maybe_become_candidate(&mut self) {
-        // If election timeout elapses without receiving AppendEntries
+        // "If election timeout elapses without receiving AppendEntries
         // RPC from current leader or granting vote to candidate:
-        // convert to candidate
+        // convert to candidate." - Reference [0] Page 4
         let state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Follower {
             return;
