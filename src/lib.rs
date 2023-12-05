@@ -2,11 +2,9 @@
 // [0] In Search of an Understandable Consensus Algorithm (Extended Version) -- https://raft.github.io/raft.pdf
 
 use std::convert::TryInto;
-use std::io::Read;
-use std::io::Seek;
-use std::io::Write;
-use std::io::{BufRead, BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::unix::prelude::FileExt;
+use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 const PAGESIZE: u64 = 4096;
@@ -41,9 +39,6 @@ pub trait StateMachine {
 // |  4 - 12                     | Term            |
 // | 12 - 20                     | Command Length  |
 // | 20 - (20 + $Command Length) | Command         |
-//
-// After Command, the file will be padding until the next boundary
-// divisible by 4k.
 
 #[derive(Debug)]
 struct LogEntry {
@@ -104,8 +99,7 @@ impl LogEntry {
         let term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
         let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
 
-        let mut command = Vec::<u8>::with_capacity(command_length as usize);
-        command.resize(command_length as usize, b'0');
+        let mut command = vec![b'0'; command_length as usize];
 
         let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
         let mut actual_checksum = CRC32C::new();
@@ -142,7 +136,7 @@ struct DurableState {
 }
 
 impl DurableState {
-    fn new(data_directory: &std::path::Path, id: u32) -> DurableState {
+    fn new(data_directory: &std::path::Path, id: u128) -> DurableState {
         let mut filename = data_directory.to_path_buf();
         filename.push(format!("server_{}.data", id));
         let file = std::fs::File::options()
@@ -304,19 +298,19 @@ impl VolatileState {
             condition: Condition::Follower,
             commit_index: 0,
             last_applied: 0,
-            next_index: Vec::with_capacity(cluster_size),
-            match_index: Vec::with_capacity(cluster_size),
-            votes: 0,
+            next_index: vec![0; cluster_size],
+            match_index: vec![0; cluster_size],
+	    votes: 0,
         }
     }
 
     fn reset(&mut self) {
         let count = self.next_index.len();
-        self.votes = 0;
         for i in 0..count {
             self.next_index[i] = 0;
             self.match_index[i] = 0;
         }
+	self.votes = 0;
     }
 }
 
@@ -327,33 +321,20 @@ struct State {
     volatile: VolatileState,
 }
 
-pub struct Config {
-    id: u32,
-    address: std::net::SocketAddr,
-}
-
-pub struct Server<SM: StateMachine> {
-    cluster: Vec<Config>,
-    cluster_index: usize, // For this Server.
-    sm: SM,
-
-    state: std::sync::Mutex<State>,
-}
-
 //             REQUEST WIRE PROTOCOL
 //
 // | Byte Range | Value                                         |
 // |------------|-----------------------------------------------|
-// |  0         | Ok                                            |
-// |  1         | Request Type                                  |
-// |  2 - 10    | Term                                          |
-// | 10 - 14    | Leader Id / Candidate Id                      |
-// | 14 - 22    | Prev Log Index / Last Log Index               |
-// | 22 - 30    | Prev Log Term / Last Log Term                 |
-// | 30 - 38    | (Request Vote) Checksum / Leader Commit Index |
-// | 38 - 46    | Entries Length                                |
-// | 46 - 50    | (Append Entries) Checksum                     |
-// | 50 - EOM   | Entries                                       |
+// |  0 - 16    | Server Id                                     |
+// | 16         | Request Type                                  |
+// | 17 - 25    | Term                                          |
+// | 25 - 41    | Leader Id / Candidate Id                      |
+// | 41 - 49    | Prev Log Index / Last Log Index               |
+// | 49 - 57    | Prev Log Term / Last Log Term                 |
+// | 57 - 65    | (Request Vote) Checksum / Leader Commit Index |
+// | 65 - 73    | Entries Length                                |
+// | 73 - 77    | (Append Entries) Checksum                     |
+// | 77 - EOM   | Entries                                       |
 //
 //             ENTRIES WIRE PROTOCOL
 //
@@ -416,7 +397,7 @@ impl<T: std::io::Write> RPCMessageEncoder<T> {
 #[derive(Debug, PartialEq)]
 struct RequestVoteRequest {
     term: u64,
-    candidate_id: u32,
+    candidate_id: u128,
     last_log_index: usize,
     last_log_term: u64,
 }
@@ -494,7 +475,7 @@ impl RequestVoteResponse {
 #[derive(Debug, PartialEq)]
 struct AppendEntriesRequest {
     term: u64,
-    leader_id: u32,
+    leader_id: u128,
     prev_log_index: usize,
     prev_log_term: u64,
     entries: Vec<LogEntry>,
@@ -504,10 +485,10 @@ struct AppendEntriesRequest {
 impl AppendEntriesRequest {
     fn decode<T: std::io::Read>(
         mut reader: BufReader<T>,
-        metadata: [u8; 10],
+        metadata: [u8; 25],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 50] = [0; 50];
+        let mut buffer: [u8; 77] = [0; 77];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
@@ -608,13 +589,21 @@ enum RPCBody {
 
 #[derive(Debug, PartialEq)]
 struct RPCMessage {
-    ok: bool,
+    from: u128,
     term: u64,
     body: RPCBody,
 }
 
 impl RPCMessage {
-    fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
+    fn new(term: u64, body: RPCBody) -> RPCMessage {
+	return RPCMessage{
+	    from: 0,
+	    term,
+	    body,
+	};
+    }
+    
+    fn decode<T: std::io::Read>(mut reader: BufReader<T>, from: std::net::SocketAddr) -> Option<RPCMessage> {
         let mut metadata: [u8; 10] = [0; 10];
         if let Err(e) = reader.read_exact(&mut metadata) {
             if e.kind() == std::io::ErrorKind::WouldBlock
@@ -646,11 +635,95 @@ impl RPCMessage {
         };
 
         Some(RPCMessage {
-            ok: true,
+	    from: 0,
             term,
             body: body?,
         })
     }
+
+    fn encode<T: std::io::Write>(&self, mut writer: BufWriter<T>) {
+	let encoder = &mut RPCMessageEncoder::new(writer);
+	match self.body {
+	    RPCBody::RequestVoteRequest(rvr) => rvr.encode(encoder),
+	    RPCBody::RequestVoteResponse(rvr) => rvr.encode(encoder),
+	    RPCBody::AppendEntriesRequest(aer) => aer.encode(encoder),
+	    RPCBody::AppendEntriesResponse(aer) => aer.encode(encoder),
+	};
+    }
+}
+
+struct RPCManager {
+    address: std::net::SocketAddr,
+    connections: std::collections::HashMap<std::net::SocketAddr, std::net::TcpStream>,
+}
+
+impl RPCManager {
+    fn new(address: std::net::SocketAddr) -> RPCManager {
+	return RPCManager {
+	    address,
+	    connections: std::collections::HashMap::new(),
+	};
+    }
+    
+    fn start(&self) -> (std::sync::mpsc::Receiver<RPCMessage>,
+			std::sync::Arc::<std::sync::Mutex::<bool>>) {
+        let (stream_sender, stream_receiver): (
+            std::sync::mpsc::Sender<RPCMessage>,
+            std::sync::mpsc::Receiver<RPCMessage>,
+        ) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::Mutex::new(false));
+ 
+	let address = self.address;
+        let listener = std::net::TcpListener::bind(self.address)
+            .expect("Could not bind to configured address.");
+
+        for stream in listener.incoming() {
+            if let Ok(s) = stream {
+		let thread_stop = stop.clone();
+		let thread_stream_sender = stream_sender.clone();
+		std::thread::spawn(move|| {
+		    loop {
+		        let stop = thread_stop.lock().unwrap();
+			if *stop {
+			    break;
+			}
+
+			let bufreader = BufReader::new(s);
+			if let Some(msg) = RPCMessage::decode(bufreader) {
+			    msg.
+			    thread_stream_sender.send(msg).unwrap();
+			}
+		    }
+                });
+	    }
+        }
+
+	return (stream_receiver, stop);
+    }
+
+    fn send(&mut self, from: u128, message: RPCMessage) {
+	if !self.connections.contains_key(&address) {
+	    self.connections[&address] = std::net::TcpStream::connect(address).unwrap();
+	}
+
+	let stream = self.connections[&address];
+	let bufwriter = BufWriter::new(stream);
+	message.encode(bufwriter);
+    }
+}
+
+pub struct Config {
+    id: u128,
+    address: std::net::SocketAddr,
+}
+
+pub struct Server<SM: StateMachine> {
+    cluster: Vec<Config>,
+    cluster_index: usize, // For this Server.
+    sm: SM,
+    rpc_manager: RPCManager,
+
+    state: std::sync::Mutex<State>,
 }
 
 impl<SM: StateMachine> Server<SM> {
@@ -681,20 +754,20 @@ impl<SM: StateMachine> Server<SM> {
         ApplyResult::Ok(results)
     }
 
-    fn handle_request_vote_request<T: std::io::Write>(
+    fn handle_request_vote_request(
         &mut self,
         request: RequestVoteRequest,
-        encoder: &mut RPCMessageEncoder<T>,
-    ) {
-        let state = self.state.lock().unwrap();
-        let false_request = RequestVoteResponse {
-            term: state.durable.current_term,
-            vote_granted: false,
-        };
+    ) -> (u64, Option<RPCBody>) {
+        let mut state = self.state.lock().unwrap();
+	let term = state.durable.current_term;
+        let false_request =
+	    RPCBody::RequestVoteResponse(RequestVoteResponse {
+		term,
+		vote_granted: false,
+            });
 
-        if request.term < state.durable.current_term {
-            false_request.encode(encoder);
-            return;
+        if request.term < term {
+            return (term, Some(false_request));
         }
 
         let canvote = if let Some(id) = state.durable.voted_for {
@@ -703,10 +776,13 @@ impl<SM: StateMachine> Server<SM> {
             true
         };
         if !canvote {
-            false_request.encode(encoder);
-            return;
+	    return (term, Some(false_request));
         }
 
+	// "2. If votedFor is null or candidateId, and candidate’s log
+	// is at least as up-to-date as receiver’s log, grant vote
+	// (§5.2, §5.4)." - Reference [0] Page 4
+	//
         // "Raft determines which of two logs is more up-to-date
         // by comparing the index and term of the last entries in the
         // logs. If the logs have last entries with different terms, then
@@ -714,89 +790,98 @@ impl<SM: StateMachine> Server<SM> {
         // end with the same term, then whichever log is longer is
         // more up-to-date." - Reference [0] Page 8
 
-        RequestVoteResponse {
-            term: state.durable.current_term,
-            vote_granted: true,
-        }
-        .encode(encoder);
+	// TODO: Fill in.
+	let candidate_more_up_to_date = false;
+
+	if candidate_more_up_to_date {
+	    state.durable.update(state.durable.current_term, Some(request.candidate_id));
+	}
+
+	let msg =
+	    RPCBody::RequestVoteResponse(RequestVoteResponse {
+		term,
+		vote_granted: candidate_more_up_to_date,
+            });
+	return (term, Some(msg));
     }
 
-    fn handle_request_vote_response(&mut self, response: RequestVoteResponse) {
-        let mut state = self.state.lock().unwrap();
-        if state.volatile.condition != Condition::Candidate {
-            return;
-        }
+    fn handle_request_vote_response(
+        &mut self,
+        response: RequestVoteResponse,
+    ) -> (u64, Option<RPCBody>) {
+	let quorum = self.cluster.len() / 2;
+	assert!(quorum > 0 || (self.cluster.len() == 1 && quorum == 0));
 
-        let quorum = self.cluster.len() / 2;
-        assert!(quorum > 0 || (self.cluster.len() == 1 && quorum == 0));
-        if response.vote_granted {
-            state.volatile.votes += 1;
-            // This will not handle the case where a single
-            // server-cluster needs to become the leader.
-            if state.volatile.votes == quorum {
+	if response.vote_granted {
+	    let mut state = self.state.lock().unwrap();
+	    state.volatile.votes += 1;
+	    // This will not handle the case where a single
+	    // server-cluster needs to become the leader.
+	    if state.volatile.votes == quorum {
                 drop(state);
                 self.candidate_become_leader();
-            }
+	    }
         }
+
+	return (0, None);
     }
 
-    fn handle_append_entries_request<T: std::io::Write>(
+    fn handle_append_entries_request(
         &mut self,
         request: AppendEntriesRequest,
-        encoder: &mut RPCMessageEncoder<T>,
-    ) {
+    ) -> (u64, Option<RPCBody>) { 
         let state = self.state.lock().unwrap();
-        if request.term < state.durable.current_term {
-            AppendEntriesResponse {
-                term: state.durable.current_term,
-                success: false,
-            }
-            .encode(encoder);
-            return;
+	let term = state.durable.current_term;
+        if request.term < term {
+	    return (
+		term,
+		Some(RPCBody::AppendEntriesResponse(
+		    AppendEntriesResponse {
+			term,
+			success: false,
+		    })));
         }
 
         // TODO: fill in.
 
-        AppendEntriesResponse {
-            term: state.durable.current_term,
-            success: true,
-        }
-        .encode(encoder);
+	return (
+	    term,
+	    Some(RPCBody::AppendEntriesResponse(
+		AppendEntriesResponse {
+		    term,
+		    success: true,
+		})));
     }
 
-    fn handle_append_entries_response(&mut self, _response: AppendEntriesResponse) {
-        // TODO: fill in.
+    fn handle_append_entries_response(
+        &mut self,
+        response: AppendEntriesResponse
+    ) -> (u64, Option<RPCBody>) { 
+	// TODO: fill in.
+	return (0, None);
     }
 
-    fn handle_request(&mut self, stream: std::net::TcpStream) {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(2000)))
-            .unwrap();
-        let reader = BufReader::new(stream.try_clone().unwrap());
-
-        let message = if let Some(message) = RPCMessage::decode(reader) {
-            message
-        } else {
-            return;
-        };
-
-        let mut state = self.state.lock().unwrap();
+    fn rpc_handle_message(&mut self, message: RPCMessage) {
+	let mut state = self.state.lock().unwrap();
         if message.term > state.durable.current_term {
             let voted_for = state.durable.voted_for;
             state.durable.update(message.term, voted_for);
             state.volatile.condition = Condition::Follower;
         }
+	drop(state);
 
-        drop(state); // Release the lock on self.state.
-
-        let bufwriter = BufWriter::new(stream);
-        let encoder = &mut RPCMessageEncoder::new(bufwriter);
-        match message.body {
-            RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r, encoder),
-            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r),
-            RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r, encoder),
+        let (term, rsp) = match message.body {
+            RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r),
+	    RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r),
+            RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r),
             RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
         };
+	if let Some(body) = rsp {
+	    self.rpc_manager.send(message.from, RPCMessage::new(
+		term,
+		body,
+	    ));
+	}
     }
 
     fn leader_maybe_new_quorum(&mut self) {
@@ -862,12 +947,18 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        _ = 1; // Make clippy happy.
+	if false {
+	    drop(state);
+	    self.candidate_request_votes();
+	}
     }
 
     fn candidate_become_leader(&mut self) {
         let mut state = self.state.lock().unwrap();
         state.volatile.reset();
+	state.volatile.condition = Condition::Leader;
+	drop(state);
+	self.leader_send_heartbeat();
     }
 
     fn candidate_request_votes(&mut self) {
@@ -876,11 +967,22 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        drop(state);
+	let candidate_id = self.cluster[self.cluster_index].id;
+	for (i, server) in self.cluster.iter().enumerate() {
+	    if i == self.cluster_index {
+		continue;
+	    }
 
-        if false {
-            self.candidate_become_leader();
-        }
+	    let term = state.durable.current_term;
+	    self.rpc_manager.send(server.address, RPCMessage::new(
+		term,
+		RPCBody::RequestVoteRequest(RequestVoteRequest{
+		    term,
+		    candidate_id: candidate_id,
+		    last_log_index: state.durable.log.len() - 1,
+		    last_log_term: state.durable.log[state.durable.log.len()-1].term,
+		})));
+	}
     }
 
     fn apply_entries(&mut self) {
@@ -911,37 +1013,12 @@ impl<SM: StateMachine> Server<SM> {
     pub fn start(&mut self) {
         self.restore();
 
-        let (tx, rx): (
-            std::sync::mpsc::Sender<std::net::TcpStream>,
-            std::sync::mpsc::Receiver<std::net::TcpStream>,
-        ) = std::sync::mpsc::channel();
-
-        let thread_tx = tx.clone();
-        let stop = std::sync::Arc::new(std::sync::Mutex::new(false));
-        let thread_stop = stop.clone();
-
-        let address = self.cluster[self.cluster_index].address;
-
-        std::thread::spawn(move || {
-            let listener = std::net::TcpListener::bind(address)
-                .expect("Could not bind to configured address.");
-
-            for stream in listener.incoming() {
-                let stop = thread_stop.lock().unwrap();
-                if *stop {
-                    break;
-                }
-
-                if let Ok(s) = stream {
-                    thread_tx.send(s).unwrap();
-                }
-            }
-        });
+	let (message_reader, rpc_stop_mutex) = self.rpc_manager.start();
 
         loop {
             let state = self.state.lock().unwrap();
             if state.tcp_done {
-                let mut stop = stop.lock().unwrap();
+                let mut stop = rpc_stop_mutex.lock().unwrap();
                 *stop = true;
                 break;
             }
@@ -954,14 +1031,11 @@ impl<SM: StateMachine> Server<SM> {
             // Follower operations.
             self.follower_maybe_become_candidate();
 
-            // Candidate operations.
-            self.candidate_request_votes();
-
             // All condition operations.
             self.apply_entries();
 
-            for s in rx.try_iter() {
-                self.handle_request(s);
+            for msg in message_reader.try_iter() {
+                self.rpc_handle_message(msg);
             }
         }
     }
@@ -979,7 +1053,7 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     pub fn new(
-        id: u32,
+        id: u128,
         data_directory: &std::path::Path,
         sm: SM,
         cluster: Vec<Config>,
@@ -990,6 +1064,7 @@ impl<SM: StateMachine> Server<SM> {
             .position(|c| c.id == id)
             .expect("Server ID must point to valid ID within cluster config.");
         Server {
+	    rpc_manager: RPCManager::new(cluster[cluster_index].address),
             cluster,
             cluster_index,
             sm,
