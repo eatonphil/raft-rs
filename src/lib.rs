@@ -1,6 +1,7 @@
 // References:
 // [0] In Search of an Understandable Consensus Algorithm (Extended Version) -- https://raft.github.io/raft.pdf
 
+use std::boxed::Box;
 use std::convert::TryInto;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::unix::prelude::FileExt;
@@ -26,9 +27,9 @@ pub trait StateMachine {
 // |        4 - 8   | Format Version |
 // |        8 - 16  | Term           |
 // |       16 - 17  | Did Vote       |
-// |       17 - 21  | Voted For      |
-// |       21 - 29  | Log Length     |
-// |       29 - 33  | Checksum       |
+// |       17 - 33  | Voted For      |
+// |       33 - 41  | Log Length     |
+// |       41 - 45  | Checksum       |
 // | PAGESIZE - EOF | Log Entries    |
 //
 //           ON DISK LOG ENTRY FORMAT
@@ -131,7 +132,7 @@ struct DurableState {
 
     // Actual data.
     current_term: u64,
-    voted_for: Option<u32>,
+    voted_for: Option<u128>,
     log: Vec<LogEntry>,
 }
 
@@ -239,7 +240,7 @@ impl DurableState {
     }
 
     // Durably save non-log data.
-    fn update(&mut self, term: u64, voted_for: Option<u32>) {
+    fn update(&mut self, term: u64, voted_for: Option<u128>) {
         self.current_term = term;
         self.voted_for = voted_for;
 
@@ -325,7 +326,7 @@ struct State {
 //
 // | Byte Range | Value                                         |
 // |------------|-----------------------------------------------|
-// |  0 - 16    | Server Id                                     |
+// |  0 - 16    | Sender Id                                     |
 // | 16         | Request Type                                  |
 // | 17 - 25    | Term                                          |
 // | 25 - 41    | Leader Id / Candidate Id                      |
@@ -344,45 +345,42 @@ struct State {
 //
 // | Byte Range   | Value                  |
 // |--------------|------------------------|
-// |  0 - 16      | Server Id              |
+// |  0 - 16      | Sender Id              |
 // |  16          | Response Type          |
 // |  17 - 25     | Term                   |
 // |  25          | Success / Vote Granted |
 // |  26 - 30     | Checksum               |
 
 struct RPCMessageEncoder<T: std::io::Write> {
+    sender_id: u128,
     writer: BufWriter<T>,
     written: Vec<u8>,
 }
 
 impl<T: std::io::Write> RPCMessageEncoder<T> {
-    fn new(writer: BufWriter<T>) -> RPCMessageEncoder<T> {
+    fn new(sender_id: u128, writer: BufWriter<T>) -> RPCMessageEncoder<T> {
         RPCMessageEncoder {
             writer,
             written: vec![],
+	    sender_id,
         }
     }
 
     fn metadata(&mut self, kind: u8, term: u64) {
         assert_eq!(self.written.len(), 0);
 
-        self.written.push(1); // OK byte.
+	self.written.extend_from_slice(&self.sender_id.to_le_bytes());
 
         self.written.push(kind);
 
-        for byte in term.to_le_bytes().into_iter() {
-            self.written.push(byte);
-        }
+	self.written.extend_from_slice(&term.to_le_bytes());
 
         self.writer.write_all(&self.written).unwrap();
     }
 
     fn data(&mut self, data: &[u8]) {
         let offset = self.written.len();
-        for &byte in data {
-            self.written.push(byte);
-        }
-
+	self.written.extend_from_slice(data);
         self.writer.write_all(&self.written[offset..]).unwrap();
     }
 
@@ -405,21 +403,21 @@ struct RequestVoteRequest {
 impl RequestVoteRequest {
     fn decode<T: std::io::Read>(
         mut reader: BufReader<T>,
-        metadata: [u8; 10],
+        metadata: [u8; 25],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 34] = [0; 34];
+        let mut buffer: [u8; 61] = [0; 61];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[30..34].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..30]) {
+        let checksum = u32::from_le_bytes(buffer[57..61].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..57]) {
             return None;
         }
 
-        let candidate_id = u32::from_le_bytes(buffer[10..14].try_into().unwrap());
-        let last_log_index = u64::from_le_bytes(buffer[14..22].try_into().unwrap());
-        let last_log_term = u64::from_le_bytes(buffer[22..30].try_into().unwrap());
+        let candidate_id = u128::from_le_bytes(buffer[25..41].try_into().unwrap());
+        let last_log_index = u64::from_le_bytes(buffer[41..49].try_into().unwrap());
+        let last_log_term = u64::from_le_bytes(buffer[49..57].try_into().unwrap());
 
         Some(RPCBody::RequestVoteRequest(RequestVoteRequest {
             term,
@@ -447,21 +445,21 @@ struct RequestVoteResponse {
 impl RequestVoteResponse {
     fn decode<T: std::io::Read>(
         mut reader: BufReader<T>,
-        metadata: [u8; 10],
+        metadata: [u8; 25],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 15] = [0; 15];
+        let mut buffer: [u8; 30] = [0; 30];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[11..15].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..11]) {
+        let checksum = u32::from_le_bytes(buffer[26..30].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..26]) {
             return None;
         }
 
         Some(RPCBody::RequestVoteResponse(RequestVoteResponse {
             term,
-            vote_granted: buffer[10] == 1,
+            vote_granted: buffer[25] == 1,
         }))
     }
 
@@ -550,18 +548,18 @@ impl AppendEntriesResponse {
         metadata: [u8; 25],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 15] = [0; 15];
+        let mut buffer: [u8; 30] = [0; 30];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[11..15].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..11]) {
+        let checksum = u32::from_le_bytes(buffer[26..30].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..26]) {
             return None;
         }
 
         Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
             term,
-            success: buffer[10] == 1,
+            success: buffer[25] == 1,
         }))
     }
 
@@ -603,8 +601,8 @@ impl RPCMessage {
 	};
     }
     
-    fn decode<T: std::io::Read>(mut reader: BufReader<T>, from: std::net::SocketAddr) -> Option<RPCMessage> {
-        let mut metadata: [u8; 10] = [0; 10];
+    fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
+        let mut metadata: [u8; 25] = [0; 25];
         if let Err(e) = reader.read_exact(&mut metadata) {
             if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut
@@ -615,13 +613,10 @@ impl RPCMessage {
             panic!("Could not read request: {:#?}.", e);
         }
 
-        // Drop any request or response that doesn't have the Ok byte set.
-        if metadata[0] != 1 {
-            return None;
-        }
+	let server_id = u128::from_le_bytes(metadata[0..16].try_into().unwrap());
 
-        let message_type = metadata[1];
-        let term = u64::from_le_bytes(metadata[2..10].try_into().unwrap());
+        let message_type = metadata[16];
+        let term = u64::from_le_bytes(metadata[17..25].try_into().unwrap());
         let body = if message_type == RPCBodyKind::RequestVoteRequest as u8 {
             RequestVoteRequest::decode(reader, metadata, term)
         } else if message_type == RPCBodyKind::RequestVoteResponse as u8 {
@@ -635,14 +630,14 @@ impl RPCMessage {
         };
 
         Some(RPCMessage {
-	    from: 0,
+	    from: server_id,
             term,
             body: body?,
         })
     }
 
-    fn encode<T: std::io::Write>(&self, mut writer: BufWriter<T>) {
-	let encoder = &mut RPCMessageEncoder::new(writer);
+    fn encode<T: std::io::Write>(&self, sender_id: u128, mut writer: BufWriter<T>) {
+	let encoder = &mut RPCMessageEncoder::new(sender_id, writer);
 	match self.body {
 	    RPCBody::RequestVoteRequest(rvr) => rvr.encode(encoder),
 	    RPCBody::RequestVoteResponse(rvr) => rvr.encode(encoder),
@@ -653,16 +648,28 @@ impl RPCMessage {
 }
 
 struct RPCManager {
-    address: std::net::SocketAddr,
-    connections: std::collections::HashMap<std::net::SocketAddr, std::net::TcpStream>,
+    cluster: Vec<Config>,
+    server_id: u128,
+    connections: std::collections::HashMap<u128, std::net::TcpStream>,
 }
 
 impl RPCManager {
-    fn new(address: std::net::SocketAddr) -> RPCManager {
+    fn new(server_id: u128, cluster: Vec<Config>) -> RPCManager {
 	return RPCManager {
-	    address,
+	    cluster,
+	    server_id,
 	    connections: std::collections::HashMap::new(),
 	};
+    }
+
+    fn address(&self) -> std::net::SocketAddr {
+	for server in self.cluster.iter() {
+	    if server.id == self.server_id {
+		return server.address;
+	    }
+	}
+
+	panic!("Bad Server Id for configuration.")
     }
     
     fn start(&self) -> (std::sync::mpsc::Receiver<RPCMessage>,
@@ -673,8 +680,8 @@ impl RPCManager {
         ) = std::sync::mpsc::channel();
         let stop = std::sync::Arc::new(std::sync::Mutex::new(false));
  
-	let address = self.address;
-        let listener = std::net::TcpListener::bind(self.address)
+	let address = self.address();
+        let listener = std::net::TcpListener::bind(address)
             .expect("Could not bind to configured address.");
 
         for stream in listener.incoming() {
@@ -690,7 +697,7 @@ impl RPCManager {
 
 			let bufreader = BufReader::new(s);
 			if let Some(msg) = RPCMessage::decode(bufreader) {
-			    msg.
+			    self.connections[&msg.from] = s;
 			    thread_stream_sender.send(msg).unwrap();
 			}
 		    }
@@ -701,14 +708,16 @@ impl RPCManager {
 	return (stream_receiver, stop);
     }
 
-    fn send(&mut self, from: u128, message: RPCMessage) {
-	if !self.connections.contains_key(&address) {
-	    self.connections[&address] = std::net::TcpStream::connect(address).unwrap();
+    fn send(&mut self, to_server_id: u128, message: RPCMessage) {
+	let from_server_id = self.server_id;
+	if !self.connections.contains_key(&to_server_id) {
+	    let address = self.address();
+	    self.connections[&to_server_id] = std::net::TcpStream::connect(address).unwrap();
 	}
 
-	let stream = self.connections[&address];
+	let stream = self.connections[&to_server_id];
 	let bufwriter = BufWriter::new(stream);
-	message.encode(bufwriter);
+	message.encode(from_server_id, bufwriter);
     }
 }
 
@@ -719,7 +728,11 @@ pub struct Config {
 
 pub struct Server<SM: StateMachine> {
     cluster: Vec<Config>,
-    cluster_index: usize, // For this Server.
+
+    // This server.
+    server_index: usize,
+    server_id: u128,
+
     sm: SM,
     rpc_manager: RPCManager,
 
@@ -915,7 +928,7 @@ impl<SM: StateMachine> Server<SM> {
                 // self always counts as part of quorum, so skip it in
                 // the count. quorum_needed already takes self into
                 // consideration (`len() / 2` not `len() / 2 + 1`).
-                if self.cluster_index == server_index {
+                if self.server_index == server_index {
                     continue;
                 }
 
@@ -967,14 +980,14 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-	let candidate_id = self.cluster[self.cluster_index].id;
+	let candidate_id = self.server_id;
 	for (i, server) in self.cluster.iter().enumerate() {
-	    if i == self.cluster_index {
+	    if i == self.server_index {
 		continue;
 	    }
 
 	    let term = state.durable.current_term;
-	    self.rpc_manager.send(server.address, RPCMessage::new(
+	    self.rpc_manager.send(server.id, RPCMessage::new(
 		term,
 		RPCBody::RequestVoteRequest(RequestVoteRequest{
 		    term,
@@ -1059,14 +1072,15 @@ impl<SM: StateMachine> Server<SM> {
         cluster: Vec<Config>,
     ) -> Server<SM> {
         let cluster_size = cluster.len();
-        let cluster_index = cluster
+        let server_index = cluster
             .iter()
             .position(|c| c.id == id)
             .expect("Server ID must point to valid ID within cluster config.");
         Server {
-	    rpc_manager: RPCManager::new(cluster[cluster_index].address),
+	    rpc_manager: RPCManager::new(id, cluster),
             cluster,
-            cluster_index,
+            server_index,
+	    server_id: id,
             sm,
 
             state: std::sync::Mutex::new(State {
