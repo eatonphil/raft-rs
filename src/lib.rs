@@ -293,6 +293,9 @@ struct VolatileState {
     // Leader-only state.
     next_index: Vec<usize>,
     match_index: Vec<usize>,
+
+    // Candidate-only state.
+    votes: usize,
 }
 
 impl VolatileState {
@@ -303,11 +306,13 @@ impl VolatileState {
             last_applied: 0,
             next_index: Vec::with_capacity(cluster_size),
             match_index: Vec::with_capacity(cluster_size),
+            votes: 0,
         }
     }
 
     fn reset(&mut self) {
         let count = self.next_index.len();
+        self.votes = 0;
         for i in 0..count {
             self.next_index[i] = 0;
             self.match_index[i] = 0;
@@ -659,7 +664,7 @@ impl<SM: StateMachine> Server<SM> {
         let receivers = state.durable.append(commands);
         drop(state);
 
-        // TODO: Should support batches of messages all checksummed together.
+        // TODO: Should support batches of messages all checksummed together?
 
         // Wait for messages to be applied.
         let to_add = commands.len();
@@ -716,12 +721,23 @@ impl<SM: StateMachine> Server<SM> {
         .encode(encoder);
     }
 
-    fn handle_request_vote_response<T: std::io::Write>(
-        &mut self,
-        _response: RequestVoteResponse,
-        _encoder: &mut RPCMessageEncoder<T>,
-    ) {
-        // TODO: fill in.
+    fn handle_request_vote_response(&mut self, response: RequestVoteResponse) {
+        let mut state = self.state.lock().unwrap();
+        if state.volatile.condition != Condition::Candidate {
+            return;
+        }
+
+        let quorum = self.cluster.len() / 2;
+        assert!(quorum > 0 || (self.cluster.len() == 1 && quorum == 0));
+        if response.vote_granted {
+            state.volatile.votes += 1;
+            // This will not handle the case where a single
+            // server-cluster needs to become the leader.
+            if state.volatile.votes == quorum {
+                drop(state);
+                self.candidate_become_leader();
+            }
+        }
     }
 
     fn handle_append_entries_request<T: std::io::Write>(
@@ -748,11 +764,7 @@ impl<SM: StateMachine> Server<SM> {
         .encode(encoder);
     }
 
-    fn handle_append_entries_response<T: std::io::Write>(
-        &mut self,
-        _response: AppendEntriesResponse,
-        _encoder: &mut RPCMessageEncoder<T>,
-    ) {
+    fn handle_append_entries_response(&mut self, _response: AppendEntriesResponse) {
         // TODO: fill in.
     }
 
@@ -781,9 +793,9 @@ impl<SM: StateMachine> Server<SM> {
         let encoder = &mut RPCMessageEncoder::new(bufwriter);
         match message.body {
             RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r, encoder),
-            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r, encoder),
+            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r),
             RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r, encoder),
-            RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r, encoder),
+            RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
         };
     }
 
