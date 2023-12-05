@@ -30,8 +30,7 @@ pub trait StateMachine {
 // |       16 - 17  | Did Vote       |
 // |       17 - 21  | Voted For      |
 // |       21 - 29  | Log Length     |
-// |       29 - 37  | Next Log Entry |
-// |       37 - 41  | Checksum       |
+// |       29 - 33  | Checksum       |
 // | PAGESIZE - EOF | Log Entries    |
 //
 //           ON DISK LOG ENTRY FORMAT
@@ -65,7 +64,7 @@ impl PartialEq for LogEntry {
 }
 
 impl LogEntry {
-    fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) -> u64 {
+    fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) {
         *buffer = [0; PAGESIZE as usize];
         let command_length = self.command.len() as u64;
 
@@ -86,7 +85,6 @@ impl LogEntry {
         buffer[20..20 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
         writer.write_all(buffer).unwrap();
 
-        let mut pages = 1;
         let mut written = command_first_page;
         while written < self.command.len() {
             let to_write = if self.command.len() - written > PAGESIZE as usize {
@@ -97,10 +95,7 @@ impl LogEntry {
             buffer[0..to_write].copy_from_slice(&self.command[written..written + to_write]);
             writer.write_all(buffer).unwrap();
             written += PAGESIZE as usize;
-            pages += 1;
         }
-
-        pages
     }
 
     fn decode(reader: &mut BufReader<impl std::io::Read>) -> Option<LogEntry> {
@@ -139,7 +134,6 @@ impl LogEntry {
 struct DurableState {
     // Backing file.
     file: std::fs::File,
-    next_log_entry: u64, // Offset of next free space.
 
     // Actual data.
     current_term: u64,
@@ -159,7 +153,6 @@ impl DurableState {
             .expect("Could not open data file.");
         DurableState {
             file,
-            next_log_entry: PAGESIZE,
             current_term: 0,
             voted_for: None,
             log: Vec::<LogEntry>::new(),
@@ -169,11 +162,13 @@ impl DurableState {
     fn restore(&mut self) {
         if let Ok(m) = self.file.metadata() {
             if m.len() == 0 {
-                return;
+                self.update(0, None);
             }
-        } else {
-            return;
         }
+
+	// Seek before returning so that we're in the right place to
+	// start appending.
+	self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
 
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         self.file
@@ -192,20 +187,17 @@ impl DurableState {
             self.voted_for = Some(u32::from_le_bytes(metadata[17..21].try_into().unwrap()));
         }
 
+        let checksum = u32::from_le_bytes(metadata[29..33].try_into().unwrap());
+        if checksum != crc32c(&metadata[0..29]) {
+            panic!("Bad checksum for data file.");
+        }
+
         let log_length = u64::from_le_bytes(metadata[21..29].try_into().unwrap()) as usize;
         self.log = Vec::with_capacity(log_length);
         if log_length == 0 {
             return;
         }
 
-        self.next_log_entry = u64::from_le_bytes(metadata[29..37].try_into().unwrap());
-
-        let checksum = u32::from_le_bytes(metadata[37..41].try_into().unwrap());
-        if checksum != crc32c(&metadata[0..37]) {
-            panic!("Bad checksum for data file.");
-        }
-
-        self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
         let reader = &mut BufReader::new(&self.file);
         while self.log.len() < log_length {
             if let Some(e) = LogEntry::decode(reader) {
@@ -218,12 +210,6 @@ impl DurableState {
 
     // Durably add logs to disk.
     fn append(&mut self, commands: &[&[u8]]) -> Vec<std::sync::mpsc::Receiver<Vec<u8>>> {
-        // Why is this here? Why does it fail when set to the end of
-        // restore()?
-        self.file
-            .seek(std::io::SeekFrom::Start(self.next_log_entry))
-            .unwrap();
-
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         let mut receivers =
             Vec::<std::sync::mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
@@ -245,9 +231,7 @@ impl DurableState {
                 response_sender: Some(sender),
             };
 
-            let pages = entry.encode(&mut buffer, &self.file);
-
-            self.next_log_entry += pages * PAGESIZE;
+            entry.encode(&mut buffer, &self.file);
 
             self.log.push(entry);
         }
@@ -280,10 +264,8 @@ impl DurableState {
         let log_length = self.log.len() as u64;
         metadata[21..29].copy_from_slice(&log_length.to_le_bytes());
 
-        metadata[29..37].copy_from_slice(&self.next_log_entry.to_le_bytes());
-
-        let checksum = crc32c(&metadata[0..37]);
-        metadata[37..41].copy_from_slice(&checksum.to_le_bytes());
+        let checksum = crc32c(&metadata[0..29]);
+        metadata[29..33].copy_from_slice(&checksum.to_le_bytes());
 
         self.file.write_all_at(&metadata, 0).unwrap();
 
@@ -674,7 +656,7 @@ impl<SM: StateMachine> Server<SM> {
         let receivers = state.durable.append(commands);
         drop(state);
 
-	// TODO: Should support batches of messages all checksummed together.
+        // TODO: Should support batches of messages all checksummed together.
 
         // Wait for messages to be applied.
         let to_add = commands.len();
@@ -697,33 +679,33 @@ impl<SM: StateMachine> Server<SM> {
         encoder: &mut RPCMessageEncoder<T>,
     ) {
         let state = self.state.lock().unwrap();
-	let false_request = RequestVoteResponse{
-	    term: state.durable.current_term,
-	    vote_granted: false,
-	};
+        let false_request = RequestVoteResponse {
+            term: state.durable.current_term,
+            vote_granted: false,
+        };
 
-	if request.term < state.durable.current_term {
-	    false_request.encode(encoder);
-	    return;
-	}
+        if request.term < state.durable.current_term {
+            false_request.encode(encoder);
+            return;
+        }
 
-	let canvote = if let Some(id) = state.durable.voted_for {
-	    id == request.candidate_id
-	} else {
-	    true
-	};
-	if !canvote {
-	    false_request.encode(encoder);
-	    return;
-	}
+        let canvote = if let Some(id) = state.durable.voted_for {
+            id == request.candidate_id
+        } else {
+            true
+        };
+        if !canvote {
+            false_request.encode(encoder);
+            return;
+        }
 
-	// "Raft determines which of two logs is more up-to-date
-	// by comparing the index and term of the last entries in the
-	// logs. If the logs have last entries with different terms, then
-	// the log with the later term is more up-to-date. If the logs
-	// end with the same term, then whichever log is longer is
-	// more up-to-date." - Reference [0] Page 8
-	
+        // "Raft determines which of two logs is more up-to-date
+        // by comparing the index and term of the last entries in the
+        // logs. If the logs have last entries with different terms, then
+        // the log with the later term is more up-to-date. If the logs
+        // end with the same term, then whichever log is longer is
+        // more up-to-date." - Reference [0] Page 8
+
         RequestVoteResponse {
             term: state.durable.current_term,
             vote_granted: true,
