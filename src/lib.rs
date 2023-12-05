@@ -168,8 +168,9 @@ impl DurableState {
             }
         }
 
-        // Seek before returning so that we're in the right place to
-        // start appending.
+        // Ensure we're in the right place to start reading or
+        // appending logs. Metadata is always in the first page so we
+        // can pread/pwrite it.
         self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
 
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
