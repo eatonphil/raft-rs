@@ -344,11 +344,11 @@ struct State {
 //
 // | Byte Range   | Value                  |
 // |--------------|------------------------|
-// |  0           | Ok                     |
-// |  1           | Response Type          |
-// |  2 - 10      | Term                   |
-// |  10          | Success / Vote Granted |
-// |  11 - 15     | Checksum               |
+// |  0 - 16      | Server Id              |
+// |  16          | Response Type          |
+// |  17 - 25     | Term                   |
+// |  25          | Success / Vote Granted |
+// |  26 - 30     | Checksum               |
 
 struct RPCMessageEncoder<T: std::io::Write> {
     writer: BufWriter<T>,
@@ -492,16 +492,16 @@ impl AppendEntriesRequest {
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[46..50].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..46]) {
+        let checksum = u32::from_le_bytes(buffer[73..77].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..73]) {
             return None;
         }
 
-        let leader_id = u32::from_le_bytes(buffer[10..14].try_into().unwrap());
-        let prev_log_index = u64::from_le_bytes(buffer[14..22].try_into().unwrap());
-        let prev_log_term = u64::from_le_bytes(buffer[22..30].try_into().unwrap());
-        let leader_commit = u64::from_le_bytes(buffer[30..38].try_into().unwrap());
-        let entries_length = u64::from_le_bytes(buffer[38..46].try_into().unwrap()) as usize;
+        let leader_id = u128::from_le_bytes(buffer[25..41].try_into().unwrap());
+        let prev_log_index = u64::from_le_bytes(buffer[41..49].try_into().unwrap());
+        let prev_log_term = u64::from_le_bytes(buffer[49..57].try_into().unwrap());
+        let leader_commit = u64::from_le_bytes(buffer[57..65].try_into().unwrap());
+        let entries_length = u64::from_le_bytes(buffer[65..73].try_into().unwrap()) as usize;
         let mut entries = Vec::<LogEntry>::with_capacity(entries_length);
 
         while entries.len() < entries_length {
@@ -547,7 +547,7 @@ struct AppendEntriesResponse {
 impl AppendEntriesResponse {
     fn decode<T: std::io::Read>(
         mut reader: BufReader<T>,
-        metadata: [u8; 10],
+        metadata: [u8; 25],
         term: u64,
     ) -> Option<RPCBody> {
         let mut buffer: [u8; 15] = [0; 15];
