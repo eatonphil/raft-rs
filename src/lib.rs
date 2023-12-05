@@ -790,21 +790,26 @@ impl<SM: StateMachine> Server<SM> {
                 break;
             }
 
-            for (i, &match_index) in state.volatile.match_index.iter().enumerate() {
+            assert!(quorum > 0 || (self.cluster.len() == 1 && quorum == 0));
+            for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
+                // Here so that in the case of there being a single
+                // server in the cluster, we still (trivially) achieve
+                // new quorums.
+                if quorum == 0 {
+                    state.volatile.commit_index = i;
+                    break;
+                }
+
                 // self always counts as part of quorum, so skip it in
                 // the count. quorum_needed already takes self into
                 // consideration (`len() / 2` not `len() / 2 + 1`).
-                if i == self.cluster_index {
+                if self.cluster_index == server_index {
                     continue;
                 }
 
                 if match_index >= i && state.durable.log[i].term == state.durable.current_term {
                     quorum -= 1;
                 }
-            }
-
-            if quorum == 0 {
-                state.volatile.commit_index = i;
             }
         }
     }
