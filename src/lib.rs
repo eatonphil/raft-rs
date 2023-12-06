@@ -209,7 +209,7 @@ impl DurableState {
     // Durably add logs to disk.
     fn append(
         &mut self,
-        commands: &Vec<Vec<u8>>,
+        commands: &[Vec<u8>],
         result_sender: Option<mpsc::Sender<ApplyResult>>,
     ) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
@@ -757,7 +757,7 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         state.durable.append(&commands, Some(result_sender));
-        return result_receiver;
+        result_receiver
     }
 
     fn handle_request_vote_request(
