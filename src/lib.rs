@@ -1427,17 +1427,18 @@ mod tests {
 
         // First test apply doesn't work as not a leader.
         let result_receiver = server.apply(vec![vec![]]);
-        assert_eq!(result_receiver.recv().unwrap(), ApplyResult::NotALeader);
+	// Use try_recv() not recv() since recv() would block so the
+	// test would hang if the logic were ever wrong. try_recv() is
+	// correct since the message *must* at this point be available
+	// to read.
+        assert_eq!(result_receiver.try_recv().unwrap(), ApplyResult::NotALeader);
 
         // Now after initializing (realizing there's only one server, so is leader), try again.
         server.init();
 
         let result_receiver = server.apply(vec!["abc".as_bytes().to_vec()]);
         server.tick();
-	// Use try_recv() not recv() since recv() would block so the
-	// test would hang if the logic were ever wrong. try_recv() is
-	// correct since the message *must* at this point be available
-	// to read.
+	// See above note about try_recv() vs recv().
         let result = result_receiver.try_recv().unwrap();
         assert_eq!(result, ApplyResult::Ok("abc".as_bytes().to_vec()));
 
