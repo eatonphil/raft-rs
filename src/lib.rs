@@ -166,7 +166,7 @@ impl DurableState {
         // state into the right place.
         if let Ok(m) = self.file.metadata() {
             if m.len() == 0 {
-                self.append(&vec![vec![]], None);
+                self.append(&[vec![]], None);
                 return;
             }
         }
