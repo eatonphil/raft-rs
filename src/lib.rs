@@ -597,11 +597,11 @@ struct RPCMessage {
 
 impl RPCMessage {
     fn new(term: u64, body: RPCBody) -> RPCMessage {
-        return RPCMessage {
+        RPCMessage {
             from: 0,
             term,
             body,
-        };
+        }
     }
 
     fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
@@ -665,14 +665,14 @@ impl RPCManager {
             mpsc::Sender<RPCMessage>,
             mpsc::Receiver<RPCMessage>,
         ) = mpsc::channel();
-        return (
+        (
             RPCManager {
-                cluster: cluster,
+                cluster,
                 server_id,
                 stream_sender,
             },
             stream_receiver,
-        );
+        )
     }
 
     fn address_from_id(&self, id: u128) -> SocketAddr {
@@ -692,28 +692,26 @@ impl RPCManager {
         let listener =
             std::net::TcpListener::bind(address).expect("Could not bind to configured address.");
 
-        for stream in listener.incoming() {
-            if let Ok(s) = stream {
-                let thread_stop = stop.clone();
-                let thread_stream_sender = self.stream_sender.clone();
-                std::thread::spawn(move || {
-                    let stream = Arc::new(s);
-                    loop {
-                        let stop = thread_stop.lock().unwrap();
-                        if *stop {
-                            break;
-                        }
-
-                        let bufreader = BufReader::new(stream.as_ref());
-                        if let Some(msg) = RPCMessage::decode(bufreader) {
-                            thread_stream_sender.send(msg).unwrap();
-                        }
+        for stream in listener.incoming().flatten() {
+            let thread_stop = stop.clone();
+            let thread_stream_sender = self.stream_sender.clone();
+            std::thread::spawn(move || {
+                let stream = Arc::new(stream);
+                loop {
+                    let stop = thread_stop.lock().unwrap();
+                    if *stop {
+                        break;
                     }
-                });
-            }
-        }
 
-        return stop;
+                    let bufreader = BufReader::new(stream.as_ref());
+                    if let Some(msg) = RPCMessage::decode(bufreader) {
+                        thread_stream_sender.send(msg).unwrap();
+                    }
+                }
+            });
+	}
+
+        stop
     }
 
     fn send(&mut self, to_server_id: u128, message: RPCMessage) {
@@ -841,7 +839,7 @@ impl<SM: StateMachine> Server<SM> {
             term,
             vote_granted: candidate_more_up_to_date,
         });
-        return (term, Some(msg));
+        (term, Some(msg))
     }
 
     fn handle_request_vote_response(
@@ -862,7 +860,7 @@ impl<SM: StateMachine> Server<SM> {
             }
         }
 
-        return (0, None);
+        (0, None)
     }
 
     fn handle_append_entries_request(
@@ -886,13 +884,13 @@ impl<SM: StateMachine> Server<SM> {
 
         // TODO: fill in.
 
-        return (
+        (
             term,
             Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                 term,
                 success: true,
             })),
-        );
+        )
     }
 
     fn handle_append_entries_response(
@@ -900,7 +898,7 @@ impl<SM: StateMachine> Server<SM> {
         _response: AppendEntriesResponse,
     ) -> (u64, Option<RPCBody>) {
         // TODO: fill in.
-        return (0, None);
+        (0, None)
     }
 
     fn rpc_handle_message(&mut self, message: RPCMessage) {
