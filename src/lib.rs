@@ -1408,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn test_server_start_stop() {
+    fn test_single_server_apply_full_path() {
         let tmp = TmpDir::new();
         let config = Config {
             server_id: 0,
