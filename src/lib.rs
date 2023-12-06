@@ -5,7 +5,7 @@ use std::convert::TryInto;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::net::SocketAddr;
 use std::os::unix::prelude::FileExt;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 const PAGESIZE: u64 = 4096;
@@ -150,23 +150,26 @@ impl DurableState {
             file,
             current_term: 0,
             voted_for: None,
-            log: Vec::<LogEntry>::new(),
+            log: vec![],
         }
     }
 
     fn restore(&mut self) {
-        // Create basic structure if the file was just created and is
-        // empty.
-        if let Ok(m) = self.file.metadata() {
-            if m.len() == 0 {
-                self.update(0, None);
-            }
-        }
-
         // Ensure we're in the right place to start reading or
         // appending logs. Metadata is always in the first page so we
         // can pread/pwrite it.
         self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
+	
+	// If there's nothing to restore, calling append with the
+	// required 0th empty log entry will be sufficient to get
+	// state into the right place.
+        if let Ok(m) = self.file.metadata() {
+            if m.len() == 0 {
+		let empty_entry: &[u8] = &[];
+                self.append(&[empty_entry]);
+		return;
+            }
+        }
 
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         self.file
@@ -192,9 +195,6 @@ impl DurableState {
 
         let log_length = u64::from_le_bytes(metadata[33..41].try_into().unwrap()) as usize;
         self.log = Vec::with_capacity(log_length);
-        if log_length == 0 {
-            return;
-        }
 
         let reader = &mut BufReader::new(&self.file);
         while self.log.len() < log_length {
@@ -211,7 +211,7 @@ impl DurableState {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         let mut receivers = Vec::<mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
 
-        // Write out all logs.
+        // Write out all new logs.
         for command in commands.iter() {
             let (sender, receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) =
                 mpsc::channel();
@@ -1029,7 +1029,7 @@ impl<SM: StateMachine> Server<SM> {
         let mut state = self.state.lock().unwrap();
         let mut to_apply = Vec::<Vec<u8>>::new();
         let starting_index = state.volatile.last_applied + 1;
-        while state.volatile.last_applied <= state.volatile.commit_index {
+        while state.volatile.last_applied < state.volatile.commit_index {
             state.volatile.last_applied += 1;
             to_apply.push(
                 state.durable.log[state.volatile.last_applied]
@@ -1050,16 +1050,22 @@ impl<SM: StateMachine> Server<SM> {
         }
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self, stop_receiver: mpsc::Receiver<bool>) {
         self.restore();
 
         let rpc_stop_mutex = self.rpc_manager.start();
 
         loop {
-            let state = self.state.lock().unwrap();
-            if state.tcp_done {
-                let mut stop = rpc_stop_mutex.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+	    if stop_receiver.try_recv().is_ok() {
+		// Prevent server from accepting any more log entries.
+		state.volatile.condition = Condition::Follower;
+
+		// Stop RPCManager.
+		let mut stop = rpc_stop_mutex.lock().unwrap();
                 *stop = true;
+
+		// Stop doing any local state machine activities.
                 break;
             }
             drop(state);
@@ -1078,13 +1084,6 @@ impl<SM: StateMachine> Server<SM> {
                 self.rpc_handle_message(msg);
             }
         }
-    }
-
-    pub fn stop(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        // Prevent server from accepting any more log entries.
-        state.volatile.condition = Condition::Follower;
-        state.tcp_done = true;
     }
 
     pub fn restore(&self) {
@@ -1208,30 +1207,36 @@ mod tests {
     }
 
     #[test]
-    fn test_save_and_restore() {
+    fn test_update_and_restore() {
         let tmp = TmpDir::new();
 
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, None);
-        assert_eq!(durable.log.len(), 0);
+        assert_eq!(durable.log.len(), 1);
+	assert_eq!(durable.log[0].term, 0);
+	assert_eq!(durable.log[0].command, vec![]);
 
         durable.update(10234, Some(40592));
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, Some(40592));
-        assert_eq!(durable.log.len(), 0);
+        assert_eq!(durable.log.len(), 1);
+	assert_eq!(durable.log[0].term, 0);
+	assert_eq!(durable.log[0].command, vec![]);
         drop(durable);
 
         let mut durable = DurableState::new(&tmp.dir, 1);
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, None);
-        assert_eq!(durable.log.len(), 0);
+	assert_eq!(durable.log.len(), 0);
 
         durable.restore();
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, Some(40592));
-        assert_eq!(durable.log.len(), 0);
+        assert_eq!(durable.log.len(), 1);
+	assert_eq!(durable.log[0].term, 0);
+	assert_eq!(durable.log[0].command, vec![]);
     }
 
     #[test]
@@ -1251,11 +1256,11 @@ mod tests {
         // Start up and restore. Should have two entries.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
-        assert_eq!(durable.log.len(), 2);
-        assert_eq!(durable.log[0].term, 0);
-        assert_eq!(durable.log[0].command, b"abcdef123456"[0..]);
+        assert_eq!(durable.log.len(), 3);
         assert_eq!(durable.log[1].term, 0);
-        assert_eq!(durable.log[1].command, b"foobar"[0..]);
+        assert_eq!(durable.log[1].command, b"abcdef123456"[0..]);
+        assert_eq!(durable.log[2].term, 0);
+        assert_eq!(durable.log[2].command, b"foobar"[0..]);
 
         // Add in double the existing entries and shut down.
         v.reverse();
@@ -1271,21 +1276,21 @@ mod tests {
         // Start up and restore. Should now have four entries.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
-        assert_eq!(durable.log.len(), 7);
-        assert_eq!(durable.log[0].term, 0);
-        assert_eq!(durable.log[0].command, b"abcdef123456"[0..]);
+        assert_eq!(durable.log.len(), 8);
         assert_eq!(durable.log[1].term, 0);
-        assert_eq!(durable.log[1].command, b"foobar"[0..]);
+        assert_eq!(durable.log[1].command, b"abcdef123456"[0..]);
         assert_eq!(durable.log[2].term, 0);
         assert_eq!(durable.log[2].command, b"foobar"[0..]);
         assert_eq!(durable.log[3].term, 0);
-        assert_eq!(durable.log[3].command, b"abcdef123456"[0..]);
+        assert_eq!(durable.log[3].command, b"foobar"[0..]);
         assert_eq!(durable.log[4].term, 0);
-        assert_eq!(durable.log[4].command, longcommand.as_bytes());
+        assert_eq!(durable.log[4].command, b"abcdef123456"[0..]);
         assert_eq!(durable.log[5].term, 0);
-        assert_eq!(durable.log[5].command, longcommand2.as_bytes());
+        assert_eq!(durable.log[5].command, longcommand.as_bytes());
         assert_eq!(durable.log[6].term, 0);
-        assert_eq!(durable.log[6].command, longcommand3.as_bytes());
+        assert_eq!(durable.log[6].command, longcommand2.as_bytes());
+        assert_eq!(durable.log[7].term, 0);
+        assert_eq!(durable.log[7].command, longcommand3.as_bytes());
     }
 
     #[test]
@@ -1401,6 +1406,51 @@ mod tests {
         assert_eq!(msg, received);
         let mut stop = stop_mutex.lock().unwrap();
         *stop = true;
+    }
+
+    struct TestStateMachine {}
+
+    impl StateMachine for TestStateMachine {
+	fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+	    return messages;
+	}
+    }
+
+    #[test]
+    fn test_server_start_stop() {
+	let (stop_sender, stop_receiver): (
+            mpsc::Sender<bool>,
+            mpsc::Receiver<bool>,
+        ) = mpsc::channel();
+
+	// TODO: Seems to need to switch to a receiver style.
+	// let (command_sender, command_receiver): (
+        //     mpsc::Sender<Vec<Vec<u8>>>,
+        //     mpsc::Receiver<Vec<Vec<u8>>>,
+        // ) = mpsc::channel();
+
+	std::thread::spawn(move || {
+	    let tmp = TmpDir::new();
+	    let config = Config{
+		server_id: 0,
+		server_index: 0,
+		cluster: vec![ServerConfig {
+		    id: 0,
+		    address: "127.0.0.1:20002".parse().unwrap(),
+		}],
+
+		heartbeat_frequency: Duration::from_secs(5),
+		heartbeat_timeout: Duration::from_secs(10),
+	    };
+	    
+	    let sm = TestStateMachine{};
+	    let mut server = Server::new(&tmp.dir, sm, config);
+
+	    server.start(stop_receiver);
+	});
+
+	std::thread::sleep(Duration::from_secs(5));
+	stop_sender.send(true).unwrap();
     }
 
     #[test]
