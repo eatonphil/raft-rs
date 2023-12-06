@@ -3,7 +3,7 @@
 
 use std::convert::TryInto;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr};
 use std::os::unix::prelude::FileExt;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -654,25 +654,24 @@ struct RPCManager {
     cluster: Vec<ServerConfig>,
     server_id: u128,
     stream_sender: mpsc::Sender<RPCMessage>,
+    stream_receiver: mpsc::Receiver<RPCMessage>,
 }
 
 impl RPCManager {
     fn new(
         server_id: u128,
         cluster: Vec<ServerConfig>,
-    ) -> (RPCManager, mpsc::Receiver<RPCMessage>) {
+    ) -> RPCManager {
         let (stream_sender, stream_receiver): (
             mpsc::Sender<RPCMessage>,
             mpsc::Receiver<RPCMessage>,
         ) = mpsc::channel();
-        (
-            RPCManager {
-                cluster,
-                server_id,
-                stream_sender,
-            },
-            stream_receiver,
-        )
+        RPCManager {
+            cluster,
+            server_id,
+            stream_sender,
+	    stream_receiver,
+        }
     }
 
     fn address_from_id(&self, id: u128) -> SocketAddr {
@@ -692,38 +691,35 @@ impl RPCManager {
         let listener =
             std::net::TcpListener::bind(address).expect("Could not bind to configured address.");
 
-        for stream in listener.incoming().flatten() {
-            let thread_stop = stop.clone();
-            let thread_stream_sender = self.stream_sender.clone();
-            std::thread::spawn(move || {
-                let stream = Arc::new(stream);
-                loop {
-                    let stop = thread_stop.lock().unwrap();
-                    if *stop {
-                        break;
-                    }
+	let thread_stop = stop.clone();
+	let thread_stream_sender = self.stream_sender.clone();
+	std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+		let stop = thread_stop.lock().unwrap();
+		if *stop {
+                    break;
+		}
 
-                    let bufreader = BufReader::new(stream.as_ref());
-                    if let Some(msg) = RPCMessage::decode(bufreader) {
-                        thread_stream_sender.send(msg).unwrap();
-                    }
-                }
-            });
-	}
+		let bufreader = BufReader::new(stream);
+		if let Some(msg) = RPCMessage::decode(bufreader) {
+                    thread_stream_sender.send(msg).unwrap();
+		}
+	    }
+	});
 
         stop
     }
 
-    fn send(&mut self, to_server_id: u128, message: RPCMessage) {
+    fn send(&mut self, to_server_id: u128, message: &RPCMessage) {
         let address = self.address_from_id(to_server_id);
         let thread_stream_sender = self.stream_sender.clone();
         let server_id = self.server_id;
 
-        std::thread::spawn(move || {
-            let stream = std::net::TcpStream::connect(address).unwrap();
-            let bufwriter = BufWriter::new(stream.try_clone().unwrap());
-            message.encode(server_id, bufwriter);
+	let stream = std::net::TcpStream::connect(address).unwrap();
+        let bufwriter = BufWriter::new(stream.try_clone().unwrap());
+        message.encode(server_id, bufwriter);
 
+        std::thread::spawn(move || {
             let bufreader = BufReader::new(stream);
             if let Some(response) = RPCMessage::decode(bufreader) {
                 thread_stream_sender.send(response).unwrap();
@@ -754,7 +750,6 @@ pub struct Server<SM: StateMachine> {
 
     sm: SM,
     rpc_manager: RPCManager,
-    rpc_receiver: mpsc::Receiver<RPCMessage>,
 
     state: Mutex<State>,
 }
@@ -917,8 +912,8 @@ impl<SM: StateMachine> Server<SM> {
             RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
         };
         if let Some(body) = rsp {
-            self.rpc_manager
-                .send(message.from, RPCMessage::new(term, body));
+	    let msg = &RPCMessage::new(term, body);
+            self.rpc_manager .send(message.from, msg);
         }
     }
 
@@ -1017,24 +1012,22 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
+	let msg = &RPCMessage::new(
+            term,
+            RPCBody::RequestVoteRequest(RequestVoteRequest {
+                term,
+                candidate_id: self.config.server_id,
+                last_log_index: state.durable.log.len() - 1,
+                last_log_term: state.durable.log[state.durable.log.len() - 1].term,
+            }),
+        );
         for server in self.config.cluster.iter() {
             // Skip self.
             if server.id == my_server_id {
                 continue;
             }
 
-            self.rpc_manager.send(
-                server.id,
-                RPCMessage::new(
-                    term,
-                    RPCBody::RequestVoteRequest(RequestVoteRequest {
-                        term,
-                        candidate_id: self.config.server_id,
-                        last_log_index: state.durable.log.len() - 1,
-                        last_log_term: state.durable.log[state.durable.log.len() - 1].term,
-                    }),
-                ),
-            );
+            self.rpc_manager.send(server.id, msg);
         }
     }
 
@@ -1087,7 +1080,7 @@ impl<SM: StateMachine> Server<SM> {
             // All condition operations.
             self.apply_entries();
 
-            if let Ok(msg) = self.rpc_receiver.try_recv() {
+            if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
                 self.rpc_handle_message(msg);
             }
         }
@@ -1112,10 +1105,9 @@ impl<SM: StateMachine> Server<SM> {
     ) -> Server<SM> {
         let cluster_size = config.cluster.len();
 	let id = config.server_id;
-        let (rpc_manager, rpc_receiver) = RPCManager::new(config.server_id, config.cluster.clone());
+        let rpc_manager = RPCManager::new(config.server_id, config.cluster.clone());
         Server {
             rpc_manager,
-            rpc_receiver,
 	    config,
             sm,
 
@@ -1467,6 +1459,32 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn test_rpc_manager() {
+	let config = vec![
+	    ServerConfig{
+		id: 0,
+		address: "127.0.0.1:20001".parse().unwrap(),
+	    },
+	];
+	let mut rpcm = RPCManager::new(0, config);
+	let stop_mutex = rpcm.start();
+
+	let msg = RPCMessage::new(
+	    1023,
+	    RPCBody::RequestVoteRequest(RequestVoteRequest{
+		term: 1023,
+		candidate_id: 2132,
+		last_log_index: 1823,
+		last_log_term: 193,
+            }));
+	rpcm.send(0, &msg);
+	let received = rpcm.stream_receiver.recv().unwrap();
+	assert_eq!(msg, received);
+	let mut stop = stop_mutex.lock().unwrap();
+	*stop = true;
     }
 
     #[test]
