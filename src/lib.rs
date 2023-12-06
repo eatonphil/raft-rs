@@ -5,14 +5,15 @@ use std::convert::TryInto;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::net::SocketAddr;
 use std::os::unix::prelude::FileExt;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PAGESIZE: u64 = 4096;
 
+#[derive(Debug, PartialEq)]
 pub enum ApplyResult {
     NotALeader,
-    Ok(Vec<Vec<u8>>),
+    Ok(Vec<u8>),
 }
 
 pub trait StateMachine {
@@ -46,7 +47,7 @@ struct LogEntry {
     // In-memory channel for sending results back to a user of the
     // library. Will always be `None` when a log is read back from
     // disk.
-    response_sender: Option<mpsc::Sender<Vec<u8>>>,
+    result_sender: Option<mpsc::Sender<ApplyResult>>,
 
     // Actual data.
     command: Vec<u8>,
@@ -121,7 +122,7 @@ impl LogEntry {
         Some(LogEntry {
             term,
             command,
-            response_sender: None,
+            result_sender: None,
         })
     }
 }
@@ -159,15 +160,14 @@ impl DurableState {
         // appending logs. Metadata is always in the first page so we
         // can pread/pwrite it.
         self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
-	
-	// If there's nothing to restore, calling append with the
-	// required 0th empty log entry will be sufficient to get
-	// state into the right place.
+
+        // If there's nothing to restore, calling append with the
+        // required 0th empty log entry will be sufficient to get
+        // state into the right place.
         if let Ok(m) = self.file.metadata() {
             if m.len() == 0 {
-		let empty_entry: &[u8] = &[];
-                self.append(&[empty_entry]);
-		return;
+                self.append(&vec![vec![]], None);
+                return;
             }
         }
 
@@ -207,23 +207,21 @@ impl DurableState {
     }
 
     // Durably add logs to disk.
-    fn append(&mut self, commands: &[&[u8]]) -> Vec<mpsc::Receiver<Vec<u8>>> {
+    fn append(
+        &mut self,
+        commands: &Vec<Vec<u8>>,
+        result_sender: Option<mpsc::Sender<ApplyResult>>,
+    ) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
-        let mut receivers = Vec::<mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
 
         // Write out all new logs.
         for command in commands.iter() {
-            let (sender, receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) =
-                mpsc::channel();
-
-            receivers.push(receiver);
-
             let entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
                 command: command.to_vec(),
 
-                response_sender: Some(sender),
+                result_sender: result_sender.clone(),
             };
 
             entry.encode(&mut buffer, &self.file);
@@ -233,7 +231,6 @@ impl DurableState {
 
         // Write log length metadata.
         self.update(self.current_term, self.voted_for);
-        receivers
     }
 
     // Durably save non-log data.
@@ -315,8 +312,7 @@ impl VolatileState {
 }
 
 struct State {
-    tcp_done: bool,
-
+    stopped: bool,
     durable: DurableState,
     volatile: VolatileState,
 }
@@ -652,6 +648,7 @@ struct RPCManager {
     server_id: u128,
     stream_sender: mpsc::Sender<RPCMessage>,
     stream_receiver: mpsc::Receiver<RPCMessage>,
+    stop_mutex: Arc<Mutex<bool>>,
 }
 
 impl RPCManager {
@@ -665,6 +662,7 @@ impl RPCManager {
             server_id,
             stream_sender,
             stream_receiver,
+            stop_mutex: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -678,14 +676,12 @@ impl RPCManager {
         panic!("Bad Server Id for configuration.")
     }
 
-    fn start(&mut self) -> std::sync::Arc<Mutex<bool>> {
-        let stop = std::sync::Arc::new(Mutex::new(false));
-
+    fn start(&mut self) {
         let address = self.address_from_id(self.server_id);
         let listener =
             std::net::TcpListener::bind(address).expect("Could not bind to configured address.");
 
-        let thread_stop = stop.clone();
+        let thread_stop = self.stop_mutex.clone();
         let thread_stream_sender = self.stream_sender.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -700,8 +696,6 @@ impl RPCManager {
                 }
             }
         });
-
-        stop
     }
 
     fn send(&mut self, to_server_id: u128, message: &RPCMessage) {
@@ -749,31 +743,21 @@ pub struct Server<SM: StateMachine> {
 }
 
 impl<SM: StateMachine> Server<SM> {
-    pub fn apply(&mut self, commands: &[&[u8]]) -> ApplyResult {
+    pub fn apply(&mut self, commands: Vec<Vec<u8>>) -> mpsc::Receiver<ApplyResult> {
+        let (result_sender, result_receiver): (
+            mpsc::Sender<ApplyResult>,
+            mpsc::Receiver<ApplyResult>,
+        ) = mpsc::channel();
+
         // Append commands to local durable state if leader.
         let mut state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Leader {
-            return ApplyResult::NotALeader;
+            result_sender.send(ApplyResult::NotALeader).unwrap();
+            return result_receiver;
         }
 
-        let receivers = state.durable.append(commands);
-        drop(state);
-
-        // TODO: Should support batches of messages all checksummed together?
-
-        // Wait for messages to be applied.
-        let to_add = commands.len();
-        let mut results = Vec::<Vec<u8>>::with_capacity(to_add);
-        for r in receivers {
-            for result in r.try_iter() {
-                // TODO: Is this clone() necessary?
-                results.push(result.clone());
-            }
-        }
-        // TODO: Handle taking too long.
-
-        assert!(results.len() == to_add);
-        ApplyResult::Ok(results)
+        state.durable.append(&commands, Some(result_sender));
+        return result_receiver;
     }
 
     fn handle_request_vote_request(
@@ -922,10 +906,11 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         let log_length = state.durable.log.len();
-        for i in log_length..0 {
+
+        'outer: for i in (0..log_length).rev() {
             let mut quorum = quorum_needed;
 
-            if i <= state.volatile.commit_index {
+            if i <= state.volatile.commit_index && self.config.cluster.len() > 1 {
                 break;
             }
 
@@ -936,7 +921,7 @@ impl<SM: StateMachine> Server<SM> {
                 // new quorums.
                 if quorum == 0 {
                     state.volatile.commit_index = i;
-                    break;
+                    break 'outer;
                 }
 
                 // self always counts as part of quorum, so skip it in
@@ -1042,47 +1027,54 @@ impl<SM: StateMachine> Server<SM> {
         if !to_apply.is_empty() {
             let results = self.sm.apply(to_apply);
             for (i, result) in results.into_iter().enumerate() {
-                if let Some(sender) = &state.durable.log[starting_index + i].response_sender {
-                    // TODO: Is this clone necessary?
-                    sender.send(result.clone()).unwrap();
+                if let Some(sender) = &state.durable.log[starting_index + i].result_sender {
+                    sender.send(ApplyResult::Ok(result)).unwrap();
                 }
             }
         }
     }
 
-    pub fn start(&mut self, stop_receiver: mpsc::Receiver<bool>) {
+    pub fn init(&mut self) {
         self.restore();
 
-        let rpc_stop_mutex = self.rpc_manager.start();
+        self.rpc_manager.start();
 
-        loop {
+        if self.config.cluster.len() == 1 {
             let mut state = self.state.lock().unwrap();
-	    if stop_receiver.try_recv().is_ok() {
-		// Prevent server from accepting any more log entries.
-		state.volatile.condition = Condition::Follower;
+            state.volatile.condition = Condition::Leader;
+        }
+    }
 
-		// Stop RPCManager.
-		let mut stop = rpc_stop_mutex.lock().unwrap();
-                *stop = true;
+    pub fn stop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        // Prevent server from accepting any more log entries.
+        state.volatile.condition = Condition::Follower;
+        state.stopped = true;
 
-		// Stop doing any local state machine activities.
-                break;
-            }
-            drop(state);
+        // Stop RPCManager.
+        let mut stop = self.rpc_manager.stop_mutex.lock().unwrap();
+        *stop = true;
+    }
 
-            // Leader operations.
-            self.leader_send_heartbeat();
-            self.leader_maybe_new_quorum();
+    pub fn tick(&mut self) {
+        let state = self.state.lock().unwrap();
+        if state.stopped {
+            return;
+        }
+        drop(state);
 
-            // Follower operations.
-            self.follower_maybe_become_candidate();
+        // Leader operations.
+        self.leader_send_heartbeat();
+        self.leader_maybe_new_quorum();
 
-            // All condition operations.
-            self.apply_entries();
+        // Follower operations.
+        self.follower_maybe_become_candidate();
 
-            if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
-                self.rpc_handle_message(msg);
-            }
+        // All condition operations.
+        self.apply_entries();
+
+        if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
+            self.rpc_handle_message(msg);
         }
     }
 
@@ -1103,8 +1095,7 @@ impl<SM: StateMachine> Server<SM> {
             state: Mutex::new(State {
                 durable: DurableState::new(data_directory, id),
                 volatile: VolatileState::new(cluster_size),
-
-                tcp_done: false,
+                stopped: false,
             }),
         }
     }
@@ -1215,42 +1206,42 @@ mod tests {
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, None);
         assert_eq!(durable.log.len(), 1);
-	assert_eq!(durable.log[0].term, 0);
-	assert_eq!(durable.log[0].command, vec![]);
+        assert_eq!(durable.log[0].term, 0);
+        assert_eq!(durable.log[0].command, vec![]);
 
         durable.update(10234, Some(40592));
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, Some(40592));
         assert_eq!(durable.log.len(), 1);
-	assert_eq!(durable.log[0].term, 0);
-	assert_eq!(durable.log[0].command, vec![]);
+        assert_eq!(durable.log[0].term, 0);
+        assert_eq!(durable.log[0].command, vec![]);
         drop(durable);
 
         let mut durable = DurableState::new(&tmp.dir, 1);
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, None);
-	assert_eq!(durable.log.len(), 0);
+        assert_eq!(durable.log.len(), 0);
 
         durable.restore();
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, Some(40592));
         assert_eq!(durable.log.len(), 1);
-	assert_eq!(durable.log[0].term, 0);
-	assert_eq!(durable.log[0].command, vec![]);
+        assert_eq!(durable.log[0].term, 0);
+        assert_eq!(durable.log[0].command, vec![]);
     }
 
     #[test]
     fn test_log_append() {
         let tmp = TmpDir::new();
 
-        let mut v = Vec::new();
-        v.push(b"abcdef123456"[0..].into());
-        v.push(b"foobar"[0..].into());
+        let mut v = Vec::<Vec<u8>>::new();
+        v.push("abcdef123456".as_bytes().to_vec());
+        v.push("foobar".as_bytes().to_vec());
 
         // Write two entries and shut down.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
-        durable.append(&v);
+        durable.append(&v, None);
         drop(durable);
 
         // Start up and restore. Should have two entries.
@@ -1267,10 +1258,10 @@ mod tests {
         let longcommand = "a".repeat(10_000);
         let longcommand2 = "a".repeat(PAGESIZE as usize);
         let longcommand3 = "a".repeat(1 + PAGESIZE as usize);
-        v.push(longcommand.as_bytes());
-        v.push(longcommand2.as_bytes());
-        v.push(longcommand3.as_bytes());
-        durable.append(&v);
+        v.push(longcommand.as_bytes().to_vec());
+        v.push(longcommand2.as_bytes().to_vec());
+        v.push(longcommand3.as_bytes().to_vec());
+        durable.append(&v, None);
         drop(durable);
 
         // Start up and restore. Should now have four entries.
@@ -1307,12 +1298,12 @@ mod tests {
                         LogEntry {
                             term: 88,
                             command: "hey there".into(),
-                            response_sender: None,
+                            result_sender: None,
                         },
                         LogEntry {
                             term: 90,
                             command: "blub".into(),
-                            response_sender: None,
+                            result_sender: None,
                         },
                     ],
                     leader_commit: 95,
@@ -1390,7 +1381,7 @@ mod tests {
             address: "127.0.0.1:20001".parse().unwrap(),
         }];
         let mut rpcm = RPCManager::new(0, config);
-        let stop_mutex = rpcm.start();
+        rpcm.start();
 
         let msg = RPCMessage::new(
             1023,
@@ -1404,53 +1395,50 @@ mod tests {
         rpcm.send(0, &msg);
         let received = rpcm.stream_receiver.recv().unwrap();
         assert_eq!(msg, received);
-        let mut stop = stop_mutex.lock().unwrap();
+        let mut stop = rpcm.stop_mutex.lock().unwrap();
         *stop = true;
     }
 
     struct TestStateMachine {}
 
     impl StateMachine for TestStateMachine {
-	fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-	    return messages;
-	}
+        fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+            return messages;
+        }
     }
 
     #[test]
     fn test_server_start_stop() {
-	let (stop_sender, stop_receiver): (
-            mpsc::Sender<bool>,
-            mpsc::Receiver<bool>,
-        ) = mpsc::channel();
+        let tmp = TmpDir::new();
+        let config = Config {
+            server_id: 0,
+            server_index: 0,
+            cluster: vec![ServerConfig {
+                id: 0,
+                address: "127.0.0.1:20002".parse().unwrap(),
+            }],
 
-	// TODO: Seems to need to switch to a receiver style.
-	// let (command_sender, command_receiver): (
-        //     mpsc::Sender<Vec<Vec<u8>>>,
-        //     mpsc::Receiver<Vec<Vec<u8>>>,
-        // ) = mpsc::channel();
+            heartbeat_frequency: Duration::from_secs(5),
+            heartbeat_timeout: Duration::from_secs(10),
+        };
 
-	std::thread::spawn(move || {
-	    let tmp = TmpDir::new();
-	    let config = Config{
-		server_id: 0,
-		server_index: 0,
-		cluster: vec![ServerConfig {
-		    id: 0,
-		    address: "127.0.0.1:20002".parse().unwrap(),
-		}],
+        let sm = TestStateMachine {};
+        let mut server = Server::new(&tmp.dir, sm, config);
 
-		heartbeat_frequency: Duration::from_secs(5),
-		heartbeat_timeout: Duration::from_secs(10),
-	    };
-	    
-	    let sm = TestStateMachine{};
-	    let mut server = Server::new(&tmp.dir, sm, config);
+        // First test apply doesn't work as not a leader.
+        let result_receiver = server.apply(vec![vec![]]);
+        assert_eq!(result_receiver.recv().unwrap(), ApplyResult::NotALeader);
 
-	    server.start(stop_receiver);
-	});
+        // Now after initializing (realizing there's only one server, so is leader), try again.
+        server.init();
 
-	std::thread::sleep(Duration::from_secs(5));
-	stop_sender.send(true).unwrap();
+        let result_receiver = server.apply(vec!["abc".as_bytes().to_vec()]);
+        server.tick();
+        let result = result_receiver.try_recv().unwrap();
+        assert_eq!(result, ApplyResult::Ok("abc".as_bytes().to_vec()));
+
+        // Clean up.
+        server.stop();
     }
 
     #[test]
