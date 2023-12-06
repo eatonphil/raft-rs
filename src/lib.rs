@@ -1434,7 +1434,11 @@ mod tests {
 
         let result_receiver = server.apply(vec!["abc".as_bytes().to_vec()]);
         server.tick();
-        let result = result_receiver.recv().unwrap();
+	// Use try_recv() not recv() since recv() would block so the
+	// test would hang if the logic were ever wrong. try_recv() is
+	// correct since the message *must* at this point be available
+	// to read.
+        let result = result_receiver.try_recv().unwrap();
         assert_eq!(result, ApplyResult::Ok("abc".as_bytes().to_vec()));
 
         // Clean up.
