@@ -3,7 +3,7 @@
 
 use std::convert::TryInto;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
-use std::net::{SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::prelude::FileExt;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -209,15 +209,12 @@ impl DurableState {
     // Durably add logs to disk.
     fn append(&mut self, commands: &[&[u8]]) -> Vec<mpsc::Receiver<Vec<u8>>> {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
-        let mut receivers =
-            Vec::<mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
+        let mut receivers = Vec::<mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
 
         // Write out all logs.
         for command in commands.iter() {
-            let (sender, receiver): (
-                mpsc::Sender<Vec<u8>>,
-                mpsc::Receiver<Vec<u8>>,
-            ) = mpsc::channel();
+            let (sender, receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) =
+                mpsc::channel();
 
             receivers.push(receiver);
 
@@ -658,10 +655,7 @@ struct RPCManager {
 }
 
 impl RPCManager {
-    fn new(
-        server_id: u128,
-        cluster: Vec<ServerConfig>,
-    ) -> RPCManager {
+    fn new(server_id: u128, cluster: Vec<ServerConfig>) -> RPCManager {
         let (stream_sender, stream_receiver): (
             mpsc::Sender<RPCMessage>,
             mpsc::Receiver<RPCMessage>,
@@ -670,7 +664,7 @@ impl RPCManager {
             cluster,
             server_id,
             stream_sender,
-	    stream_receiver,
+            stream_receiver,
         }
     }
 
@@ -691,21 +685,21 @@ impl RPCManager {
         let listener =
             std::net::TcpListener::bind(address).expect("Could not bind to configured address.");
 
-	let thread_stop = stop.clone();
-	let thread_stream_sender = self.stream_sender.clone();
-	std::thread::spawn(move || {
+        let thread_stop = stop.clone();
+        let thread_stream_sender = self.stream_sender.clone();
+        std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-		let stop = thread_stop.lock().unwrap();
-		if *stop {
+                let stop = thread_stop.lock().unwrap();
+                if *stop {
                     break;
-		}
+                }
 
-		let bufreader = BufReader::new(stream);
-		if let Some(msg) = RPCMessage::decode(bufreader) {
+                let bufreader = BufReader::new(stream);
+                if let Some(msg) = RPCMessage::decode(bufreader) {
                     thread_stream_sender.send(msg).unwrap();
-		}
-	    }
-	});
+                }
+            }
+        });
 
         stop
     }
@@ -715,7 +709,7 @@ impl RPCManager {
         let thread_stream_sender = self.stream_sender.clone();
         let server_id = self.server_id;
 
-	let stream = std::net::TcpStream::connect(address).unwrap();
+        let stream = std::net::TcpStream::connect(address).unwrap();
         let bufwriter = BufWriter::new(stream.try_clone().unwrap());
         message.encode(server_id, bufwriter);
 
@@ -912,8 +906,8 @@ impl<SM: StateMachine> Server<SM> {
             RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
         };
         if let Some(body) = rsp {
-	    let msg = &RPCMessage::new(term, body);
-            self.rpc_manager .send(message.from, msg);
+            let msg = &RPCMessage::new(term, body);
+            self.rpc_manager.send(message.from, msg);
         }
     }
 
@@ -1012,7 +1006,7 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-	let msg = &RPCMessage::new(
+        let msg = &RPCMessage::new(
             term,
             RPCBody::RequestVoteRequest(RequestVoteRequest {
                 term,
@@ -1098,17 +1092,13 @@ impl<SM: StateMachine> Server<SM> {
         state.durable.restore();
     }
 
-    pub fn new(
-        data_directory: &std::path::Path,
-        sm: SM,
-	config: Config
-    ) -> Server<SM> {
+    pub fn new(data_directory: &std::path::Path, sm: SM, config: Config) -> Server<SM> {
         let cluster_size = config.cluster.len();
-	let id = config.server_id;
+        let id = config.server_id;
         let rpc_manager = RPCManager::new(config.server_id, config.cluster.clone());
         Server {
             rpc_manager,
-	    config,
+            config,
             sm,
 
             state: Mutex::new(State {
@@ -1299,192 +1289,118 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_append_entries_request() {
-        let mut file = Vec::new();
+    fn test_rpc_message_encode_decode() {
         let tests = vec![
-            AppendEntriesRequest {
-                term: 1023,
-                leader_id: 2132,
-                prev_log_index: 1823,
-                prev_log_term: 193,
-                entries: vec![
-                    LogEntry {
-                        term: 88,
-                        command: "hey there".into(),
-                        response_sender: None,
-                    },
-                    LogEntry {
-                        term: 90,
-                        command: "blub".into(),
-                        response_sender: None,
-                    },
-                ],
-                leader_commit: 95,
-            },
-            AppendEntriesRequest {
-                term: 1023,
-                leader_id: 2132,
-                prev_log_index: 1823,
-                prev_log_term: 193,
-                entries: vec![],
-                leader_commit: 95,
-            },
+            RPCMessage::new(
+                88,
+                RPCBody::AppendEntriesRequest(AppendEntriesRequest {
+                    term: 88,
+                    leader_id: 2132,
+                    prev_log_index: 1823,
+                    prev_log_term: 193,
+                    entries: vec![
+                        LogEntry {
+                            term: 88,
+                            command: "hey there".into(),
+                            response_sender: None,
+                        },
+                        LogEntry {
+                            term: 90,
+                            command: "blub".into(),
+                            response_sender: None,
+                        },
+                    ],
+                    leader_commit: 95,
+                }),
+            ),
+            RPCMessage::new(
+                91,
+                RPCBody::AppendEntriesRequest(AppendEntriesRequest {
+                    term: 91,
+                    leader_id: 2132,
+                    prev_log_index: 1823,
+                    prev_log_term: 193,
+                    entries: vec![],
+                    leader_commit: 95,
+                }),
+            ),
+            RPCMessage::new(
+                10,
+                RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 10,
+                    success: true,
+                }),
+            ),
+            RPCMessage::new(
+                10,
+                RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 10,
+                    success: false,
+                }),
+            ),
+            RPCMessage::new(
+                1023,
+                RPCBody::RequestVoteRequest(RequestVoteRequest {
+                    term: 1023,
+                    candidate_id: 2132,
+                    last_log_index: 1823,
+                    last_log_term: 193,
+                }),
+            ),
+            RPCMessage::new(
+                1023,
+                RPCBody::RequestVoteResponse(RequestVoteResponse {
+                    term: 1023,
+                    vote_granted: true,
+                }),
+            ),
+            RPCMessage::new(
+                1023,
+                RPCBody::RequestVoteResponse(RequestVoteResponse {
+                    term: 1023,
+                    vote_granted: false,
+                }),
+            ),
         ];
 
-        for aer in tests.into_iter() {
-            let mut cursor = std::io::Cursor::new(&mut file);
-            let bufwriter = BufWriter::new(&mut cursor);
-            let mut encoder = RPCMessageEncoder::new(0, bufwriter);
-            aer.encode(&mut encoder);
-
-            drop(encoder);
-            drop(cursor);
-
-            let mut cursor = std::io::Cursor::new(&mut file);
-            let bufreader = BufReader::new(&mut cursor);
-            let result = RPCMessage::decode(bufreader);
-            assert_eq!(
-                result,
-                Some(RPCMessage {
-                    from: 0,
-                    term: aer.term,
-                    body: RPCBody::AppendEntriesRequest(aer),
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_append_entries_response() {
-        let mut file = Vec::new();
-        let tests = vec![
-            AppendEntriesResponse {
-                term: 1023,
-                success: true,
-            },
-            AppendEntriesResponse {
-                term: 1023,
-                success: false,
-            },
-        ];
-
-        for aer in tests.into_iter() {
-            let mut cursor = std::io::Cursor::new(&mut file);
-            let bufwriter = BufWriter::new(&mut cursor);
-            let mut encoder = RPCMessageEncoder::new(0, bufwriter);
-            aer.encode(&mut encoder);
-
-            drop(encoder);
-            drop(cursor);
-
-            let mut cursor = std::io::Cursor::new(&mut file);
-            let bufreader = BufReader::new(&mut cursor);
-            let result = RPCMessage::decode(bufreader);
-            assert_eq!(
-                result,
-                Some(RPCMessage {
-                    from: 0,
-                    term: aer.term,
-                    body: RPCBody::AppendEntriesResponse(aer),
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_request_vote_request() {
-        let mut file = Vec::new();
-        let tests = vec![RequestVoteRequest {
-            term: 1023,
-            candidate_id: 2132,
-            last_log_index: 1823,
-            last_log_term: 193,
-        }];
-
-        for rvr in tests.into_iter() {
-            let mut cursor = std::io::Cursor::new(&mut file);
-            let bufwriter = BufWriter::new(&mut cursor);
-            let mut encoder = RPCMessageEncoder::new(0, bufwriter);
-            rvr.encode(&mut encoder);
-
-            drop(encoder);
-            drop(cursor);
-
-            let mut cursor = std::io::Cursor::new(&mut file);
-            let bufreader = BufReader::new(&mut cursor);
-            let result = RPCMessage::decode(bufreader);
-            assert_eq!(
-                result,
-                Some(RPCMessage {
-                    from: 0,
-                    term: rvr.term,
-                    body: RPCBody::RequestVoteRequest(rvr),
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_request_vote_response() {
-        let tests = vec![
-            RequestVoteResponse {
-                term: 1023,
-                vote_granted: true,
-            },
-            RequestVoteResponse {
-                term: 1023,
-                vote_granted: false,
-            },
-        ];
-
-        for rvr in tests.into_iter() {
+        for rpcmessage in tests.into_iter() {
             let mut file = Vec::new();
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufwriter = BufWriter::new(&mut cursor);
-            let mut encoder = RPCMessageEncoder::new(0, bufwriter);
-            rvr.encode(&mut encoder);
+            rpcmessage.encode(0, bufwriter);
 
-            drop(encoder);
             drop(cursor);
 
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufreader = BufReader::new(&mut cursor);
             let result = RPCMessage::decode(bufreader);
-            assert_eq!(
-                result,
-                Some(RPCMessage {
-                    from: 0,
-                    term: rvr.term,
-                    body: RPCBody::RequestVoteResponse(rvr),
-                })
-            );
+            assert_eq!(result, Some(rpcmessage));
         }
     }
 
     #[test]
     fn test_rpc_manager() {
-	let config = vec![
-	    ServerConfig{
-		id: 0,
-		address: "127.0.0.1:20001".parse().unwrap(),
-	    },
-	];
-	let mut rpcm = RPCManager::new(0, config);
-	let stop_mutex = rpcm.start();
+        let config = vec![ServerConfig {
+            id: 0,
+            address: "127.0.0.1:20001".parse().unwrap(),
+        }];
+        let mut rpcm = RPCManager::new(0, config);
+        let stop_mutex = rpcm.start();
 
-	let msg = RPCMessage::new(
-	    1023,
-	    RPCBody::RequestVoteRequest(RequestVoteRequest{
-		term: 1023,
-		candidate_id: 2132,
-		last_log_index: 1823,
-		last_log_term: 193,
-            }));
-	rpcm.send(0, &msg);
-	let received = rpcm.stream_receiver.recv().unwrap();
-	assert_eq!(msg, received);
-	let mut stop = stop_mutex.lock().unwrap();
-	*stop = true;
+        let msg = RPCMessage::new(
+            1023,
+            RPCBody::RequestVoteRequest(RequestVoteRequest {
+                term: 1023,
+                candidate_id: 2132,
+                last_log_index: 1823,
+                last_log_term: 193,
+            }),
+        );
+        rpcm.send(0, &msg);
+        let received = rpcm.stream_receiver.recv().unwrap();
+        assert_eq!(msg, received);
+        let mut stop = stop_mutex.lock().unwrap();
+        *stop = true;
     }
 
     #[test]
