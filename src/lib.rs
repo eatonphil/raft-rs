@@ -1434,7 +1434,7 @@ mod tests {
 
         let result_receiver = server.apply(vec!["abc".as_bytes().to_vec()]);
         server.tick();
-        let result = result_receiver.try_recv().unwrap();
+        let result = result_receiver.recv().unwrap();
         assert_eq!(result, ApplyResult::Ok("abc".as_bytes().to_vec()));
 
         // Clean up.
