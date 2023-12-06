@@ -1,12 +1,12 @@
 // References:
 // [0] In Search of an Understandable Consensus Algorithm (Extended Version) -- https://raft.github.io/raft.pdf
 
-use std::boxed::Box;
 use std::convert::TryInto;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::net::SocketAddr;
 use std::os::unix::prelude::FileExt;
-use std::net::{SocketAddr, IpAddr, Ipv4Addr};
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const PAGESIZE: u64 = 4096;
 
@@ -46,7 +46,7 @@ struct LogEntry {
     // In-memory channel for sending results back to a user of the
     // library. Will always be `None` when a log is read back from
     // disk.
-    response_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    response_sender: Option<mpsc::Sender<Vec<u8>>>,
 
     // Actual data.
     command: Vec<u8>,
@@ -182,15 +182,15 @@ impl DurableState {
         self.current_term = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
         let did_vote = metadata[16] == 1;
         if did_vote {
-            self.voted_for = Some(u32::from_le_bytes(metadata[17..21].try_into().unwrap()));
+            self.voted_for = Some(u128::from_le_bytes(metadata[17..33].try_into().unwrap()));
         }
 
-        let checksum = u32::from_le_bytes(metadata[29..33].try_into().unwrap());
-        if checksum != crc32c(&metadata[0..29]) {
+        let checksum = u32::from_le_bytes(metadata[41..45].try_into().unwrap());
+        if checksum != crc32c(&metadata[0..41]) {
             panic!("Bad checksum for data file.");
         }
 
-        let log_length = u64::from_le_bytes(metadata[21..29].try_into().unwrap()) as usize;
+        let log_length = u64::from_le_bytes(metadata[33..41].try_into().unwrap()) as usize;
         self.log = Vec::with_capacity(log_length);
         if log_length == 0 {
             return;
@@ -207,17 +207,17 @@ impl DurableState {
     }
 
     // Durably add logs to disk.
-    fn append(&mut self, commands: &[&[u8]]) -> Vec<std::sync::mpsc::Receiver<Vec<u8>>> {
+    fn append(&mut self, commands: &[&[u8]]) -> Vec<mpsc::Receiver<Vec<u8>>> {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         let mut receivers =
-            Vec::<std::sync::mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
+            Vec::<mpsc::Receiver<Vec<u8>>>::with_capacity(commands.len());
 
         // Write out all logs.
         for command in commands.iter() {
             let (sender, receiver): (
-                std::sync::mpsc::Sender<Vec<u8>>,
-                std::sync::mpsc::Receiver<Vec<u8>>,
-            ) = std::sync::mpsc::channel();
+                mpsc::Sender<Vec<u8>>,
+                mpsc::Receiver<Vec<u8>>,
+            ) = mpsc::channel();
 
             receivers.push(receiver);
 
@@ -254,16 +254,16 @@ impl DurableState {
 
         if let Some(v) = voted_for {
             metadata[16] = 1;
-            metadata[17..21].copy_from_slice(&v.to_le_bytes());
+            metadata[17..33].copy_from_slice(&v.to_le_bytes());
         } else {
             metadata[16] = 0;
         }
 
         let log_length = self.log.len() as u64;
-        metadata[21..29].copy_from_slice(&log_length.to_le_bytes());
+        metadata[33..41].copy_from_slice(&log_length.to_le_bytes());
 
-        let checksum = crc32c(&metadata[0..29]);
-        metadata[29..33].copy_from_slice(&checksum.to_le_bytes());
+        let checksum = crc32c(&metadata[0..41]);
+        metadata[41..45].copy_from_slice(&checksum.to_le_bytes());
 
         self.file.write_all_at(&metadata, 0).unwrap();
 
@@ -284,6 +284,7 @@ struct VolatileState {
 
     commit_index: usize,
     last_applied: usize,
+    last_valid_message: Instant,
 
     // Leader-only state.
     next_index: Vec<usize>,
@@ -301,7 +302,8 @@ impl VolatileState {
             last_applied: 0,
             next_index: vec![0; cluster_size],
             match_index: vec![0; cluster_size],
-	    votes: 0,
+            votes: 0,
+            last_valid_message: Instant::now(),
         }
     }
 
@@ -311,7 +313,7 @@ impl VolatileState {
             self.next_index[i] = 0;
             self.match_index[i] = 0;
         }
-	self.votes = 0;
+        self.votes = 0;
     }
 }
 
@@ -362,25 +364,26 @@ impl<T: std::io::Write> RPCMessageEncoder<T> {
         RPCMessageEncoder {
             writer,
             written: vec![],
-	    sender_id,
+            sender_id,
         }
     }
 
     fn metadata(&mut self, kind: u8, term: u64) {
         assert_eq!(self.written.len(), 0);
 
-	self.written.extend_from_slice(&self.sender_id.to_le_bytes());
+        self.written
+            .extend_from_slice(&self.sender_id.to_le_bytes());
 
         self.written.push(kind);
 
-	self.written.extend_from_slice(&term.to_le_bytes());
+        self.written.extend_from_slice(&term.to_le_bytes());
 
         self.writer.write_all(&self.written).unwrap();
     }
 
     fn data(&mut self, data: &[u8]) {
         let offset = self.written.len();
-	self.written.extend_from_slice(data);
+        self.written.extend_from_slice(data);
         self.writer.write_all(&self.written[offset..]).unwrap();
     }
 
@@ -594,13 +597,13 @@ struct RPCMessage {
 
 impl RPCMessage {
     fn new(term: u64, body: RPCBody) -> RPCMessage {
-	return RPCMessage{
-	    from: 0,
-	    term,
-	    body,
-	};
+        return RPCMessage {
+            from: 0,
+            term,
+            body,
+        };
     }
-    
+
     fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
         let mut metadata: [u8; 25] = [0; 25];
         if let Err(e) = reader.read_exact(&mut metadata) {
@@ -613,7 +616,7 @@ impl RPCMessage {
             panic!("Could not read request: {:#?}.", e);
         }
 
-	let server_id = u128::from_le_bytes(metadata[0..16].try_into().unwrap());
+        let server_id = u128::from_le_bytes(metadata[0..16].try_into().unwrap());
 
         let message_type = metadata[16];
         let term = u64::from_le_bytes(metadata[17..25].try_into().unwrap());
@@ -630,113 +633,132 @@ impl RPCMessage {
         };
 
         Some(RPCMessage {
-	    from: server_id,
+            from: server_id,
             term,
             body: body?,
         })
     }
 
-    fn encode<T: std::io::Write>(&self, sender_id: u128, mut writer: BufWriter<T>) {
-	let encoder = &mut RPCMessageEncoder::new(sender_id, writer);
-	match self.body {
-	    RPCBody::RequestVoteRequest(rvr) => rvr.encode(encoder),
-	    RPCBody::RequestVoteResponse(rvr) => rvr.encode(encoder),
-	    RPCBody::AppendEntriesRequest(aer) => aer.encode(encoder),
-	    RPCBody::AppendEntriesResponse(aer) => aer.encode(encoder),
-	};
+    fn encode<T: std::io::Write>(&self, sender_id: u128, writer: BufWriter<T>) {
+        let encoder = &mut RPCMessageEncoder::new(sender_id, writer);
+        match &self.body {
+            RPCBody::RequestVoteRequest(rvr) => rvr.encode(encoder),
+            RPCBody::RequestVoteResponse(rvr) => rvr.encode(encoder),
+            RPCBody::AppendEntriesRequest(aer) => aer.encode(encoder),
+            RPCBody::AppendEntriesResponse(aer) => aer.encode(encoder),
+        };
     }
 }
 
 struct RPCManager {
-    cluster: Vec<Config>,
+    cluster: Vec<ServerConfig>,
     server_id: u128,
-    connections: std::collections::HashMap<u128, std::net::TcpStream>,
+    stream_sender: mpsc::Sender<RPCMessage>,
 }
 
 impl RPCManager {
-    fn new(server_id: u128, cluster: Vec<Config>) -> RPCManager {
-	return RPCManager {
-	    cluster,
-	    server_id,
-	    connections: std::collections::HashMap::new(),
-	};
-    }
-
-    fn address(&self) -> std::net::SocketAddr {
-	for server in self.cluster.iter() {
-	    if server.id == self.server_id {
-		return server.address;
-	    }
-	}
-
-	panic!("Bad Server Id for configuration.")
-    }
-    
-    fn start(&self) -> (std::sync::mpsc::Receiver<RPCMessage>,
-			std::sync::Arc::<std::sync::Mutex::<bool>>) {
+    fn new(
+        server_id: u128,
+        cluster: Vec<ServerConfig>,
+    ) -> (RPCManager, mpsc::Receiver<RPCMessage>) {
         let (stream_sender, stream_receiver): (
-            std::sync::mpsc::Sender<RPCMessage>,
-            std::sync::mpsc::Receiver<RPCMessage>,
-        ) = std::sync::mpsc::channel();
-        let stop = std::sync::Arc::new(std::sync::Mutex::new(false));
- 
-	let address = self.address();
-        let listener = std::net::TcpListener::bind(address)
-            .expect("Could not bind to configured address.");
+            mpsc::Sender<RPCMessage>,
+            mpsc::Receiver<RPCMessage>,
+        ) = mpsc::channel();
+        return (
+            RPCManager {
+                cluster: cluster,
+                server_id,
+                stream_sender,
+            },
+            stream_receiver,
+        );
+    }
+
+    fn address_from_id(&self, id: u128) -> SocketAddr {
+        for server in self.cluster.iter() {
+            if server.id == id {
+                return server.address;
+            }
+        }
+
+        panic!("Bad Server Id for configuration.")
+    }
+
+    fn start(&mut self) -> std::sync::Arc<Mutex<bool>> {
+        let stop = std::sync::Arc::new(Mutex::new(false));
+
+        let address = self.address_from_id(self.server_id);
+        let listener =
+            std::net::TcpListener::bind(address).expect("Could not bind to configured address.");
 
         for stream in listener.incoming() {
             if let Ok(s) = stream {
-		let thread_stop = stop.clone();
-		let thread_stream_sender = stream_sender.clone();
-		std::thread::spawn(move|| {
-		    loop {
-		        let stop = thread_stop.lock().unwrap();
-			if *stop {
-			    break;
-			}
+                let thread_stop = stop.clone();
+                let thread_stream_sender = self.stream_sender.clone();
+                std::thread::spawn(move || {
+                    let stream = Arc::new(s);
+                    loop {
+                        let stop = thread_stop.lock().unwrap();
+                        if *stop {
+                            break;
+                        }
 
-			let bufreader = BufReader::new(s);
-			if let Some(msg) = RPCMessage::decode(bufreader) {
-			    self.connections[&msg.from] = s;
-			    thread_stream_sender.send(msg).unwrap();
-			}
-		    }
+                        let bufreader = BufReader::new(stream.as_ref());
+                        if let Some(msg) = RPCMessage::decode(bufreader) {
+                            thread_stream_sender.send(msg).unwrap();
+                        }
+                    }
                 });
-	    }
+            }
         }
 
-	return (stream_receiver, stop);
+        return stop;
     }
 
     fn send(&mut self, to_server_id: u128, message: RPCMessage) {
-	let from_server_id = self.server_id;
-	if !self.connections.contains_key(&to_server_id) {
-	    let address = self.address();
-	    self.connections[&to_server_id] = std::net::TcpStream::connect(address).unwrap();
-	}
+        let address = self.address_from_id(to_server_id);
+        let thread_stream_sender = self.stream_sender.clone();
+        let server_id = self.server_id;
 
-	let stream = self.connections[&to_server_id];
-	let bufwriter = BufWriter::new(stream);
-	message.encode(from_server_id, bufwriter);
+        std::thread::spawn(move || {
+            let stream = std::net::TcpStream::connect(address).unwrap();
+            let bufwriter = BufWriter::new(stream.try_clone().unwrap());
+            message.encode(server_id, bufwriter);
+
+            let bufreader = BufReader::new(stream);
+            if let Some(response) = RPCMessage::decode(bufreader) {
+                thread_stream_sender.send(response).unwrap();
+            }
+        });
     }
 }
 
-pub struct Config {
+#[derive(Copy, Clone)]
+pub struct ServerConfig {
     id: u128,
-    address: std::net::SocketAddr,
+    address: SocketAddr,
+}
+
+pub struct Config {
+    // Cluster configuration.
+    server_index: usize,
+    server_id: u128,
+    cluster: Vec<ServerConfig>,
+
+    // Timing configuration.
+    heartbeat_frequency: Duration,
+    heartbeat_timeout: Duration,
 }
 
 pub struct Server<SM: StateMachine> {
-    cluster: Vec<Config>,
-
-    // This server.
-    server_index: usize,
-    server_id: u128,
+    config: Config,
 
     sm: SM,
     rpc_manager: RPCManager,
+    rpc_receiver: mpsc::Receiver<RPCMessage>,
 
-    state: std::sync::Mutex<State>,
+    state: Mutex<State>,
 }
 
 impl<SM: StateMachine> Server<SM> {
@@ -772,16 +794,18 @@ impl<SM: StateMachine> Server<SM> {
         request: RequestVoteRequest,
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
-	let term = state.durable.current_term;
-        let false_request =
-	    RPCBody::RequestVoteResponse(RequestVoteResponse {
-		term,
-		vote_granted: false,
-            });
+        let term = state.durable.current_term;
+        let false_request = RPCBody::RequestVoteResponse(RequestVoteResponse {
+            term,
+            vote_granted: false,
+        });
 
         if request.term < term {
             return (term, Some(false_request));
         }
+
+        // Reset the heartbeat timer.
+        state.volatile.last_valid_message = Instant::now();
 
         let canvote = if let Some(id) = state.durable.voted_for {
             id == request.candidate_id
@@ -789,13 +813,13 @@ impl<SM: StateMachine> Server<SM> {
             true
         };
         if !canvote {
-	    return (term, Some(false_request));
+            return (term, Some(false_request));
         }
 
-	// "2. If votedFor is null or candidateId, and candidate’s log
-	// is at least as up-to-date as receiver’s log, grant vote
-	// (§5.2, §5.4)." - Reference [0] Page 4
-	//
+        // "2. If votedFor is null or candidateId, and candidate’s log
+        // is at least as up-to-date as receiver’s log, grant vote
+        // (§5.2, §5.4)." - Reference [0] Page 4
+        //
         // "Raft determines which of two logs is more up-to-date
         // by comparing the index and term of the last entries in the
         // logs. If the logs have last entries with different terms, then
@@ -803,105 +827,108 @@ impl<SM: StateMachine> Server<SM> {
         // end with the same term, then whichever log is longer is
         // more up-to-date." - Reference [0] Page 8
 
-	// TODO: Fill in.
-	let candidate_more_up_to_date = false;
+        // TODO: Fill in.
+        let candidate_more_up_to_date = false;
 
-	if candidate_more_up_to_date {
-	    state.durable.update(state.durable.current_term, Some(request.candidate_id));
-	}
+        if candidate_more_up_to_date {
+            state.durable.update(term, Some(request.candidate_id));
 
-	let msg =
-	    RPCBody::RequestVoteResponse(RequestVoteResponse {
-		term,
-		vote_granted: candidate_more_up_to_date,
-            });
-	return (term, Some(msg));
+            // Reset heartbeat timer.
+            state.volatile.last_valid_message = Instant::now();
+        }
+
+        let msg = RPCBody::RequestVoteResponse(RequestVoteResponse {
+            term,
+            vote_granted: candidate_more_up_to_date,
+        });
+        return (term, Some(msg));
     }
 
     fn handle_request_vote_response(
         &mut self,
         response: RequestVoteResponse,
     ) -> (u64, Option<RPCBody>) {
-	let quorum = self.cluster.len() / 2;
-	assert!(quorum > 0 || (self.cluster.len() == 1 && quorum == 0));
+        let quorum = self.config.cluster.len() / 2;
+        assert!(quorum > 0 || (self.config.cluster.len() == 1 && quorum == 0));
 
-	if response.vote_granted {
-	    let mut state = self.state.lock().unwrap();
-	    state.volatile.votes += 1;
-	    // This will not handle the case where a single
-	    // server-cluster needs to become the leader.
-	    if state.volatile.votes == quorum {
+        if response.vote_granted {
+            let mut state = self.state.lock().unwrap();
+            state.volatile.votes += 1;
+            // This will not handle the case where a single
+            // server-cluster needs to become the leader.
+            if state.volatile.votes == quorum {
                 drop(state);
                 self.candidate_become_leader();
-	    }
+            }
         }
 
-	return (0, None);
+        return (0, None);
     }
 
     fn handle_append_entries_request(
         &mut self,
         request: AppendEntriesRequest,
-    ) -> (u64, Option<RPCBody>) { 
-        let state = self.state.lock().unwrap();
-	let term = state.durable.current_term;
+    ) -> (u64, Option<RPCBody>) {
+        let mut state = self.state.lock().unwrap();
+        let term = state.durable.current_term;
         if request.term < term {
-	    return (
-		term,
-		Some(RPCBody::AppendEntriesResponse(
-		    AppendEntriesResponse {
-			term,
-			success: false,
-		    })));
+            return (
+                term,
+                Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                    term,
+                    success: false,
+                })),
+            );
         }
+
+        // Reset heartbeat timer.
+        state.volatile.last_valid_message = Instant::now();
 
         // TODO: fill in.
 
-	return (
-	    term,
-	    Some(RPCBody::AppendEntriesResponse(
-		AppendEntriesResponse {
-		    term,
-		    success: true,
-		})));
+        return (
+            term,
+            Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                term,
+                success: true,
+            })),
+        );
     }
 
     fn handle_append_entries_response(
         &mut self,
-        response: AppendEntriesResponse
-    ) -> (u64, Option<RPCBody>) { 
-	// TODO: fill in.
-	return (0, None);
+        _response: AppendEntriesResponse,
+    ) -> (u64, Option<RPCBody>) {
+        // TODO: fill in.
+        return (0, None);
     }
 
     fn rpc_handle_message(&mut self, message: RPCMessage) {
-	let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if message.term > state.durable.current_term {
             let voted_for = state.durable.voted_for;
             state.durable.update(message.term, voted_for);
             state.volatile.condition = Condition::Follower;
         }
-	drop(state);
+        drop(state);
 
         let (term, rsp) = match message.body {
             RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r),
-	    RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r),
+            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r),
             RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r),
             RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
         };
-	if let Some(body) = rsp {
-	    self.rpc_manager.send(message.from, RPCMessage::new(
-		term,
-		body,
-	    ));
-	}
+        if let Some(body) = rsp {
+            self.rpc_manager
+                .send(message.from, RPCMessage::new(term, body));
+        }
     }
 
     fn leader_maybe_new_quorum(&mut self) {
         // "If there exists an N such that N > commitIndex, a majority
         // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
         // set commitIndex = N (§5.3, §5.4)." - Reference [0] Page 4
-        let quorum_needed = self.cluster.len() / 2;
+        let quorum_needed = self.config.cluster.len() / 2;
         let mut state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Leader {
             return;
@@ -915,7 +942,7 @@ impl<SM: StateMachine> Server<SM> {
                 break;
             }
 
-            assert!(quorum > 0 || (self.cluster.len() == 1 && quorum == 0));
+            assert!(quorum > 0 || (self.config.cluster.len() == 1 && quorum == 0));
             for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
                 // Here so that in the case of there being a single
                 // server in the cluster, we still (trivially) achieve
@@ -928,7 +955,7 @@ impl<SM: StateMachine> Server<SM> {
                 // self always counts as part of quorum, so skip it in
                 // the count. quorum_needed already takes self into
                 // consideration (`len() / 2` not `len() / 2 + 1`).
-                if self.server_index == server_index {
+                if self.config.server_index == server_index {
                     continue;
                 }
 
@@ -960,42 +987,57 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-	if false {
-	    drop(state);
-	    self.candidate_request_votes();
-	}
+        if state.volatile.last_valid_message.elapsed() > self.config.heartbeat_timeout {
+            drop(state);
+            self.candidate_request_votes();
+        }
     }
 
     fn candidate_become_leader(&mut self) {
         let mut state = self.state.lock().unwrap();
         state.volatile.reset();
-	state.volatile.condition = Condition::Leader;
-	drop(state);
-	self.leader_send_heartbeat();
+        state.volatile.condition = Condition::Leader;
+        drop(state);
+        self.leader_send_heartbeat();
     }
 
     fn candidate_request_votes(&mut self) {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Candidate {
             return;
         }
 
-	let candidate_id = self.server_id;
-	for (i, server) in self.cluster.iter().enumerate() {
-	    if i == self.server_index {
-		continue;
-	    }
+        let term = state.durable.current_term + 1;
+        let my_server_id = self.config.server_id;
+        state.durable.update(term, Some(my_server_id));
 
-	    let term = state.durable.current_term;
-	    self.rpc_manager.send(server.id, RPCMessage::new(
-		term,
-		RPCBody::RequestVoteRequest(RequestVoteRequest{
-		    term,
-		    candidate_id: candidate_id,
-		    last_log_index: state.durable.log.len() - 1,
-		    last_log_term: state.durable.log[state.durable.log.len()-1].term,
-		})));
-	}
+        // Trivial case. In a single-server cluster, the server is the
+        // leader.
+        if self.config.cluster.len() == 1 {
+            drop(state);
+            self.candidate_become_leader();
+            return;
+        }
+
+        for server in self.config.cluster.iter() {
+            // Skip self.
+            if server.id == my_server_id {
+                continue;
+            }
+
+            self.rpc_manager.send(
+                server.id,
+                RPCMessage::new(
+                    term,
+                    RPCBody::RequestVoteRequest(RequestVoteRequest {
+                        term,
+                        candidate_id: self.config.server_id,
+                        last_log_index: state.durable.log.len() - 1,
+                        last_log_term: state.durable.log[state.durable.log.len() - 1].term,
+                    }),
+                ),
+            );
+        }
     }
 
     fn apply_entries(&mut self) {
@@ -1026,7 +1068,7 @@ impl<SM: StateMachine> Server<SM> {
     pub fn start(&mut self) {
         self.restore();
 
-	let (message_reader, rpc_stop_mutex) = self.rpc_manager.start();
+        let rpc_stop_mutex = self.rpc_manager.start();
 
         loop {
             let state = self.state.lock().unwrap();
@@ -1047,7 +1089,7 @@ impl<SM: StateMachine> Server<SM> {
             // All condition operations.
             self.apply_entries();
 
-            for msg in message_reader.try_iter() {
+            if let Ok(msg) = self.rpc_receiver.try_recv() {
                 self.rpc_handle_message(msg);
             }
         }
@@ -1066,24 +1108,20 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     pub fn new(
-        id: u128,
         data_directory: &std::path::Path,
         sm: SM,
-        cluster: Vec<Config>,
+	config: Config
     ) -> Server<SM> {
-        let cluster_size = cluster.len();
-        let server_index = cluster
-            .iter()
-            .position(|c| c.id == id)
-            .expect("Server ID must point to valid ID within cluster config.");
+        let cluster_size = config.cluster.len();
+	let id = config.server_id;
+        let (rpc_manager, rpc_receiver) = RPCManager::new(config.server_id, config.cluster.clone());
         Server {
-	    rpc_manager: RPCManager::new(id, cluster),
-            cluster,
-            server_index,
-	    server_id: id,
+            rpc_manager,
+            rpc_receiver,
+	    config,
             sm,
 
-            state: std::sync::Mutex::new(State {
+            state: Mutex::new(State {
                 durable: DurableState::new(data_directory, id),
                 volatile: VolatileState::new(cluster_size),
 
@@ -1306,7 +1344,7 @@ mod tests {
         for aer in tests.into_iter() {
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufwriter = BufWriter::new(&mut cursor);
-            let mut encoder = RPCMessageEncoder::new(bufwriter);
+            let mut encoder = RPCMessageEncoder::new(0, bufwriter);
             aer.encode(&mut encoder);
 
             drop(encoder);
@@ -1318,7 +1356,7 @@ mod tests {
             assert_eq!(
                 result,
                 Some(RPCMessage {
-                    ok: true,
+                    from: 0,
                     term: aer.term,
                     body: RPCBody::AppendEntriesRequest(aer),
                 })
@@ -1343,7 +1381,7 @@ mod tests {
         for aer in tests.into_iter() {
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufwriter = BufWriter::new(&mut cursor);
-            let mut encoder = RPCMessageEncoder::new(bufwriter);
+            let mut encoder = RPCMessageEncoder::new(0, bufwriter);
             aer.encode(&mut encoder);
 
             drop(encoder);
@@ -1355,7 +1393,7 @@ mod tests {
             assert_eq!(
                 result,
                 Some(RPCMessage {
-                    ok: true,
+                    from: 0,
                     term: aer.term,
                     body: RPCBody::AppendEntriesResponse(aer),
                 })
@@ -1376,7 +1414,7 @@ mod tests {
         for rvr in tests.into_iter() {
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufwriter = BufWriter::new(&mut cursor);
-            let mut encoder = RPCMessageEncoder::new(bufwriter);
+            let mut encoder = RPCMessageEncoder::new(0, bufwriter);
             rvr.encode(&mut encoder);
 
             drop(encoder);
@@ -1388,7 +1426,7 @@ mod tests {
             assert_eq!(
                 result,
                 Some(RPCMessage {
-                    ok: true,
+                    from: 0,
                     term: rvr.term,
                     body: RPCBody::RequestVoteRequest(rvr),
                 })
@@ -1413,7 +1451,7 @@ mod tests {
             let mut file = Vec::new();
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufwriter = BufWriter::new(&mut cursor);
-            let mut encoder = RPCMessageEncoder::new(bufwriter);
+            let mut encoder = RPCMessageEncoder::new(0, bufwriter);
             rvr.encode(&mut encoder);
 
             drop(encoder);
@@ -1425,7 +1463,7 @@ mod tests {
             assert_eq!(
                 result,
                 Some(RPCMessage {
-                    ok: true,
+                    from: 0,
                     term: rvr.term,
                     body: RPCBody::RequestVoteResponse(rvr),
                 })
