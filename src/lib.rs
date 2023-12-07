@@ -207,11 +207,7 @@ impl DurableState {
     }
 
     // Durably add logs to disk.
-    fn append(
-        &mut self,
-        commands: &[Vec<u8>],
-        result_sender: Option<mpsc::Sender<ApplyResult>>,
-    ) {
+    fn append(&mut self, commands: &[Vec<u8>], result_sender: Option<mpsc::Sender<ApplyResult>>) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
         // Write out all new logs.
@@ -742,7 +738,6 @@ pub struct Server<SM: StateMachine> {
     rpc_manager: RPCManager,
 
     state: Mutex<State>,
-    
 }
 
 impl<SM: StateMachine> Drop for Server<SM> {
@@ -807,12 +802,10 @@ impl<SM: StateMachine> Server<SM> {
         // end with the same term, then whichever log is longer is
         // more up-to-date." - Reference [0] Page 8
 
-	let log_length = state.durable.log.len();
-	let my_last_log = &state.durable.log[log_length - 1];
-        let candidate_more_up_to_date =
-	    request.last_log_term > my_last_log.term ||
-	    (request.last_log_term == my_last_log.term &&
-	     request.last_log_index >= log_length);
+        let log_length = state.durable.log.len();
+        let my_last_log = &state.durable.log[log_length - 1];
+        let candidate_more_up_to_date = request.last_log_term > my_last_log.term
+            || (request.last_log_term == my_last_log.term && request.last_log_index >= log_length);
 
         if candidate_more_up_to_date {
             state.durable.update(term, Some(request.candidate_id));
@@ -902,7 +895,7 @@ impl<SM: StateMachine> Server<SM> {
             RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r),
             RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
         };
-	return Some(RPCMessage::new(term, rsp?));
+        Some(RPCMessage::new(term, rsp?))
     }
 
     fn leader_maybe_new_quorum(&mut self) {
@@ -1067,7 +1060,7 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     pub fn tick(&mut self) {
-	let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         if state.stopped {
             return;
         }
@@ -1084,8 +1077,8 @@ impl<SM: StateMachine> Server<SM> {
         self.apply_entries();
 
         if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
-	    if let Some(response) = self.handle_message(&msg) {
-		self.rpc_manager.send(msg.from, &response);
+            if let Some(response) = self.handle_message(&msg) {
+                self.rpc_manager.send(msg.from, &response);
             }
         }
     }
@@ -1406,7 +1399,7 @@ mod tests {
 
     #[test]
     fn test_rpc_manager() {
-	let server = new_test_server(20001);
+        let server = new_test_server(20001);
         let mut rpcm = RPCManager::new(0, server.config.cluster.clone());
         rpcm.start();
 
@@ -1436,14 +1429,14 @@ mod tests {
 
     #[test]
     fn test_single_server_apply_end_to_end() {
-	let mut server = new_test_server(20002);
+        let mut server = new_test_server(20002);
 
         // First test apply doesn't work as not a leader.
         let result_receiver = server.apply(vec![vec![]]);
-	// Use try_recv() not recv() since recv() would block so the
-	// test would hang if the logic were ever wrong. try_recv() is
-	// correct since the message *must* at this point be available
-	// to read.
+        // Use try_recv() not recv() since recv() would block so the
+        // test would hang if the logic were ever wrong. try_recv() is
+        // correct since the message *must* at this point be available
+        // to read.
         assert_eq!(result_receiver.try_recv().unwrap(), ApplyResult::NotALeader);
 
         // Now after initializing (realizing there's only one server, so is leader), try again.
@@ -1451,34 +1444,33 @@ mod tests {
 
         let result_receiver = server.apply(vec!["abc".as_bytes().to_vec()]);
         server.tick();
-	// See above note about try_recv() vs recv().
+        // See above note about try_recv() vs recv().
         let result = result_receiver.try_recv().unwrap();
         assert_eq!(result, ApplyResult::Ok("abc".as_bytes().to_vec()));
     }
 
     #[test]
     fn test_handle_request_vote_request() {
-	let mut server = new_test_server(20003);
-	server.init();
+        let mut server = new_test_server(20003);
+        server.init();
 
-	let msg = RequestVoteRequest{
-	    term: 1,
-	    candidate_id: 2,
-	    last_log_index: 2,
-	    last_log_term: 1,
-	};
-	let response = server.handle_message(
-	    &RPCMessage::new(1, RPCBody::RequestVoteRequest(msg))
-	);
-	assert_eq!(
-	    response,
-	    Some(RPCMessage::new(
-		1,
-		RPCBody::RequestVoteResponse(RequestVoteResponse{
-		    term: 1,
-		    vote_granted: true,
-		}))),
-	);
+        let msg = RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 2,
+            last_log_term: 1,
+        };
+        let response = server.handle_message(&RPCMessage::new(1, RPCBody::RequestVoteRequest(msg)));
+        assert_eq!(
+            response,
+            Some(RPCMessage::new(
+                1,
+                RPCBody::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                })
+            )),
+        );
     }
 
     #[test]
