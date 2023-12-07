@@ -35,12 +35,16 @@ pub trait StateMachine {
 //
 //           ON DISK LOG ENTRY FORMAT
 //
-// | Byte Range                  | Value           |
-// |-----------------------------|-----------------|
-// |  0 - 4                      | Checksum        |
-// |  4 - 12                     | Term            |
-// | 12 - 20                     | Command Length  |
-// | 20 - (20 + $Command Length) | Command         |
+// | Byte Range                   | Value           |
+// |------------------------------|-----------------|
+// |  0                           | Entry Start     |
+// |  1 - 5                       | Checksum        |
+// |  5 - 13                      | Term            |
+// | 13 - 21                      | Command Length  |
+// | 21 - (21 + $Command Length$) | Command         |
+//
+// $Entry Start$ is a boolean field indicating whether the page is the
+// start of a log entry or it is an overflow page.
 
 #[derive(Debug)]
 struct LogEntry {
@@ -95,15 +99,28 @@ impl LogEntry {
         }
     }
 
-    fn decode(reader: &mut BufReader<impl std::io::Read>) -> Option<LogEntry> {
+    fn decode_metadata(metadata: &[u8; 20]) -> (u64, u64, u32, u64) {
+	let term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
+        let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
+	let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
+
+	let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
+	let total_size = rest_before_page_boundary + 20 + command_length;
+	assert_eq!(total_size % PAGESIZE, 0);
+	let pages = total_size / PAGESIZE;
+	
+	return (term, command_length, stored_checksum, pages);
+    }
+
+    fn decode(reader: &mut BufReader<impl std::io::Read>) -> LogEntry {
         let mut metadata: [u8; 20] = [0; 20];
         reader.read_exact(&mut metadata).unwrap();
-        let term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
-        let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
 
+	let (term, command_length, stored_checksum, pages) =
+	    LogEntry::decode_metadata(&metadata);
+	
         let mut command = vec![b'0'; command_length as usize];
-
-        let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
+	
         let mut actual_checksum = CRC32C::new();
         actual_checksum.update(&metadata[4..]);
 
@@ -111,30 +128,108 @@ impl LogEntry {
         reader.read_exact(&mut command).unwrap();
         actual_checksum.update(&command);
 
-        if stored_checksum != actual_checksum.sum() {
-            return None;
-        }
-
+	assert_eq!(stored_checksum, actual_checksum.sum());
+        
         // Read (and drop) until the next page boundary.
-        let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
+        let rest_before_page_boundary = pages * PAGESIZE - (20 + command_length);
         reader.consume(rest_before_page_boundary as usize);
 
-        Some(LogEntry {
+        return LogEntry {
             term,
             command,
             result_sender: None,
-        })
+        }
+    }
+
+    fn decode_from_pagecache(pagecache: &PageCache, offset: u64) -> (LogEntry, u64) {
+	let mut page: [u8; PAGESIZE as usize];
+	pagecache.read(offset, &mut page);
+	let metadata: [u8; 20];
+	metadata.copy_from_slice(&page[0..20]);
+	let (term, command_length, stored_checksum, pages) =
+	    LogEntry::decode_metadata(&metadata);
+
+	let to_read = (pages * PAGESIZE) as usize;
+	let all_pages = Vec::<u8>::with_capacity(to_read);
+	all_pages.copy_from_slice(&page);
+	while all_pages.len() < to_read {
+	    pagecache.read(offset, &mut page);
+	    all_pages.copy_from_slice(&page);
+	}
+	
+	let mut cursor = std::io::Cursor::new(&mut all_pages);
+        let bufreader = BufReader::new(&mut cursor);
+	return (LogEntry::decode(&mut bufreader), pages);
+    }
+}
+
+// FIFO-based cache of file pages.
+struct PageCache {
+    // Backing file.
+    file: std::fs::File,
+
+    // Page cache. Maps file offset to page.
+    page_cache: std::collections::VecDeque<(u64, [u8; PAGESIZE as usize])>,
+    page_cache_size: usize,
+}
+
+impl PageCache {
+    fn new(file: std::fs::File, page_cache_size: usize) -> PageCache {
+	return PageCache{
+	    file,
+	    page_cache_size,
+	    page_cache: std::collections::VecDeque::new(),
+	};
+    }
+
+    fn insert_or_replace_in_cache(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
+	let mut index_in_cache: Option<usize> = None;
+	for (index, (existing_offset, _)) in self.page_cache.iter().enumerate() {
+	    if *existing_offset == offset {
+		index_in_cache = Some(index);
+	    }
+	}
+
+	if let Some(index) = index_in_cache {
+	    self.page_cache.remove(index);
+	    return;
+	}
+	self.page_cache.push_back((offset, page));
+
+	if self.page_cache.len() == self.page_cache_size + 1 {
+	    self.page_cache.pop_front();
+	}
+    }
+
+    fn read(&mut self, offset: u64, buf_into: &mut [u8; PAGESIZE as usize]) {
+	let index_in_cache: Option<usize> = None;
+	for (existing_offset, page) in self.page_cache.iter() {
+	    if *existing_offset == offset {
+		buf_into.copy_from_slice(page);
+		return;
+	    }
+	}
+
+	self.file.read_exact_at(buf_into, offset).unwrap();
+	self.insert_or_replace_in_cache(offset, buf_into.clone());
+    }
+
+    fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
+	self.file.write_all_at(&page, offset);
+	self.file.sync_all().unwrap();
     }
 }
 
 struct DurableState {
-    // Backing file.
-    file: std::fs::File,
+    // In-memory data.
+    last_log_index: u64,
+    last_log_term: u64,
+    next_log_offset: u64,
+    pagecache: PageCache,
 
-    // Actual data.
+    // On-disk data.
     current_term: u64,
     voted_for: Option<u128>,
-    log: Vec<LogEntry>,
 }
 
 impl DurableState {
@@ -148,33 +243,30 @@ impl DurableState {
             .open(filename)
             .expect("Could not open data file.");
         DurableState {
-            file,
-            current_term: 0,
+	    last_log_index: 0,
+	    last_log_term: 0,
+	    next_log_offset: PAGESIZE,
+	    pagecache: PageCache::new(file, 100),
+
+	    current_term: 0,
             voted_for: None,
-            log: vec![],
         }
     }
 
     fn restore(&mut self) {
-        // Ensure we're in the right place to start reading or
-        // appending logs. Metadata is always in the first page so we
-        // can pread/pwrite it.
-        self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
-
         // If there's nothing to restore, calling append with the
         // required 0th empty log entry will be sufficient to get
         // state into the right place.
-        if let Ok(m) = self.file.metadata() {
+        if let Ok(m) = self.pagecache.file.metadata() {
             if m.len() == 0 {
                 self.append(&[vec![]], None);
                 return;
             }
         }
 
+
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
-        self.file
-            .read_exact_at(&mut metadata[0..], 0)
-            .expect("Could not read server metadata.");
+	self.pagecache.read(0, &mut metadata);
 
         // Magic number check.
         assert_eq!(metadata[0..4], 0xFABEF15E_u32.to_le_bytes());
@@ -193,22 +285,23 @@ impl DurableState {
             panic!("Bad checksum for data file.");
         }
 
-        let log_length = u64::from_le_bytes(metadata[33..41].try_into().unwrap()) as usize;
-        self.log = Vec::with_capacity(log_length);
+	let log_length = u64::from_le_bytes(metadata[33..41].try_into().unwrap()) as usize;
 
-        let reader = &mut BufReader::new(&self.file);
-        while self.log.len() < log_length {
-            if let Some(e) = LogEntry::decode(reader) {
-                self.log.push(e);
-            } else {
-                panic!("Could not read log from data file.");
-            }
-        }
+	let scanned = 0;
+	while scanned < log_length {
+	    let (e, pages) = LogEntry::decode_from_pagecache(&self.pagecache, self.next_log_offset);
+	    self.last_log_index += 1;
+	    self.last_log_term = e.term;
+	    self.next_log_offset += pages * PAGESIZE;
+	}
+	self.last_log_index -= 1;
     }
 
     // Durably add logs to disk.
     fn append(&mut self, commands: &[Vec<u8>], result_sender: Option<mpsc::Sender<ApplyResult>>) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
+
+	// TODO: MUST BE REDONE TO SUPPORT PAGE CACHE AND ALSO MUST SET last_log_index, last_log_term, next_log_offset.
 
         // Write out all new logs.
         for command in commands.iter() {
@@ -249,16 +342,34 @@ impl DurableState {
             metadata[16] = 0;
         }
 
-        let log_length = self.log.len() as u64;
+        let log_length = self.last_log_index + 1;
         metadata[33..41].copy_from_slice(&log_length.to_le_bytes());
 
         let checksum = crc32c(&metadata[0..41]);
         metadata[41..45].copy_from_slice(&checksum.to_le_bytes());
 
-        self.file.write_all_at(&metadata, 0).unwrap();
+	self.pagecache.write(0, metadata);
+    }
 
-        // fsync.
-        self.file.sync_all().unwrap();
+    fn log_at_index(&self, i: u64) -> LogEntry {
+	assert!(i <= self.last_log_index);
+	assert!(i >= 0);
+	let mut current_index = self.last_log_index + 1;
+	let offset = self.next_log_offset;
+	let mut page: [u8; PAGESIZE as usize];
+
+	while i < current_index {
+	    self.pagecache.read(offset, &mut page);
+	    // Found an entry page.
+	    if page[0] == 1 {
+		current_index -= 1;
+	    }
+
+	    offset -= PAGESIZE;
+	}
+
+	let (entry, _) = LogEntry::decode_from_pagecache(&self.pagecache, offset);
+	return entry;
     }
 }
 
@@ -390,7 +501,7 @@ impl<T: std::io::Write> RPCMessageEncoder<T> {
 struct RequestVoteRequest {
     term: u64,
     candidate_id: u128,
-    last_log_index: usize,
+    last_log_index: u64,
     last_log_term: u64,
 }
 
@@ -497,11 +608,8 @@ impl AppendEntriesRequest {
         let mut entries = Vec::<LogEntry>::with_capacity(entries_length);
 
         while entries.len() < entries_length {
-            if let Some(e) = LogEntry::decode(&mut reader) {
-                entries.push(e);
-            } else {
-                return None;
-            }
+            let e = LogEntry::decode(&mut reader);
+            entries.push(e);
         }
 
         Some(RPCBody::AppendEntriesRequest(AppendEntriesRequest {
@@ -802,8 +910,8 @@ impl<SM: StateMachine> Server<SM> {
         // end with the same term, then whichever log is longer is
         // more up-to-date." - Reference [0] Page 8
 
-        let log_length = state.durable.log.len();
-        let my_last_log = &state.durable.log[log_length - 1];
+        let log_length = state.durable.last_log_index + 1;
+        let my_last_log = &state.durable.log_at_index(log_length - 1);
         let candidate_more_up_to_date = request.last_log_term > my_last_log.term
             || (request.last_log_term == my_last_log.term && request.last_log_index >= log_length);
 
@@ -937,7 +1045,8 @@ impl<SM: StateMachine> Server<SM> {
                     continue;
                 }
 
-                if match_index >= i && state.durable.log[i].term == state.durable.current_term {
+		let e = state.durable.log_at_index(i as u64);
+                if match_index >= i && e.term == state.durable.current_term {
                     quorum -= 1;
                 }
             }
@@ -1002,8 +1111,8 @@ impl<SM: StateMachine> Server<SM> {
             RPCBody::RequestVoteRequest(RequestVoteRequest {
                 term,
                 candidate_id: self.config.server_id,
-                last_log_index: state.durable.log.len() - 1,
-                last_log_term: state.durable.log[state.durable.log.len() - 1].term,
+                last_log_index: state.durable.last_log_index,
+                last_log_term: state.durable.last_log_term,
             }),
         );
         for server in self.config.cluster.iter() {
