@@ -881,6 +881,9 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     fn handle_message(&mut self, message: &RPCMessage) -> Option<RPCMessage> {
+	// "If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)."
+	// - Reference [0] Page 4
         let mut state = self.state.lock().unwrap();
         if message.term > state.durable.current_term {
             let voted_for = state.durable.voted_for;
@@ -1379,8 +1382,7 @@ mod tests {
         }
     }
 
-    fn new_test_server(port: u16) -> Server<TestStateMachine> {
-        let tmp = TmpDir::new();
+    fn new_test_server(tmp: &TmpDir, port: u16) -> Server<TestStateMachine> {
         let config = Config {
             server_id: 0,
             server_index: 0,
@@ -1399,7 +1401,8 @@ mod tests {
 
     #[test]
     fn test_rpc_manager() {
-        let server = new_test_server(20001);
+	let tmpdir = &TmpDir::new();
+        let server = new_test_server(&tmpdir, 20001);
         let mut rpcm = RPCManager::new(0, server.config.cluster.clone());
         rpcm.start();
 
@@ -1429,7 +1432,8 @@ mod tests {
 
     #[test]
     fn test_single_server_apply_end_to_end() {
-        let mut server = new_test_server(20002);
+	let tmpdir = &TmpDir::new();
+        let mut server = new_test_server(&tmpdir, 20002);
 
         // First test apply doesn't work as not a leader.
         let result_receiver = server.apply(vec![vec![]]);
@@ -1451,7 +1455,8 @@ mod tests {
 
     #[test]
     fn test_handle_request_vote_request() {
-        let mut server = new_test_server(20003);
+	let tmpdir = &TmpDir::new();
+        let mut server = new_test_server(&tmpdir, 20003);
         server.init();
 
         let msg = RequestVoteRequest {
@@ -1460,7 +1465,8 @@ mod tests {
             last_log_index: 2,
             last_log_term: 1,
         };
-        let response = server.handle_message(&RPCMessage::new(1, RPCBody::RequestVoteRequest(msg)));
+        let response = server.handle_message(
+	    &RPCMessage::new(1, RPCBody::RequestVoteRequest(msg)));
         assert_eq!(
             response,
             Some(RPCMessage::new(
@@ -1471,6 +1477,60 @@ mod tests {
                 })
             )),
         );
+    }
+
+    #[test]
+    fn test_handle_request_vote_response() {
+	let tmpdir = &TmpDir::new();
+        let mut server = new_test_server(&tmpdir, 20004);
+        server.init();
+
+        let msg = RequestVoteResponse {
+            term: 1,
+	    vote_granted: false,
+        };
+        let response = server.handle_message(
+	    &RPCMessage::new(1, RPCBody::RequestVoteResponse(msg)));
+        assert_eq!(response, None);
+    }
+
+    #[test]
+    fn test_handle_append_entries_request() {
+	let tmpdir = &TmpDir::new();
+        let mut server = new_test_server(&tmpdir, 20005);
+        server.init();
+
+        let msg = AppendEntriesRequest {
+	    term: 91,
+            leader_id: 2132,
+            prev_log_index: 1823,
+            prev_log_term: 193,
+            entries: vec![],
+            leader_commit: 95,
+        };
+        let response = server.handle_message(
+	    &RPCMessage::new(91, RPCBody::AppendEntriesRequest(msg)));
+        assert_eq!(response, Some(RPCMessage::new(91, RPCBody::AppendEntriesResponse(
+	    AppendEntriesResponse{
+		term: 91,
+		success: true,
+	    }
+	))));
+    }
+
+    #[test]
+    fn test_handle_append_entries_response() {
+	let tmpdir = &TmpDir::new();
+        let mut server = new_test_server(&tmpdir, 20006);
+        server.init();
+
+        let msg = AppendEntriesResponse {
+            term: 1,
+	    success: false,
+        };
+        let response = server.handle_message(
+	    &RPCMessage::new(1, RPCBody::AppendEntriesResponse(msg)));
+        assert_eq!(response, None);
     }
 
     #[test]
