@@ -195,28 +195,30 @@ impl LogEntry {
         return written as u64 / PAGESIZE;
     }
 
-    fn decode_metadata(metadata: &[u8; 20]) -> (u64, u64, u32, u64) {
-        let term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
-        let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
-        let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
+    fn decode_metadata(metadata: &[u8; 21]) -> (u64, u64, u32, u64) {
+        let term = u64::from_le_bytes(metadata[5..13].try_into().unwrap());
+        let command_length = u64::from_le_bytes(metadata[13..21].try_into().unwrap());
+        let stored_checksum = u32::from_le_bytes(metadata[1..5].try_into().unwrap());
 
-        let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
-        let total_size = rest_before_page_boundary + 20 + command_length;
+        let rest_before_page_boundary = PAGESIZE - ((22 + command_length) % PAGESIZE);
+        let total_size = rest_before_page_boundary + 22 + command_length;
         assert_eq!(total_size % PAGESIZE, 0);
+	// TODO: pages needs to take into consideration the fact that
+	// the first byte of each page is used as a marker.
         let pages = total_size / PAGESIZE;
 
         return (term, command_length, stored_checksum, pages);
     }
 
-    fn decode_validate(stored_checksum: u32, metadata: &[u8; 20], command: &[u8]) {
+    fn decode_validate(stored_checksum: u32, metadata: &[u8; 21], command: &[u8]) {
         let mut actual_checksum = CRC32C::new();
-        actual_checksum.update(&metadata[4..]);
+        actual_checksum.update(&metadata[5..]);
         actual_checksum.update(&command);
         assert_eq!(stored_checksum, actual_checksum.sum());
     }
 
     fn decode(reader: &mut BufReader<impl std::io::Read>) -> LogEntry {
-        let mut metadata: [u8; 20] = [0; 20];
+        let mut metadata: [u8; 21] = [0; 21];
         reader.read_exact(&mut metadata).unwrap();
 
         let (term, command_length, stored_checksum, pages) = LogEntry::decode_metadata(&metadata);
@@ -241,17 +243,17 @@ impl LogEntry {
     fn decode_from_pagecache(pagecache: &mut PageCache, offset: u64) -> (LogEntry, u64) {
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         pagecache.read(offset, &mut page);
-        let mut metadata: [u8; 20] = [0; 20];
-        metadata.copy_from_slice(&page[0..20]);
+        let mut metadata: [u8; 21] = [0; 21];
+        metadata.copy_from_slice(&page[0..21]);
         let (term, command_length, stored_checksum, pages) = LogEntry::decode_metadata(&metadata);
 
         let mut command = Vec::<u8>::with_capacity(command_length as usize);
-        let command_first_page = if command_length <= PAGESIZE - 20 {
+        let command_first_page = if command_length <= PAGESIZE - 21 {
             command_length
         } else {
-            PAGESIZE - 20
+            PAGESIZE - 21
         } as usize;
-        command.copy_from_slice(&page[20..command_first_page]);
+        command.copy_from_slice(&page[21..command_first_page]);
         let mut current_page = 1;
         while (command.len() as u64) < command_length {
             pagecache.read(offset, &mut page);
@@ -260,6 +262,7 @@ impl LogEntry {
             } else {
                 command_length - (command.len() as u64)
             };
+	    // TODO: take into consideration that the first byte marks the page as overflow.
             let write_start = (PAGESIZE * current_page) as usize;
             let write_end = (PAGESIZE * current_page + remaining) as usize;
             command[write_start..write_end].copy_from_slice(&page[0..remaining as usize]);
