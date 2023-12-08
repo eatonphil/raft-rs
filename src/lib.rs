@@ -2,7 +2,7 @@
 // [0] In Search of an Understandable Consensus Algorithm (Extended Version) -- https://raft.github.io/raft.pdf
 
 use std::convert::TryInto;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::prelude::FileExt;
 use std::sync::{mpsc, Arc, Mutex};
@@ -18,6 +18,63 @@ pub enum ApplyResult {
 
 pub trait StateMachine {
     fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>>;
+}
+
+// FIFO-based cache of file pages.
+struct PageCache {
+    // Backing file.
+    file: std::fs::File,
+
+    // Page cache. Maps file offset to page.
+    page_cache: std::collections::VecDeque<(u64, [u8; PAGESIZE as usize])>,
+    page_cache_size: usize,
+}
+
+impl PageCache {
+    fn new(file: std::fs::File, page_cache_size: usize) -> PageCache {
+        return PageCache {
+            file,
+            page_cache_size,
+            page_cache: std::collections::VecDeque::new(),
+        };
+    }
+
+    fn insert_or_replace_in_cache(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
+        let mut index_in_cache: Option<usize> = None;
+        for (index, (existing_offset, _)) in self.page_cache.iter().enumerate() {
+            if *existing_offset == offset {
+                index_in_cache = Some(index);
+            }
+        }
+
+        if let Some(index) = index_in_cache {
+            self.page_cache.remove(index);
+            return;
+        }
+        self.page_cache.push_back((offset, page));
+
+        if self.page_cache.len() == self.page_cache_size + 1 {
+            self.page_cache.pop_front();
+        }
+    }
+
+    fn read(&mut self, offset: u64, buf_into: &mut [u8; PAGESIZE as usize]) {
+        for (existing_offset, page) in self.page_cache.iter() {
+            if *existing_offset == offset {
+                buf_into.copy_from_slice(page);
+                return;
+            }
+        }
+
+        self.file.read_exact_at(buf_into, offset).unwrap();
+        self.insert_or_replace_in_cache(offset, buf_into.clone());
+    }
+
+    fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
+        self.file.write_all_at(&page, offset).unwrap();
+        self.file.sync_all().unwrap();
+        self.insert_or_replace_in_cache(offset, page);
+    }
 }
 
 //        ON DISK FORMAT
@@ -65,9 +122,9 @@ impl PartialEq for LogEntry {
 }
 
 impl LogEntry {
-    fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) {
+    fn store_metadata(&self, buffer: &mut [u8; PAGESIZE as usize]) -> usize {
         *buffer = [0; PAGESIZE as usize];
-        let command_length = self.command.len() as u64;
+        let command_length = self.command.len();
 
         buffer[4..12].copy_from_slice(&self.term.to_le_bytes());
 
@@ -78,58 +135,98 @@ impl LogEntry {
         checksum.update(&self.command);
         buffer[0..4].copy_from_slice(&checksum.sum().to_le_bytes());
 
-        let command_first_page = if command_length <= PAGESIZE - 20 {
+        let page_minus_metadata = (PAGESIZE - 20) as usize;
+        let command_first_page = if command_length <= page_minus_metadata {
             command_length
         } else {
-            PAGESIZE - 20
-        } as usize;
+            page_minus_metadata
+        };
         buffer[20..20 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
+        return command_length - command_first_page;
+    }
+
+    fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) {
+        let to_write = self.store_metadata(buffer);
         writer.write_all(buffer).unwrap();
 
-        let mut written = command_first_page;
-        while written < self.command.len() {
+        let mut written = self.command.len() - to_write;
+        while written < to_write {
             let to_write = if self.command.len() - written > PAGESIZE as usize {
                 PAGESIZE as usize
             } else {
+                // If there's going to be empty space, zero out the buffer.
+                buffer[to_write..].fill(0);
                 self.command.len() - written
             };
             buffer[0..to_write].copy_from_slice(&self.command[written..written + to_write]);
             writer.write_all(buffer).unwrap();
             written += PAGESIZE as usize;
         }
+
+        assert_eq!(written as u64 % PAGESIZE, 0);
+    }
+
+    fn encode_to_pagecache(
+        &self,
+        buffer: &mut [u8; PAGESIZE as usize],
+        pagecache: &mut PageCache,
+        offset: u64,
+    ) -> u64 {
+        let to_write = self.store_metadata(buffer);
+        pagecache.write(offset, buffer.clone());
+        let mut offset = offset + PAGESIZE;
+
+        let mut written = self.command.len() - to_write;
+        while written < to_write {
+            let to_write = if self.command.len() - written > PAGESIZE as usize {
+                PAGESIZE as usize
+            } else {
+                // If there's going to be empty space, zero out the buffer.
+                buffer[to_write..].fill(0);
+                self.command.len() - written
+            };
+            buffer[0..to_write].copy_from_slice(&self.command[written..written + to_write]);
+            pagecache.write(offset, buffer.clone());
+            written += PAGESIZE as usize;
+            offset += PAGESIZE;
+        }
+
+        assert_eq!(written as u64 % PAGESIZE, 0);
+        return written as u64 / PAGESIZE;
     }
 
     fn decode_metadata(metadata: &[u8; 20]) -> (u64, u64, u32, u64) {
-	let term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
+        let term = u64::from_le_bytes(metadata[4..12].try_into().unwrap());
         let command_length = u64::from_le_bytes(metadata[12..20].try_into().unwrap());
-	let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
+        let stored_checksum = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
 
-	let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
-	let total_size = rest_before_page_boundary + 20 + command_length;
-	assert_eq!(total_size % PAGESIZE, 0);
-	let pages = total_size / PAGESIZE;
-	
-	return (term, command_length, stored_checksum, pages);
+        let rest_before_page_boundary = PAGESIZE - ((20 + command_length) % PAGESIZE);
+        let total_size = rest_before_page_boundary + 20 + command_length;
+        assert_eq!(total_size % PAGESIZE, 0);
+        let pages = total_size / PAGESIZE;
+
+        return (term, command_length, stored_checksum, pages);
+    }
+
+    fn decode_validate(stored_checksum: u32, metadata: &[u8; 20], command: &[u8]) {
+        let mut actual_checksum = CRC32C::new();
+        actual_checksum.update(&metadata[4..]);
+        actual_checksum.update(&command);
+        assert_eq!(stored_checksum, actual_checksum.sum());
     }
 
     fn decode(reader: &mut BufReader<impl std::io::Read>) -> LogEntry {
         let mut metadata: [u8; 20] = [0; 20];
         reader.read_exact(&mut metadata).unwrap();
 
-	let (term, command_length, stored_checksum, pages) =
-	    LogEntry::decode_metadata(&metadata);
-	
+        let (term, command_length, stored_checksum, pages) = LogEntry::decode_metadata(&metadata);
+
         let mut command = vec![b'0'; command_length as usize];
-	
-        let mut actual_checksum = CRC32C::new();
-        actual_checksum.update(&metadata[4..]);
-
-        assert_eq!(command.len(), command_length as usize);
         reader.read_exact(&mut command).unwrap();
-        actual_checksum.update(&command);
+        assert_eq!(command.len(), command_length as usize);
 
-	assert_eq!(stored_checksum, actual_checksum.sum());
-        
+        LogEntry::decode_validate(stored_checksum, &metadata, &command);
+
         // Read (and drop) until the next page boundary.
         let rest_before_page_boundary = pages * PAGESIZE - (20 + command_length);
         reader.consume(rest_before_page_boundary as usize);
@@ -138,85 +235,46 @@ impl LogEntry {
             term,
             command,
             result_sender: None,
+        };
+    }
+
+    fn decode_from_pagecache(pagecache: &mut PageCache, offset: u64) -> (LogEntry, u64) {
+        let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
+        pagecache.read(offset, &mut page);
+        let mut metadata: [u8; 20] = [0; 20];
+        metadata.copy_from_slice(&page[0..20]);
+        let (term, command_length, stored_checksum, pages) = LogEntry::decode_metadata(&metadata);
+
+        let mut command = Vec::<u8>::with_capacity(command_length as usize);
+        let command_first_page = if command_length <= PAGESIZE - 20 {
+            command_length
+        } else {
+            PAGESIZE - 20
+        } as usize;
+        command.copy_from_slice(&page[20..command_first_page]);
+        let mut current_page = 1;
+        while (command.len() as u64) < command_length {
+            pagecache.read(offset, &mut page);
+            let remaining = if command_length - (command.len() as u64) > PAGESIZE {
+                PAGESIZE
+            } else {
+                command_length - (command.len() as u64)
+            };
+            let write_start = (PAGESIZE * current_page) as usize;
+            let write_end = (PAGESIZE * current_page + remaining) as usize;
+            command[write_start..write_end].copy_from_slice(&page[0..remaining as usize]);
+            current_page += 1;
         }
-    }
 
-    fn decode_from_pagecache(pagecache: &PageCache, offset: u64) -> (LogEntry, u64) {
-	let mut page: [u8; PAGESIZE as usize];
-	pagecache.read(offset, &mut page);
-	let metadata: [u8; 20];
-	metadata.copy_from_slice(&page[0..20]);
-	let (term, command_length, stored_checksum, pages) =
-	    LogEntry::decode_metadata(&metadata);
-
-	let to_read = (pages * PAGESIZE) as usize;
-	let all_pages = Vec::<u8>::with_capacity(to_read);
-	all_pages.copy_from_slice(&page);
-	while all_pages.len() < to_read {
-	    pagecache.read(offset, &mut page);
-	    all_pages.copy_from_slice(&page);
-	}
-	
-	let mut cursor = std::io::Cursor::new(&mut all_pages);
-        let bufreader = BufReader::new(&mut cursor);
-	return (LogEntry::decode(&mut bufreader), pages);
-    }
-}
-
-// FIFO-based cache of file pages.
-struct PageCache {
-    // Backing file.
-    file: std::fs::File,
-
-    // Page cache. Maps file offset to page.
-    page_cache: std::collections::VecDeque<(u64, [u8; PAGESIZE as usize])>,
-    page_cache_size: usize,
-}
-
-impl PageCache {
-    fn new(file: std::fs::File, page_cache_size: usize) -> PageCache {
-	return PageCache{
-	    file,
-	    page_cache_size,
-	    page_cache: std::collections::VecDeque::new(),
-	};
-    }
-
-    fn insert_or_replace_in_cache(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
-	let mut index_in_cache: Option<usize> = None;
-	for (index, (existing_offset, _)) in self.page_cache.iter().enumerate() {
-	    if *existing_offset == offset {
-		index_in_cache = Some(index);
-	    }
-	}
-
-	if let Some(index) = index_in_cache {
-	    self.page_cache.remove(index);
-	    return;
-	}
-	self.page_cache.push_back((offset, page));
-
-	if self.page_cache.len() == self.page_cache_size + 1 {
-	    self.page_cache.pop_front();
-	}
-    }
-
-    fn read(&mut self, offset: u64, buf_into: &mut [u8; PAGESIZE as usize]) {
-	let index_in_cache: Option<usize> = None;
-	for (existing_offset, page) in self.page_cache.iter() {
-	    if *existing_offset == offset {
-		buf_into.copy_from_slice(page);
-		return;
-	    }
-	}
-
-	self.file.read_exact_at(buf_into, offset).unwrap();
-	self.insert_or_replace_in_cache(offset, buf_into.clone());
-    }
-
-    fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
-	self.file.write_all_at(&page, offset);
-	self.file.sync_all().unwrap();
+        LogEntry::decode_validate(stored_checksum, &metadata, &command);
+        return (
+            LogEntry {
+                term,
+                command,
+                result_sender: None,
+            },
+            pages,
+        );
     }
 }
 
@@ -243,12 +301,12 @@ impl DurableState {
             .open(filename)
             .expect("Could not open data file.");
         DurableState {
-	    last_log_index: 0,
-	    last_log_term: 0,
-	    next_log_offset: PAGESIZE,
-	    pagecache: PageCache::new(file, 100),
+            last_log_index: 0,
+            last_log_term: 0,
+            next_log_offset: PAGESIZE,
+            pagecache: PageCache::new(file, 100),
 
-	    current_term: 0,
+            current_term: 0,
             voted_for: None,
         }
     }
@@ -264,9 +322,8 @@ impl DurableState {
             }
         }
 
-
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
-	self.pagecache.read(0, &mut metadata);
+        self.pagecache.read(0, &mut metadata);
 
         // Magic number check.
         assert_eq!(metadata[0..4], 0xFABEF15E_u32.to_le_bytes());
@@ -285,26 +342,32 @@ impl DurableState {
             panic!("Bad checksum for data file.");
         }
 
-	let log_length = u64::from_le_bytes(metadata[33..41].try_into().unwrap()) as usize;
+        let log_length = u64::from_le_bytes(metadata[33..41].try_into().unwrap()) as usize;
 
-	let scanned = 0;
-	while scanned < log_length {
-	    let (e, pages) = LogEntry::decode_from_pagecache(&self.pagecache, self.next_log_offset);
-	    self.last_log_index += 1;
-	    self.last_log_term = e.term;
-	    self.next_log_offset += pages * PAGESIZE;
-	}
-	self.last_log_index -= 1;
+        let scanned = 0;
+        while scanned < log_length {
+            if scanned > 0 {
+                self.last_log_index += 1;
+            }
+
+            let (e, pages) =
+                LogEntry::decode_from_pagecache(&mut self.pagecache, self.next_log_offset);
+            self.last_log_index += 1;
+            self.last_log_term = e.term;
+            self.next_log_offset += pages * PAGESIZE;
+        }
     }
 
     // Durably add logs to disk.
     fn append(&mut self, commands: &[Vec<u8>], result_sender: Option<mpsc::Sender<ApplyResult>>) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
-	// TODO: MUST BE REDONE TO SUPPORT PAGE CACHE AND ALSO MUST SET last_log_index, last_log_term, next_log_offset.
-
         // Write out all new logs.
-        for command in commands.iter() {
+        for (i, command) in commands.iter().enumerate() {
+            if i > 0 {
+                self.last_log_index += 1;
+            }
+
             let entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
@@ -313,9 +376,10 @@ impl DurableState {
                 result_sender: result_sender.clone(),
             };
 
-            entry.encode(&mut buffer, &self.file);
-
-            self.log.push(entry);
+            let offset = self.next_log_offset;
+            let pages = entry.encode_to_pagecache(&mut buffer, &mut self.pagecache, offset);
+            self.next_log_offset = offset + pages * PAGESIZE;
+            self.last_log_term = entry.term;
         }
 
         // Write log length metadata.
@@ -348,28 +412,27 @@ impl DurableState {
         let checksum = crc32c(&metadata[0..41]);
         metadata[41..45].copy_from_slice(&checksum.to_le_bytes());
 
-	self.pagecache.write(0, metadata);
+        self.pagecache.write(0, metadata);
     }
 
-    fn log_at_index(&self, i: u64) -> LogEntry {
-	assert!(i <= self.last_log_index);
-	assert!(i >= 0);
-	let mut current_index = self.last_log_index + 1;
-	let offset = self.next_log_offset;
-	let mut page: [u8; PAGESIZE as usize];
+    fn log_at_index(&mut self, i: u64) -> LogEntry {
+        assert!(i <= self.last_log_index);
+        let mut current_index = self.last_log_index + 1;
+        let mut offset = self.next_log_offset;
+        let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
-	while i < current_index {
-	    self.pagecache.read(offset, &mut page);
-	    // Found an entry page.
-	    if page[0] == 1 {
-		current_index -= 1;
-	    }
+        while i < current_index {
+            self.pagecache.read(offset, &mut page);
+            // Found an entry page.
+            if page[0] == 1 {
+                current_index -= 1;
+            }
 
-	    offset -= PAGESIZE;
-	}
+            offset -= PAGESIZE;
+        }
 
-	let (entry, _) = LogEntry::decode_from_pagecache(&self.pagecache, offset);
-	return entry;
+        let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
+        return entry;
     }
 }
 
@@ -383,13 +446,13 @@ enum Condition {
 struct VolatileState {
     condition: Condition,
 
-    commit_index: usize,
-    last_applied: usize,
+    commit_index: u64,
+    last_applied: u64,
     last_valid_message: Instant,
 
     // Leader-only state.
-    next_index: Vec<usize>,
-    match_index: Vec<usize>,
+    next_index: Vec<u64>,
+    match_index: Vec<u64>,
 
     // Candidate-only state.
     votes: usize,
@@ -527,7 +590,7 @@ impl RequestVoteRequest {
         Some(RPCBody::RequestVoteRequest(RequestVoteRequest {
             term,
             candidate_id,
-            last_log_index: last_log_index as usize,
+            last_log_index,
             last_log_term,
         }))
     }
@@ -989,9 +1052,9 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     fn handle_message(&mut self, message: &RPCMessage) -> Option<RPCMessage> {
-	// "If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1)."
-	// - Reference [0] Page 4
+        // "If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower (§5.1)."
+        // - Reference [0] Page 4
         let mut state = self.state.lock().unwrap();
         if message.term > state.durable.current_term {
             let voted_for = state.durable.voted_for;
@@ -1019,7 +1082,7 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        let log_length = state.durable.log.len();
+        let log_length = state.durable.last_log_index + 1;
 
         'outer: for i in (0..log_length).rev() {
             let mut quorum = quorum_needed;
@@ -1029,6 +1092,7 @@ impl<SM: StateMachine> Server<SM> {
             }
 
             assert!(quorum > 0 || (self.config.cluster.len() == 1 && quorum == 0));
+            let e = state.durable.log_at_index(i as u64);
             for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
                 // Here so that in the case of there being a single
                 // server in the cluster, we still (trivially) achieve
@@ -1045,7 +1109,6 @@ impl<SM: StateMachine> Server<SM> {
                     continue;
                 }
 
-		let e = state.durable.log_at_index(i as u64);
                 if match_index >= i && e.term == state.durable.current_term {
                     quorum -= 1;
                 }
@@ -1131,18 +1194,15 @@ impl<SM: StateMachine> Server<SM> {
         let starting_index = state.volatile.last_applied + 1;
         while state.volatile.last_applied < state.volatile.commit_index {
             state.volatile.last_applied += 1;
-            to_apply.push(
-                state.durable.log[state.volatile.last_applied]
-                    .command
-                    // TODO: Is this clone necessary?
-                    .clone(),
-            );
+            let last_applied = state.volatile.last_applied;
+            to_apply.push(state.durable.log_at_index(last_applied).command);
         }
 
         if !to_apply.is_empty() {
             let results = self.sm.apply(to_apply);
             for (i, result) in results.into_iter().enumerate() {
-                if let Some(sender) = &state.durable.log[starting_index + i].result_sender {
+                let e = state.durable.log_at_index(starting_index + i as u64);
+                if let Some(sender) = &e.result_sender {
                     sender.send(ApplyResult::Ok(result)).unwrap();
                 }
             }
@@ -1322,29 +1382,29 @@ mod tests {
         durable.restore();
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, None);
-        assert_eq!(durable.log.len(), 1);
-        assert_eq!(durable.log[0].term, 0);
-        assert_eq!(durable.log[0].command, vec![]);
+        assert_eq!(durable.last_log_index, 0);
+        assert_eq!(durable.log_at_index(0).term, 0);
+        assert_eq!(durable.log_at_index(0).command, vec![]);
 
         durable.update(10234, Some(40592));
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, Some(40592));
-        assert_eq!(durable.log.len(), 1);
-        assert_eq!(durable.log[0].term, 0);
-        assert_eq!(durable.log[0].command, vec![]);
+        assert_eq!(durable.last_log_index, 0);
+        assert_eq!(durable.log_at_index(0).term, 0);
+        assert_eq!(durable.log_at_index(0).command, vec![]);
         drop(durable);
 
         let mut durable = DurableState::new(&tmp.dir, 1);
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, None);
-        assert_eq!(durable.log.len(), 0);
+        assert_eq!(durable.last_log_index, 0);
 
         durable.restore();
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, Some(40592));
-        assert_eq!(durable.log.len(), 1);
-        assert_eq!(durable.log[0].term, 0);
-        assert_eq!(durable.log[0].command, vec![]);
+        assert_eq!(durable.last_log_index, 0);
+        assert_eq!(durable.log_at_index(0).term, 0);
+        assert_eq!(durable.log_at_index(0).command, vec![]);
     }
 
     #[test]
@@ -1364,41 +1424,95 @@ mod tests {
         // Start up and restore. Should have two entries.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
-        assert_eq!(durable.log.len(), 3);
-        assert_eq!(durable.log[1].term, 0);
-        assert_eq!(durable.log[1].command, b"abcdef123456"[0..]);
-        assert_eq!(durable.log[2].term, 0);
-        assert_eq!(durable.log[2].command, b"foobar"[0..]);
+        assert_eq!(durable.last_log_index, 2);
+        assert_eq!(
+            durable.log_at_index(1),
+            LogEntry {
+                term: 0,
+                command: b"abcdef123456".to_vec(),
+                result_sender: None,
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(2),
+            LogEntry {
+                term: 0,
+                command: b"foobar".to_vec(),
+                result_sender: None,
+            }
+        );
 
         // Add in double the existing entries and shut down.
         v.reverse();
-        let longcommand = "a".repeat(10_000);
-        let longcommand2 = "a".repeat(PAGESIZE as usize);
-        let longcommand3 = "a".repeat(1 + PAGESIZE as usize);
-        v.push(longcommand.as_bytes().to_vec());
-        v.push(longcommand2.as_bytes().to_vec());
-        v.push(longcommand3.as_bytes().to_vec());
+        let longcommand = b"a".repeat(10_000);
+        let longcommand2 = b"a".repeat(PAGESIZE as usize);
+        let longcommand3 = b"a".repeat(1 + PAGESIZE as usize);
+        v.push(longcommand.to_vec());
+        v.push(longcommand2.to_vec());
+        v.push(longcommand3.to_vec());
         durable.append(&v, None);
         drop(durable);
 
         // Start up and restore. Should now have four entries.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
-        assert_eq!(durable.log.len(), 8);
-        assert_eq!(durable.log[1].term, 0);
-        assert_eq!(durable.log[1].command, b"abcdef123456"[0..]);
-        assert_eq!(durable.log[2].term, 0);
-        assert_eq!(durable.log[2].command, b"foobar"[0..]);
-        assert_eq!(durable.log[3].term, 0);
-        assert_eq!(durable.log[3].command, b"foobar"[0..]);
-        assert_eq!(durable.log[4].term, 0);
-        assert_eq!(durable.log[4].command, b"abcdef123456"[0..]);
-        assert_eq!(durable.log[5].term, 0);
-        assert_eq!(durable.log[5].command, longcommand.as_bytes());
-        assert_eq!(durable.log[6].term, 0);
-        assert_eq!(durable.log[6].command, longcommand2.as_bytes());
-        assert_eq!(durable.log[7].term, 0);
-        assert_eq!(durable.log[7].command, longcommand3.as_bytes());
+        assert_eq!(durable.last_log_index, 7);
+        assert_eq!(
+            durable.log_at_index(1),
+            LogEntry {
+                term: 0,
+                command: b"abcdef123456".to_vec(),
+                result_sender: None
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(2),
+            LogEntry {
+                term: 0,
+                command: b"foobar".to_vec(),
+                result_sender: None
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(3),
+            LogEntry {
+                term: 0,
+                command: b"foobar".to_vec(),
+                result_sender: None
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(4),
+            LogEntry {
+                term: 0,
+                command: b"abcdef123456".to_vec(),
+                result_sender: None
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(5),
+            LogEntry {
+                term: 0,
+                command: longcommand.to_vec(),
+                result_sender: None
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(6),
+            LogEntry {
+                term: 0,
+                command: longcommand2.to_vec(),
+                result_sender: None
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(7),
+            LogEntry {
+                term: 0,
+                command: longcommand3.to_vec(),
+                result_sender: None
+            }
+        );
     }
 
     #[test]
@@ -1510,7 +1624,7 @@ mod tests {
 
     #[test]
     fn test_rpc_manager() {
-	let tmpdir = &TmpDir::new();
+        let tmpdir = &TmpDir::new();
         let server = new_test_server(&tmpdir, 20001);
         let mut rpcm = RPCManager::new(0, server.config.cluster.clone());
         rpcm.start();
@@ -1541,7 +1655,7 @@ mod tests {
 
     #[test]
     fn test_single_server_apply_end_to_end() {
-	let tmpdir = &TmpDir::new();
+        let tmpdir = &TmpDir::new();
         let mut server = new_test_server(&tmpdir, 20002);
 
         // First test apply doesn't work as not a leader.
@@ -1564,7 +1678,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_vote_request() {
-	let tmpdir = &TmpDir::new();
+        let tmpdir = &TmpDir::new();
         let mut server = new_test_server(&tmpdir, 20003);
         server.init();
 
@@ -1574,8 +1688,7 @@ mod tests {
             last_log_index: 2,
             last_log_term: 1,
         };
-        let response = server.handle_message(
-	    &RPCMessage::new(1, RPCBody::RequestVoteRequest(msg)));
+        let response = server.handle_message(&RPCMessage::new(1, RPCBody::RequestVoteRequest(msg)));
         assert_eq!(
             response,
             Some(RPCMessage::new(
@@ -1590,55 +1703,59 @@ mod tests {
 
     #[test]
     fn test_handle_request_vote_response() {
-	let tmpdir = &TmpDir::new();
+        let tmpdir = &TmpDir::new();
         let mut server = new_test_server(&tmpdir, 20004);
         server.init();
 
         let msg = RequestVoteResponse {
             term: 1,
-	    vote_granted: false,
+            vote_granted: false,
         };
-        let response = server.handle_message(
-	    &RPCMessage::new(1, RPCBody::RequestVoteResponse(msg)));
+        let response =
+            server.handle_message(&RPCMessage::new(1, RPCBody::RequestVoteResponse(msg)));
         assert_eq!(response, None);
     }
 
     #[test]
     fn test_handle_append_entries_request() {
-	let tmpdir = &TmpDir::new();
+        let tmpdir = &TmpDir::new();
         let mut server = new_test_server(&tmpdir, 20005);
         server.init();
 
         let msg = AppendEntriesRequest {
-	    term: 91,
+            term: 91,
             leader_id: 2132,
             prev_log_index: 1823,
             prev_log_term: 193,
             entries: vec![],
             leader_commit: 95,
         };
-        let response = server.handle_message(
-	    &RPCMessage::new(91, RPCBody::AppendEntriesRequest(msg)));
-        assert_eq!(response, Some(RPCMessage::new(91, RPCBody::AppendEntriesResponse(
-	    AppendEntriesResponse{
-		term: 91,
-		success: true,
-	    }
-	))));
+        let response =
+            server.handle_message(&RPCMessage::new(91, RPCBody::AppendEntriesRequest(msg)));
+        assert_eq!(
+            response,
+            Some(RPCMessage::new(
+                91,
+                RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 91,
+                    success: true,
+                })
+            ))
+        );
     }
 
     #[test]
     fn test_handle_append_entries_response() {
-	let tmpdir = &TmpDir::new();
+        let tmpdir = &TmpDir::new();
         let mut server = new_test_server(&tmpdir, 20006);
         server.init();
 
         let msg = AppendEntriesResponse {
             term: 1,
-	    success: false,
+            success: false,
         };
-        let response = server.handle_message(
-	    &RPCMessage::new(1, RPCBody::AppendEntriesResponse(msg)));
+        let response =
+            server.handle_message(&RPCMessage::new(1, RPCBody::AppendEntriesResponse(msg)));
         assert_eq!(response, None);
     }
 
