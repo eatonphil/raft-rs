@@ -32,11 +32,11 @@ struct PageCache {
 
 impl PageCache {
     fn new(file: std::fs::File, page_cache_size: usize) -> PageCache {
-        return PageCache {
+        PageCache {
             file,
             page_cache_size,
             page_cache: std::collections::VecDeque::new(),
-        };
+        }
     }
 
     fn insert_or_replace_in_cache(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
@@ -69,7 +69,7 @@ impl PageCache {
         }
 
         self.file.read_exact_at(buf_into, offset).unwrap();
-        self.insert_or_replace_in_cache(offset, buf_into.clone());
+        self.insert_or_replace_in_cache(offset, *buf_into);
     }
 
     fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
@@ -124,11 +124,11 @@ impl PartialEq for LogEntry {
 impl LogEntry {
     fn command_first_page(command_length: usize) -> usize {
         let page_minus_metadata = (PAGESIZE - 21) as usize;
-        return if command_length <= page_minus_metadata {
+        if command_length <= page_minus_metadata {
             command_length
         } else {
             page_minus_metadata
-        };
+        }
     }
 
     fn store_metadata(&self, buffer: &mut [u8; PAGESIZE as usize]) -> usize {
@@ -146,7 +146,7 @@ impl LogEntry {
 
         let command_first_page = LogEntry::command_first_page(command_length);
         buffer[21..21 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
-        return command_length - command_first_page;
+        command_length - command_first_page
     }
 
     fn store_overflow(&self, buffer: &mut [u8; PAGESIZE as usize], offset: usize) -> usize {
@@ -159,7 +159,7 @@ impl LogEntry {
         };
         buffer[0] = 0; // Overflow marker.
         buffer[1..1 + filled].copy_from_slice(&self.command[offset..offset + filled]);
-        return filled;
+        filled
     }
 
     fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) {
@@ -181,7 +181,7 @@ impl LogEntry {
         offset: u64,
     ) -> u64 {
         let to_write = self.store_metadata(buffer);
-        pagecache.write(offset, buffer.clone());
+        pagecache.write(offset, *buffer);
         let mut pages = 1;
 
         let mut offset = offset + PAGESIZE;
@@ -189,13 +189,13 @@ impl LogEntry {
 
         while written < self.command.len() {
             let filled = self.store_overflow(buffer, written);
-            pagecache.write(offset, buffer.clone());
+            pagecache.write(offset, *buffer);
             written += filled;
             offset += PAGESIZE;
             pages += 1;
         }
 
-        return pages;
+        pages
     }
 
     fn recover_metadata(page: &[u8; PAGESIZE as usize]) -> (LogEntry, u32, usize) {
@@ -208,20 +208,20 @@ impl LogEntry {
         // the command. Call recover_overflow() to decode any
         // additional pages.
         let command_first_page = LogEntry::command_first_page(command_length);
-        let mut command = vec![0; command_length as usize];
+        let mut command = vec![0; command_length];
         command[0..command_first_page].copy_from_slice(&page[21..21 + command_first_page]);
 
-        return (
+        (
             LogEntry { term, command },
             stored_checksum,
             command_first_page,
-        );
+        )
     }
 
     fn decode_validate(stored_checksum: u32, metadata: &[u8; PAGESIZE as usize], command: &[u8]) {
         let mut actual_checksum = CRC32C::new();
         actual_checksum.update(&metadata[5..21]);
-        actual_checksum.update(&command);
+        actual_checksum.update(command);
         assert_eq!(stored_checksum, actual_checksum.sum());
     }
 
@@ -241,7 +241,7 @@ impl LogEntry {
             to_read
         };
         command[command_read..command_read + fill].copy_from_slice(&page[1..1 + fill]);
-        return fill;
+        fill
     }
 
     fn decode(mut reader: impl std::io::Read) -> LogEntry {
@@ -262,14 +262,14 @@ impl LogEntry {
         }
 
         LogEntry::decode_validate(stored_checksum, &page, &entry.command);
-        return entry;
+        entry
     }
 
     fn decode_from_pagecache(pagecache: &mut PageCache, offset: u64) -> (LogEntry, u64) {
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         println!("LOOKING AT OFFSET {}", offset);
         pagecache.read(offset, &mut page);
-        let (mut entry, stored_checksum, command_read) = LogEntry::recover_metadata(&mut page);
+        let (mut entry, stored_checksum, command_read) = LogEntry::recover_metadata(&page);
         let mut actual_checksum = CRC32C::new();
         actual_checksum.update(&page[5..21]);
 
@@ -284,7 +284,7 @@ impl LogEntry {
 
         actual_checksum.update(&entry.command);
         assert_eq!(stored_checksum, actual_checksum.sum());
-        return (entry, current_offset);
+        (entry, current_offset)
     }
 }
 
@@ -442,7 +442,7 @@ impl DurableState {
             return self.next_log_offset;
         }
 
-        assert!(index <= self.next_log_index - 1);
+        assert!(index < self.next_log_index);
         let mut current_index = self.next_log_index - 1;
         let mut offset = self.next_log_offset - PAGESIZE;
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
@@ -462,14 +462,14 @@ impl DurableState {
             offset -= PAGESIZE;
         }
 
-        return offset;
+        offset
     }
 
     fn log_at_index(&mut self, i: u64) -> LogEntry {
         let offset = self.offset_from_index(i);
         println!("HERE Looking up {i} at {offset}");
         let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
-        return entry;
+        entry
     }
 }
 
@@ -636,7 +636,7 @@ impl RequestVoteRequest {
     fn encode<T: std::io::Write>(&self, encoder: &mut RPCMessageEncoder<T>) {
         encoder.metadata(RPCBodyKind::RequestVoteRequest as u8, self.term);
         encoder.data(&self.candidate_id.to_le_bytes());
-        encoder.data(&(self.last_log_index as u64).to_le_bytes());
+        encoder.data(&self.last_log_index.to_le_bytes());
         encoder.data(&self.last_log_term.to_le_bytes());
         encoder.done();
     }
@@ -1134,7 +1134,7 @@ impl<SM: StateMachine> Server<SM> {
             }
 
             assert!(quorum > 0 || (self.config.cluster.len() == 1 && quorum == 0));
-            let e = state.durable.log_at_index(i as u64);
+            let e = state.durable.log_at_index(i);
             for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
                 // Here so that in the case of there being a single
                 // server in the cluster, we still (trivially) achieve
