@@ -59,8 +59,8 @@ impl PageCache {
         }
     }
 
-    fn read(&mut self, offset: u64, buf_into: &mut [u8]) {
-	assert_eq!(buf_into.len(), PAGESIZE as usize);
+    fn read(&mut self, offset: u64, buf_into: &mut [u8; PAGESIZE as usize]) {
+        assert_eq!(buf_into.len(), PAGESIZE as usize);
         for (existing_offset, page) in self.page_cache.iter() {
             if *existing_offset == offset {
                 buf_into.copy_from_slice(page);
@@ -80,24 +80,6 @@ impl PageCache {
     fn sync(&self) {
         self.file.sync_all().unwrap();
     }
-}
-
-struct PageCacheIO {
-    pagecache: PageCache,
-    offset: u64,
-}
-
-impl Read for PageCacheIO {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-	assert_eq!(buf.len(), PAGESIZE as usize);
-	self.pagecache.read(self.offset, buf);
-	self.offset += PAGESIZE;
-	return Ok(PAGESIZE as usize);
-    }
-}
-
-impl Write for PageCacheIO {
-    fn write(&mut self, buf: [u8]) 
 }
 
 //        ON DISK FORMAT
@@ -125,20 +107,9 @@ impl Write for PageCacheIO {
 //
 // $Entry Start$ is `1` when the page is the start of an entry, not an
 // overflow page.
-//
-// The last entry in a page (or the last part of an entry when
-// overflowing a page) will pad out the to the end of the page with
-// zeroes. As new entries come in that can fill out the page and
-// replace the padding, they will. This is to ensure there is always a
-// PAGESIZE worth of bytes to read and write.
 
 #[derive(Debug)]
 struct LogEntry {
-    // In-memory channel for sending results back to a user of the
-    // library. Will always be `None` when a log is read back from
-    // disk.
-    result_sender: Option<mpsc::Sender<ApplyResult>>,
-
     // Actual data.
     command: Vec<u8>,
     term: u64,
@@ -160,7 +131,7 @@ impl LogEntry {
         };
     }
 
-    fn store_metadata(&self, buffer: &mut [u8; PAGESIZE as usize], buffer_offset: usize) -> usize {
+    fn store_metadata(&self, buffer: &mut [u8; PAGESIZE as usize]) -> usize {
         *buffer = [0; PAGESIZE as usize];
         let command_length = self.command.len();
 
@@ -187,7 +158,7 @@ impl LogEntry {
             to_write
         };
         buffer[0] = 0; // Overflow marker.
-        buffer[1..].copy_from_slice(&self.command[offset..offset + filled]);
+        buffer[1..1 + filled].copy_from_slice(&self.command[offset..offset + filled]);
         return filled;
     }
 
@@ -196,13 +167,11 @@ impl LogEntry {
         writer.write_all(buffer).unwrap();
 
         let mut written = self.command.len() - to_write;
-        while written < to_write {
+        while written < self.command.len() {
             let filled = self.store_overflow(buffer, written);
             writer.write_all(buffer).unwrap();
             written += filled;
         }
-
-        assert_eq!(written as u64 % PAGESIZE, 0);
     }
 
     fn encode_to_pagecache(
@@ -213,16 +182,17 @@ impl LogEntry {
     ) -> u64 {
         let to_write = self.store_metadata(buffer);
         pagecache.write(offset, buffer.clone());
-	let mut pages = 1;
+        let mut pages = 1;
 
         let mut offset = offset + PAGESIZE;
         let mut written = self.command.len() - to_write;
-        while written < to_write {
+
+        while written < self.command.len() {
             let filled = self.store_overflow(buffer, written);
             pagecache.write(offset, buffer.clone());
             written += filled;
             offset += PAGESIZE;
-	    pages += 1;
+            pages += 1;
         }
 
         return pages;
@@ -242,11 +212,7 @@ impl LogEntry {
         command[0..command_first_page].copy_from_slice(&page[21..21 + command_first_page]);
 
         return (
-            LogEntry {
-                term,
-                command,
-                result_sender: None,
-            },
+            LogEntry { term, command },
             stored_checksum,
             command_first_page,
         );
@@ -304,6 +270,8 @@ impl LogEntry {
         println!("LOOKING AT OFFSET {}", offset);
         pagecache.read(offset, &mut page);
         let (mut entry, stored_checksum, command_read) = LogEntry::recover_metadata(&mut page);
+        let mut actual_checksum = CRC32C::new();
+        actual_checksum.update(&page[5..21]);
 
         let mut read = command_read;
         let mut current_offset = offset + PAGESIZE;
@@ -314,17 +282,17 @@ impl LogEntry {
             current_offset += PAGESIZE;
         }
 
-        LogEntry::decode_validate(stored_checksum, &page, &entry.command);
+        actual_checksum.update(&entry.command);
+        assert_eq!(stored_checksum, actual_checksum.sum());
         return (entry, current_offset);
     }
 }
 
 struct DurableState {
     // In-memory data.
-    last_log_index: u64,
     last_log_term: u64,
+    next_log_index: u64,
     next_log_offset: u64,
-    final_page: [u8; PAGESIZE as usize],
     pagecache: PageCache,
 
     // On-disk data.
@@ -343,10 +311,9 @@ impl DurableState {
             .open(filename)
             .expect("Could not open data file.");
         DurableState {
-            last_log_index: 0,
             last_log_term: 0,
+            next_log_index: 0,
             next_log_offset: PAGESIZE,
-	    final_page: [0; PAGESIZE as usize],
             pagecache: PageCache::new(file, 100),
 
             current_term: 0,
@@ -360,8 +327,7 @@ impl DurableState {
         // state into the right place.
         if let Ok(m) = self.pagecache.file.metadata() {
             if m.len() == 0 {
-                self.append(&[vec![]], None);
-		println!("here, {}", self.next_log_offset);
+                self.append(&[vec![]]);
                 return;
             }
         }
@@ -390,43 +356,49 @@ impl DurableState {
 
         let mut scanned = 0;
         while scanned < log_length {
-            if scanned > 0 {
-                self.last_log_index += 1;
-            }
+            self.next_log_index += 1;
 
+            println!("Restoring log: {}", self.next_log_index - 1);
             let (e, new_offset) =
                 LogEntry::decode_from_pagecache(&mut self.pagecache, self.next_log_offset);
             self.last_log_term = e.term;
             self.next_log_offset = new_offset;
-	    scanned += 1;
+            scanned += 1;
         }
     }
 
-    // TODO: this must become append_at_index to support log rewrite which will happen for followers.
+    fn append(&mut self, commands: &[Vec<u8>]) {
+        self.append_from_index(commands, self.next_log_index);
+    }
+
     // Durably add logs to disk.
-    fn append(&mut self, commands: &[Vec<u8>], result_sender: Option<mpsc::Sender<ApplyResult>>) {
+    fn append_from_index(&mut self, commands: &[Vec<u8>], from_index: u64) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
+        self.next_log_offset = self.offset_from_index(from_index);
+        self.next_log_index = from_index;
+
         // Write out all new logs.
-        for (i, command) in commands.iter().enumerate() {
-            if i > 0 {
-                self.last_log_index += 1;
-            }
+        for command in commands.iter() {
+            self.next_log_index += 1;
 
             let entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
                 command: command.to_vec(),
-
-                result_sender: result_sender.clone(),
             };
 
+            println!(
+                "Log: {}, at offset: {}",
+                self.next_log_index - 1,
+                self.next_log_offset
+            );
             assert!(self.next_log_offset >= PAGESIZE);
             let pages =
                 entry.encode_to_pagecache(&mut buffer, &mut self.pagecache, self.next_log_offset);
             self.next_log_offset += pages * PAGESIZE;
-	    println!("n pages: {}", pages);
-	    println!("Updating next log offset to: {}", self.next_log_offset);
+            println!("n pages: {}, for command of size: {}", pages, command.len());
+            //println!("Updating next log offset to: {}, for log: {}", self.next_log_offset, self.next_log_index - 1);
 
             self.last_log_term = entry.term;
         }
@@ -455,7 +427,7 @@ impl DurableState {
             metadata[16] = 0;
         }
 
-        let log_length = self.last_log_index + 1;
+        let log_length = self.next_log_index;
         metadata[33..41].copy_from_slice(&log_length.to_le_bytes());
 
         let checksum = crc32c(&metadata[0..41]);
@@ -465,28 +437,37 @@ impl DurableState {
         self.pagecache.sync();
     }
 
-    fn offset_for_index(&mut self, index: u64) -> u64 {
-	assert!(index <= self.last_log_index);
-        let mut current_index = self.last_log_index;
+    fn offset_from_index(&mut self, index: u64) -> u64 {
+        if index == self.next_log_index {
+            return self.next_log_offset;
+        }
+
+        assert!(index <= self.next_log_index - 1);
+        let mut current_index = self.next_log_index - 1;
         let mut offset = self.next_log_offset - PAGESIZE;
-        assert!(offset >= PAGESIZE);
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
-        while index < current_index {
+        loop {
+            assert!(offset >= PAGESIZE);
+            println!("Looking up {current_index} at {offset}");
             self.pagecache.read(offset, &mut page);
             // Found an entry page.
             if page[0] == 1 {
+                if current_index == index {
+                    break;
+                }
                 current_index -= 1;
             }
 
             offset -= PAGESIZE;
         }
 
-	return offset;
+        return offset;
     }
 
     fn log_at_index(&mut self, i: u64) -> LogEntry {
-        let offset = self.offset_for_index(i);
+        let offset = self.offset_from_index(i);
+        println!("HERE Looking up {i} at {offset}");
         let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
         return entry;
     }
@@ -543,6 +524,7 @@ struct State {
 
     // Non-Raft state.
     stopped: bool,
+    notifications: Vec<(u64, mpsc::Sender<ApplyResult>)>,
 }
 
 //             REQUEST WIRE PROTOCOL
@@ -954,7 +936,6 @@ pub struct Config {
     cluster: Vec<ServerConfig>,
 
     // Timing configuration.
-    heartbeat_frequency: Duration,
     heartbeat_timeout: Duration,
 }
 
@@ -987,7 +968,12 @@ impl<SM: StateMachine> Server<SM> {
             return result_receiver;
         }
 
-        state.durable.append(&commands, Some(result_sender));
+        for i in 0..commands.len() {
+            let log_index = state.durable.next_log_index + i as u64;
+            state.notifications.push((log_index, result_sender.clone()));
+        }
+
+        state.durable.append(&commands);
         result_receiver
     }
 
@@ -1029,7 +1015,7 @@ impl<SM: StateMachine> Server<SM> {
         // end with the same term, then whichever log is longer is
         // more up-to-date." - Reference [0] Page 8
 
-        let log_length = state.durable.last_log_index + 1;
+        let log_length = state.durable.next_log_index;
         let my_last_log = &state.durable.log_at_index(log_length - 1);
         let candidate_more_up_to_date = request.last_log_term > my_last_log.term
             || (request.last_log_term == my_last_log.term && request.last_log_index >= log_length);
@@ -1138,7 +1124,7 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        let log_length = state.durable.last_log_index + 1;
+        let log_length = state.durable.next_log_index;
 
         'outer: for i in (0..log_length).rev() {
             let mut quorum = quorum_needed;
@@ -1230,7 +1216,7 @@ impl<SM: StateMachine> Server<SM> {
             RPCBody::RequestVoteRequest(RequestVoteRequest {
                 term,
                 candidate_id: self.config.server_id,
-                last_log_index: state.durable.last_log_index,
+                last_log_index: state.durable.next_log_index - 1,
                 last_log_term: state.durable.last_log_term,
             }),
         );
@@ -1257,9 +1243,17 @@ impl<SM: StateMachine> Server<SM> {
         if !to_apply.is_empty() {
             let results = self.sm.apply(to_apply);
             for (i, result) in results.into_iter().enumerate() {
-                let e = state.durable.log_at_index(starting_index + i as u64);
-                if let Some(sender) = &e.result_sender {
-                    sender.send(ApplyResult::Ok(result)).unwrap();
+                let mut notification_to_drop = None;
+                for (notification, (index, sender)) in state.notifications.iter().enumerate() {
+                    if *index == starting_index + i as u64 {
+                        notification_to_drop = Some(notification);
+                        sender.send(ApplyResult::Ok(result)).unwrap();
+                        break;
+                    }
+                }
+
+                if let Some(index) = notification_to_drop {
+                    state.notifications.remove(index);
                 }
             }
         }
@@ -1329,6 +1323,7 @@ impl<SM: StateMachine> Server<SM> {
                 durable: DurableState::new(data_directory, id),
                 volatile: VolatileState::new(cluster_size),
                 stopped: false,
+                notifications: Vec::new(),
             }),
         }
     }
@@ -1426,7 +1421,7 @@ mod tests {
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-            //std::fs::remove_dir_all(&self.dir).unwrap();
+            std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
@@ -1438,14 +1433,14 @@ mod tests {
         durable.restore();
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, None);
-        assert_eq!(durable.last_log_index, 0);
+        assert_eq!(durable.next_log_index, 1);
         assert_eq!(durable.log_at_index(0).term, 0);
         assert_eq!(durable.log_at_index(0).command, vec![]);
 
         durable.update(10234, Some(40592));
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, Some(40592));
-        assert_eq!(durable.last_log_index, 0);
+        assert_eq!(durable.next_log_index, 1);
         assert_eq!(durable.log_at_index(0).term, 0);
         assert_eq!(durable.log_at_index(0).command, vec![]);
         drop(durable);
@@ -1453,12 +1448,12 @@ mod tests {
         let mut durable = DurableState::new(&tmp.dir, 1);
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, None);
-        assert_eq!(durable.last_log_index, 0);
+        assert_eq!(durable.next_log_index, 0);
 
         durable.restore();
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, Some(40592));
-        assert_eq!(durable.last_log_index, 0);
+        assert_eq!(durable.next_log_index, 1);
         assert_eq!(durable.log_at_index(0).term, 0);
         assert_eq!(durable.log_at_index(0).command, vec![]);
     }
@@ -1474,20 +1469,22 @@ mod tests {
         // Write two entries and shut down.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
-        durable.append(&v, None);
-	assert_eq!(durable.last_log_index, 2);
+        assert_eq!(durable.next_log_index, 1);
+        durable.append(&v);
+        assert_eq!(durable.next_log_index, 3);
+        let prev_offset = durable.next_log_offset;
         drop(durable);
 
         // Start up and restore. Should have two entries.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
-        assert_eq!(durable.last_log_index, 2);
+        assert_eq!(prev_offset, durable.next_log_offset);
+        assert_eq!(durable.next_log_index, 3);
         assert_eq!(
             durable.log_at_index(1),
             LogEntry {
                 term: 0,
                 command: b"abcdef123456".to_vec(),
-                result_sender: None,
             }
         );
         assert_eq!(
@@ -1495,7 +1492,6 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: b"foobar".to_vec(),
-                result_sender: None,
             }
         );
 
@@ -1507,43 +1503,19 @@ mod tests {
         v.push(longcommand.to_vec());
         v.push(longcommand2.to_vec());
         v.push(longcommand3.to_vec());
-        durable.append(&v, None);
-        drop(durable);
-
-        // Start up and restore. Should now have four entries.
-        let mut durable = DurableState::new(&tmp.dir, 1);
-        durable.restore();
-        assert_eq!(durable.last_log_index, 7);
-        assert_eq!(
-            durable.log_at_index(1),
-            LogEntry {
-                term: 0,
-                command: b"abcdef123456".to_vec(),
-                result_sender: None
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(2),
-            LogEntry {
-                term: 0,
-                command: b"foobar".to_vec(),
-                result_sender: None
-            }
-        );
+        durable.append(&v);
         assert_eq!(
             durable.log_at_index(3),
             LogEntry {
                 term: 0,
-                command: b"foobar".to_vec(),
-                result_sender: None
+                command: v[0].clone(),
             }
         );
         assert_eq!(
             durable.log_at_index(4),
             LogEntry {
                 term: 0,
-                command: b"abcdef123456".to_vec(),
-                result_sender: None
+                command: v[1].clone(),
             }
         );
         assert_eq!(
@@ -1551,7 +1523,6 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand.to_vec(),
-                result_sender: None
             }
         );
         assert_eq!(
@@ -1559,7 +1530,6 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand2.to_vec(),
-                result_sender: None
             }
         );
         assert_eq!(
@@ -1567,7 +1537,61 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand3.to_vec(),
-                result_sender: None
+            }
+        );
+        drop(durable);
+
+        // Start up and restore. Should now have 8 entries.
+        let mut durable = DurableState::new(&tmp.dir, 1);
+        durable.restore();
+        assert_eq!(durable.next_log_index, 8);
+        assert_eq!(
+            durable.log_at_index(1),
+            LogEntry {
+                term: 0,
+                command: b"abcdef123456".to_vec(),
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(2),
+            LogEntry {
+                term: 0,
+                command: b"foobar".to_vec(),
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(3),
+            LogEntry {
+                term: 0,
+                command: b"foobar".to_vec(),
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(4),
+            LogEntry {
+                term: 0,
+                command: b"abcdef123456".to_vec(),
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(5),
+            LogEntry {
+                term: 0,
+                command: longcommand.to_vec(),
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(6),
+            LogEntry {
+                term: 0,
+                command: longcommand2.to_vec(),
+            }
+        );
+        assert_eq!(
+            durable.log_at_index(7),
+            LogEntry {
+                term: 0,
+                command: longcommand3.to_vec(),
             }
         );
     }
@@ -1586,12 +1610,10 @@ mod tests {
                         LogEntry {
                             term: 88,
                             command: "hey there".into(),
-                            result_sender: None,
                         },
                         LogEntry {
                             term: 90,
                             command: "blub".into(),
-                            result_sender: None,
                         },
                     ],
                     leader_commit: 95,
@@ -1671,7 +1693,6 @@ mod tests {
                 address: format!("127.0.0.1:{port}").parse().unwrap(),
             }],
 
-            heartbeat_frequency: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(10),
         };
 
@@ -1857,11 +1878,15 @@ mod tests {
             let third_page = [b'c'; PAGESIZE as usize];
             let mut p = PageCache::new(file, cache_size);
             p.write(0, first_page);
-	    assert!(p.page_cache.len() <= cache_size);
-	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
+            assert!(p.page_cache.len() <= cache_size);
+            if cache_size > 0 {
+                assert!(p.page_cache.len() > 0);
+            }
             p.write(PAGESIZE * 2, third_page);
-	    assert!(p.page_cache.len() <= cache_size);
-	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
+            assert!(p.page_cache.len() <= cache_size);
+            if cache_size > 0 {
+                assert!(p.page_cache.len() > 0);
+            }
             p.sync();
 
             drop(p);
@@ -1887,16 +1912,22 @@ mod tests {
             let mut p = PageCache::new(file, cache_size);
             let mut page = [0; PAGESIZE as usize];
             p.read(0, &mut page);
-	    assert!(p.page_cache.len() <= cache_size);
-	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
+            assert!(p.page_cache.len() <= cache_size);
+            if cache_size > 0 {
+                assert!(p.page_cache.len() > 0);
+            }
             assert_eq!(page, first_page);
             p.read(PAGESIZE, &mut page);
-	    assert!(p.page_cache.len() <= cache_size);
-	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
+            assert!(p.page_cache.len() <= cache_size);
+            if cache_size > 0 {
+                assert!(p.page_cache.len() > 0);
+            }
             assert_eq!(page, second_page);
             p.read(PAGESIZE * 2, &mut page);
-	    assert!(p.page_cache.len() <= cache_size);
-	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
+            assert!(p.page_cache.len() <= cache_size);
+            if cache_size > 0 {
+                assert!(p.page_cache.len() > 0);
+            }
             assert_eq!(page, third_page);
         }
     }
