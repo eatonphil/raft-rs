@@ -59,7 +59,8 @@ impl PageCache {
         }
     }
 
-    fn read(&mut self, offset: u64, buf_into: &mut [u8; PAGESIZE as usize]) {
+    fn read(&mut self, offset: u64, buf_into: &mut [u8]) {
+	assert_eq!(buf_into.len(), PAGESIZE as usize);
         for (existing_offset, page) in self.page_cache.iter() {
             if *existing_offset == offset {
                 buf_into.copy_from_slice(page);
@@ -79,6 +80,24 @@ impl PageCache {
     fn sync(&self) {
         self.file.sync_all().unwrap();
     }
+}
+
+struct PageCacheIO {
+    pagecache: PageCache,
+    offset: u64,
+}
+
+impl Read for PageCacheIO {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+	assert_eq!(buf.len(), PAGESIZE as usize);
+	self.pagecache.read(self.offset, buf);
+	self.offset += PAGESIZE;
+	return Ok(PAGESIZE as usize);
+    }
+}
+
+impl Write for PageCacheIO {
+    fn write(&mut self, buf: [u8]) 
 }
 
 //        ON DISK FORMAT
@@ -141,7 +160,7 @@ impl LogEntry {
         };
     }
 
-    fn store_metadata(&self, buffer: &mut [u8; PAGESIZE as usize]) -> usize {
+    fn store_metadata(&self, buffer: &mut [u8; PAGESIZE as usize], buffer_offset: usize) -> usize {
         *buffer = [0; PAGESIZE as usize];
         let command_length = self.command.len();
 
@@ -216,7 +235,7 @@ impl LogEntry {
         let stored_checksum = u32::from_le_bytes(page[1..5].try_into().unwrap());
 
         // recover_metadata() will only decode the first page's worth of
-        // the command.  Call recover_overflow() to decode any
+        // the command. Call recover_overflow() to decode any
         // additional pages.
         let command_first_page = LogEntry::command_first_page(command_length);
         let mut command = vec![0; command_length as usize];
@@ -446,18 +465,16 @@ impl DurableState {
         self.pagecache.sync();
     }
 
-    fn log_at_index(&mut self, i: u64) -> LogEntry {
-        assert!(i <= self.last_log_index);
+    fn offset_for_index(&mut self, index: u64) -> u64 {
+	assert!(index <= self.last_log_index);
         let mut current_index = self.last_log_index;
         let mut offset = self.next_log_offset - PAGESIZE;
         assert!(offset >= PAGESIZE);
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
-        println!("i: {}, current_index: {}", i, current_index);
-        while i < current_index {
+        while index < current_index {
             self.pagecache.read(offset, &mut page);
             // Found an entry page.
-	    println!("Is an entry page? {}", i == 1);
             if page[0] == 1 {
                 current_index -= 1;
             }
@@ -465,7 +482,11 @@ impl DurableState {
             offset -= PAGESIZE;
         }
 
-	println!("Looking up {} at offset: {}", i, offset);
+	return offset;
+    }
+
+    fn log_at_index(&mut self, i: u64) -> LogEntry {
+        let offset = self.offset_for_index(i);
         let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
         return entry;
     }
