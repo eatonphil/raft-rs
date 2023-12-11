@@ -1,7 +1,7 @@
 // References:
 // [0] In Search of an Understandable Consensus Algorithm (Extended Version) -- https://raft.github.io/raft.pdf
 
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::prelude::FileExt;
@@ -69,7 +69,7 @@ impl PageCache {
         }
 
         self.file.read_exact_at(buf_into, offset).unwrap();
-        self.insert_or_replace_in_cache(offset, *buf_into);
+        self.insert_or_replace_in_cache(offset, buf_into.clone());
     }
 
     fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
@@ -79,6 +79,36 @@ impl PageCache {
 
     fn sync(&self) {
         self.file.sync_all().unwrap();
+    }
+}
+
+struct PageCacheIO<'this> {
+    offset: u64,
+    pagecache: &'this mut PageCache,
+}
+
+impl<'this> Read for &mut PageCacheIO<'this> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert_eq!(buf.len(), PAGESIZE as usize);
+        let fixed_buf = <&mut [u8; PAGESIZE as usize]>::try_from(buf).unwrap();
+        self.pagecache.read(self.offset, fixed_buf);
+        self.offset += PAGESIZE;
+        return Ok(PAGESIZE as usize);
+    }
+}
+
+impl<'this> Write for PageCacheIO<'this> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        assert_eq!(buf.len(), PAGESIZE as usize);
+        let fixed_buf = <&[u8; PAGESIZE as usize]>::try_from(buf).unwrap();
+        self.pagecache.write(self.offset, fixed_buf.clone());
+        self.offset += PAGESIZE;
+        return Ok(PAGESIZE as usize);
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.pagecache.sync();
+        return Ok(());
     }
 }
 
@@ -162,16 +192,21 @@ impl LogEntry {
         filled
     }
 
-    fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) {
+    fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) -> u64 {
         let to_write = self.store_metadata(buffer);
-        writer.write_all(buffer).unwrap();
+        writer.write(buffer).unwrap();
+        let mut pages = 1;
 
         let mut written = self.command.len() - to_write;
+
         while written < self.command.len() {
             let filled = self.store_overflow(buffer, written);
-            writer.write_all(buffer).unwrap();
+            writer.write(buffer).unwrap();
             written += filled;
+            pages += 1;
         }
+
+        pages
     }
 
     fn encode_to_pagecache(
@@ -180,22 +215,8 @@ impl LogEntry {
         pagecache: &mut PageCache,
         offset: u64,
     ) -> u64 {
-        let to_write = self.store_metadata(buffer);
-        pagecache.write(offset, *buffer);
-        let mut pages = 1;
-
-        let mut offset = offset + PAGESIZE;
-        let mut written = self.command.len() - to_write;
-
-        while written < self.command.len() {
-            let filled = self.store_overflow(buffer, written);
-            pagecache.write(offset, *buffer);
-            written += filled;
-            offset += PAGESIZE;
-            pages += 1;
-        }
-
-        pages
+        let writer = PageCacheIO { offset, pagecache };
+        return self.encode(buffer, writer);
     }
 
     fn recover_metadata(page: &[u8; PAGESIZE as usize]) -> (LogEntry, u32, usize) {
@@ -218,13 +239,6 @@ impl LogEntry {
         )
     }
 
-    fn decode_validate(stored_checksum: u32, metadata: &[u8; PAGESIZE as usize], command: &[u8]) {
-        let mut actual_checksum = CRC32C::new();
-        actual_checksum.update(&metadata[5..21]);
-        actual_checksum.update(command);
-        assert_eq!(stored_checksum, actual_checksum.sum());
-    }
-
     fn recover_overflow(
         page: &[u8; PAGESIZE as usize],
         command: &mut Vec<u8>,
@@ -232,7 +246,8 @@ impl LogEntry {
     ) -> usize {
         let to_read = command.len() - command_read;
 
-        assert_eq!(page[0], 0); // Entry start marker.
+        // Entry start marker is false for overflow page.
+        assert_eq!(page[0], 0);
 
         let fill = if to_read > PAGESIZE as usize - 1 {
             // -1 for the entry start marker.
@@ -253,6 +268,8 @@ impl LogEntry {
         reader.read_exact(&mut page).unwrap();
 
         let (mut entry, stored_checksum, command_read) = LogEntry::recover_metadata(&page);
+        let mut actual_checksum = CRC32C::new();
+        actual_checksum.update(&page[5..21]);
 
         let mut read = command_read;
         while read < entry.command.len() {
@@ -261,30 +278,17 @@ impl LogEntry {
             read += filled;
         }
 
-        LogEntry::decode_validate(stored_checksum, &page, &entry.command);
-        entry
+        actual_checksum.update(&entry.command);
+        assert_eq!(stored_checksum, actual_checksum.sum());
+        return entry;
     }
 
     fn decode_from_pagecache(pagecache: &mut PageCache, offset: u64) -> (LogEntry, u64) {
-        let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
-        println!("LOOKING AT OFFSET {}", offset);
-        pagecache.read(offset, &mut page);
-        let (mut entry, stored_checksum, command_read) = LogEntry::recover_metadata(&page);
-        let mut actual_checksum = CRC32C::new();
-        actual_checksum.update(&page[5..21]);
+        let mut reader = PageCacheIO { offset, pagecache };
+        let entry = LogEntry::decode(&mut reader);
+        let offset = reader.offset;
 
-        let mut read = command_read;
-        let mut current_offset = offset + PAGESIZE;
-        while read < entry.command.len() {
-            pagecache.read(current_offset, &mut page);
-            let filled = LogEntry::recover_overflow(&page, &mut entry.command, read);
-            read += filled;
-            current_offset += PAGESIZE;
-        }
-
-        actual_checksum.update(&entry.command);
-        assert_eq!(stored_checksum, actual_checksum.sum());
-        (entry, current_offset)
+        return (entry, offset);
     }
 }
 
@@ -358,7 +362,6 @@ impl DurableState {
         while scanned < log_length {
             self.next_log_index += 1;
 
-            println!("Restoring log: {}", self.next_log_index - 1);
             let (e, new_offset) =
                 LogEntry::decode_from_pagecache(&mut self.pagecache, self.next_log_offset);
             self.last_log_term = e.term;
@@ -388,17 +391,10 @@ impl DurableState {
                 command: command.to_vec(),
             };
 
-            println!(
-                "Log: {}, at offset: {}",
-                self.next_log_index - 1,
-                self.next_log_offset
-            );
             assert!(self.next_log_offset >= PAGESIZE);
             let pages =
                 entry.encode_to_pagecache(&mut buffer, &mut self.pagecache, self.next_log_offset);
             self.next_log_offset += pages * PAGESIZE;
-            println!("n pages: {}, for command of size: {}", pages, command.len());
-            //println!("Updating next log offset to: {}, for log: {}", self.next_log_offset, self.next_log_index - 1);
 
             self.last_log_term = entry.term;
         }
@@ -449,7 +445,6 @@ impl DurableState {
 
         loop {
             assert!(offset >= PAGESIZE);
-            println!("Looking up {current_index} at {offset}");
             self.pagecache.read(offset, &mut page);
             // Found an entry page.
             if page[0] == 1 {
@@ -467,7 +462,6 @@ impl DurableState {
 
     fn log_at_index(&mut self, i: u64) -> LogEntry {
         let offset = self.offset_from_index(i);
-        println!("HERE Looking up {i} at {offset}");
         let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
         entry
     }
