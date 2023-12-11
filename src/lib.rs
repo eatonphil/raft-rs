@@ -966,6 +966,15 @@ impl<SM: StateMachine> Server<SM> {
             return result_receiver;
         }
 
+	// TODO: Should instead switch to unique client serial ids for
+	// commands as the Raft paper suggests. Otherwise the index
+	// that ends up being used for a command may not be the same
+	// as we expect here. That could happen if the user apply()-es
+	// and then the cluster goes through election. However, in
+	// that case, the user should no longer be notified by this
+	// server about anything. So that is probably another
+	// TODO. The request should fail and the client should retry
+	// on the new leader.
         for i in 0..commands.len() {
             let log_index = state.durable.next_log_index + i as u64;
             state.notifications.push((log_index, result_sender.clone()));
