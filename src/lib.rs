@@ -40,6 +40,10 @@ impl PageCache {
     }
 
     fn insert_or_replace_in_cache(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
+        if self.page_cache_size == 0 {
+            return;
+        }
+
         let mut index_in_cache: Option<usize> = None;
         for (index, (existing_offset, _)) in self.page_cache.iter().enumerate() {
             if *existing_offset == offset {
