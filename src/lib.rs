@@ -106,6 +106,12 @@ impl PageCache {
 //
 // $Entry Start$ is `1` when the page is the start of an entry, not an
 // overflow page.
+//
+// The last entry in a page (or the last part of an entry when
+// overflowing a page) will pad out the to the end of the page with
+// zeroes. As new entries come in that can fill out the page and
+// replace the padding, they will. This is to ensure there is always a
+// PAGESIZE worth of bytes to read and write.
 
 #[derive(Debug)]
 struct LogEntry {
@@ -188,6 +194,7 @@ impl LogEntry {
     ) -> u64 {
         let to_write = self.store_metadata(buffer);
         pagecache.write(offset, buffer.clone());
+	let mut pages = 1;
 
         let mut offset = offset + PAGESIZE;
         let mut written = self.command.len() - to_write;
@@ -196,10 +203,10 @@ impl LogEntry {
             pagecache.write(offset, buffer.clone());
             written += filled;
             offset += PAGESIZE;
+	    pages += 1;
         }
 
-        assert_eq!(written as u64 % PAGESIZE, 0);
-        return written as u64 / PAGESIZE;
+        return pages;
     }
 
     fn recover_metadata(page: &[u8; PAGESIZE as usize]) -> (LogEntry, u32, usize) {
@@ -298,6 +305,7 @@ struct DurableState {
     last_log_index: u64,
     last_log_term: u64,
     next_log_offset: u64,
+    final_page: [u8; PAGESIZE as usize],
     pagecache: PageCache,
 
     // On-disk data.
@@ -319,6 +327,7 @@ impl DurableState {
             last_log_index: 0,
             last_log_term: 0,
             next_log_offset: PAGESIZE,
+	    final_page: [0; PAGESIZE as usize],
             pagecache: PageCache::new(file, 100),
 
             current_term: 0,
@@ -333,6 +342,7 @@ impl DurableState {
         if let Ok(m) = self.pagecache.file.metadata() {
             if m.len() == 0 {
                 self.append(&[vec![]], None);
+		println!("here, {}", self.next_log_offset);
                 return;
             }
         }
@@ -359,21 +369,21 @@ impl DurableState {
 
         let log_length = u64::from_le_bytes(metadata[33..41].try_into().unwrap()) as usize;
 
-        let scanned = 0;
+        let mut scanned = 0;
         while scanned < log_length {
-            println!("scanned: {scanned}");
             if scanned > 0 {
                 self.last_log_index += 1;
             }
 
             let (e, new_offset) =
                 LogEntry::decode_from_pagecache(&mut self.pagecache, self.next_log_offset);
-            self.last_log_index += 1;
             self.last_log_term = e.term;
             self.next_log_offset = new_offset;
+	    scanned += 1;
         }
     }
 
+    // TODO: this must become append_at_index to support log rewrite which will happen for followers.
     // Durably add logs to disk.
     fn append(&mut self, commands: &[Vec<u8>], result_sender: Option<mpsc::Sender<ApplyResult>>) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
@@ -396,6 +406,8 @@ impl DurableState {
             let pages =
                 entry.encode_to_pagecache(&mut buffer, &mut self.pagecache, self.next_log_offset);
             self.next_log_offset += pages * PAGESIZE;
+	    println!("n pages: {}", pages);
+	    println!("Updating next log offset to: {}", self.next_log_offset);
 
             self.last_log_term = entry.term;
         }
@@ -437,7 +449,7 @@ impl DurableState {
     fn log_at_index(&mut self, i: u64) -> LogEntry {
         assert!(i <= self.last_log_index);
         let mut current_index = self.last_log_index;
-        let mut offset = self.next_log_offset;
+        let mut offset = self.next_log_offset - PAGESIZE;
         assert!(offset >= PAGESIZE);
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
@@ -445,6 +457,7 @@ impl DurableState {
         while i < current_index {
             self.pagecache.read(offset, &mut page);
             // Found an entry page.
+	    println!("Is an entry page? {}", i == 1);
             if page[0] == 1 {
                 current_index -= 1;
             }
@@ -452,6 +465,7 @@ impl DurableState {
             offset -= PAGESIZE;
         }
 
+	println!("Looking up {} at offset: {}", i, offset);
         let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
         return entry;
     }
@@ -1391,7 +1405,7 @@ mod tests {
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.dir).unwrap();
+            //std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
@@ -1440,6 +1454,7 @@ mod tests {
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         durable.append(&v, None);
+	assert_eq!(durable.last_log_index, 2);
         drop(durable);
 
         // Start up and restore. Should have two entries.
@@ -1821,7 +1836,11 @@ mod tests {
             let third_page = [b'c'; PAGESIZE as usize];
             let mut p = PageCache::new(file, cache_size);
             p.write(0, first_page);
+	    assert!(p.page_cache.len() <= cache_size);
+	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
             p.write(PAGESIZE * 2, third_page);
+	    assert!(p.page_cache.len() <= cache_size);
+	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
             p.sync();
 
             drop(p);
@@ -1847,10 +1866,16 @@ mod tests {
             let mut p = PageCache::new(file, cache_size);
             let mut page = [0; PAGESIZE as usize];
             p.read(0, &mut page);
+	    assert!(p.page_cache.len() <= cache_size);
+	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
             assert_eq!(page, first_page);
             p.read(PAGESIZE, &mut page);
+	    assert!(p.page_cache.len() <= cache_size);
+	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
             assert_eq!(page, second_page);
             p.read(PAGESIZE * 2, &mut page);
+	    assert!(p.page_cache.len() <= cache_size);
+	    if cache_size > 0 { assert!(p.page_cache.len() > 0); }
             assert_eq!(page, third_page);
         }
     }
