@@ -97,7 +97,7 @@ impl<'this> Read for &mut PageCacheIO<'this> {
         let fixed_buf = <&mut [u8; PAGESIZE as usize]>::try_from(buf).unwrap();
         self.pagecache.read(self.offset, fixed_buf);
         self.offset += PAGESIZE;
-        return Ok(PAGESIZE as usize);
+        Ok(PAGESIZE as usize)
     }
 }
 
@@ -107,12 +107,12 @@ impl<'this> Write for PageCacheIO<'this> {
         let fixed_buf = <&[u8; PAGESIZE as usize]>::try_from(buf).unwrap();
         self.pagecache.write(self.offset, *fixed_buf);
         self.offset += PAGESIZE;
-        return Ok(PAGESIZE as usize);
+        Ok(PAGESIZE as usize)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.pagecache.sync();
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -222,7 +222,7 @@ impl LogEntry {
         offset: u64,
     ) -> u64 {
         let writer = PageCacheIO { offset, pagecache };
-        return self.encode(buffer, writer);
+        self.encode(buffer, writer)
     }
 
     fn recover_metadata(page: &[u8; PAGESIZE as usize]) -> (LogEntry, u32, usize) {
@@ -291,7 +291,7 @@ impl LogEntry {
 
         actual_checksum.update(&entry.command);
         assert_eq!(stored_checksum, actual_checksum.sum());
-        return entry;
+        entry
     }
 
     fn decode_from_pagecache(pagecache: &mut PageCache, offset: u64) -> (LogEntry, u64) {
@@ -299,7 +299,7 @@ impl LogEntry {
         let entry = LogEntry::decode(&mut reader);
         let offset = reader.offset;
 
-        return (entry, offset);
+        (entry, offset)
     }
 }
 
