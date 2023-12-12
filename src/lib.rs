@@ -73,7 +73,7 @@ impl PageCache {
         }
 
         self.file.read_exact_at(buf_into, offset).unwrap();
-        self.insert_or_replace_in_cache(offset, buf_into.clone());
+        self.insert_or_replace_in_cache(offset, *buf_into);
     }
 
     fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
@@ -105,7 +105,7 @@ impl<'this> Write for PageCacheIO<'this> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         assert_eq!(buf.len(), PAGESIZE as usize);
         let fixed_buf = <&[u8; PAGESIZE as usize]>::try_from(buf).unwrap();
-        self.pagecache.write(self.offset, fixed_buf.clone());
+        self.pagecache.write(self.offset, *fixed_buf);
         self.offset += PAGESIZE;
         return Ok(PAGESIZE as usize);
     }
@@ -123,21 +123,21 @@ impl<'this> Write for PageCacheIO<'this> {
 // |        0 - 4   | Magic Number   |
 // |        4 - 8   | Format Version |
 // |        8 - 16  | Term           |
-// |       16 - 17  | Did Vote       |
-// |       17 - 33  | Voted For      |
-// |       33 - 41  | Log Length     |
-// |       41 - 45  | Checksum       |
+// |       16 - 32  | Voted For      |
+// |       32 - 40  | Log Length     |
+// |       40 - 44  | Checksum       |
 // | PAGESIZE - EOF | Log Entries    |
 //
 //           ON DISK LOG ENTRY FORMAT
 //
-// | Byte Range                   | Value           |
-// |------------------------------|-----------------|
-// |  0                           | Entry Start     |
-// |  1 - 5                       | Checksum        |
-// |  5 - 13                      | Term            |
-// | 13 - 21                      | Command Length  |
-// | 21 - (21 + $Command Length$) | Command         |
+// | Byte Range                   | Value              |
+// |------------------------------|--------------------|
+// |  0                           | Entry Start Marker |
+// |  1 - 5                       | Checksum           |
+// |  5 - 13                      | Term               |
+// | 13 - 29                      | Client Serial Id   |
+// | 29 - 37                      | Command Length     |
+// | 37 - (37 + $Command Length$) | Command            |
 //
 // $Entry Start$ is `1` when the page is the start of an entry, not an
 // overflow page.
@@ -147,6 +147,7 @@ struct LogEntry {
     // Actual data.
     command: Vec<u8>,
     term: u64,
+    client_serial_id: u128,
 }
 
 impl PartialEq for LogEntry {
@@ -157,7 +158,7 @@ impl PartialEq for LogEntry {
 
 impl LogEntry {
     fn command_first_page(command_length: usize) -> usize {
-        let page_minus_metadata = (PAGESIZE - 21) as usize;
+        let page_minus_metadata = (PAGESIZE - 37) as usize;
         if command_length <= page_minus_metadata {
             command_length
         } else {
@@ -171,15 +172,16 @@ impl LogEntry {
 
         buffer[0] = 1; // Entry start marker.
         buffer[5..13].copy_from_slice(&self.term.to_le_bytes());
-        buffer[13..21].copy_from_slice(&command_length.to_le_bytes());
+        buffer[13..29].copy_from_slice(&self.client_serial_id.to_le_bytes());
+        buffer[29..37].copy_from_slice(&command_length.to_le_bytes());
 
         let mut checksum = CRC32C::new();
-        checksum.update(&buffer[5..21]);
+        checksum.update(&buffer[5..37]);
         checksum.update(&self.command);
         buffer[1..5].copy_from_slice(&checksum.sum().to_le_bytes());
 
         let command_first_page = LogEntry::command_first_page(command_length);
-        buffer[21..21 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
+        buffer[37..37 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
         command_length - command_first_page
     }
 
@@ -198,14 +200,14 @@ impl LogEntry {
 
     fn encode(&self, buffer: &mut [u8; PAGESIZE as usize], mut writer: impl std::io::Write) -> u64 {
         let to_write = self.store_metadata(buffer);
-        writer.write(buffer).unwrap();
+        writer.write_all(buffer).unwrap();
         let mut pages = 1;
 
         let mut written = self.command.len() - to_write;
 
         while written < self.command.len() {
             let filled = self.store_overflow(buffer, written);
-            writer.write(buffer).unwrap();
+            writer.write_all(buffer).unwrap();
             written += filled;
             pages += 1;
         }
@@ -226,7 +228,8 @@ impl LogEntry {
     fn recover_metadata(page: &[u8; PAGESIZE as usize]) -> (LogEntry, u32, usize) {
         assert_eq!(page[0], 1); // Start of entry marker.
         let term = u64::from_le_bytes(page[5..13].try_into().unwrap());
-        let command_length = u64::from_le_bytes(page[13..21].try_into().unwrap()) as usize;
+        let client_serial_id = u128::from_le_bytes(page[13..29].try_into().unwrap());
+        let command_length = u64::from_le_bytes(page[29..37].try_into().unwrap()) as usize;
         let stored_checksum = u32::from_le_bytes(page[1..5].try_into().unwrap());
 
         // recover_metadata() will only decode the first page's worth of
@@ -234,10 +237,14 @@ impl LogEntry {
         // additional pages.
         let command_first_page = LogEntry::command_first_page(command_length);
         let mut command = vec![0; command_length];
-        command[0..command_first_page].copy_from_slice(&page[21..21 + command_first_page]);
+        command[0..command_first_page].copy_from_slice(&page[37..37 + command_first_page]);
 
         (
-            LogEntry { term, command },
+            LogEntry {
+                term,
+                command,
+                client_serial_id,
+            },
             stored_checksum,
             command_first_page,
         )
@@ -273,7 +280,7 @@ impl LogEntry {
 
         let (mut entry, stored_checksum, command_read) = LogEntry::recover_metadata(&page);
         let mut actual_checksum = CRC32C::new();
-        actual_checksum.update(&page[5..21]);
+        actual_checksum.update(&page[5..37]);
 
         let mut read = command_read;
         while read < entry.command.len() {
@@ -305,7 +312,7 @@ struct DurableState {
 
     // On-disk data.
     current_term: u64,
-    voted_for: Option<u128>,
+    voted_for: u128, // Zero is the None value. User must not be a valid server id.
 }
 
 impl DurableState {
@@ -325,7 +332,7 @@ impl DurableState {
             pagecache: PageCache::new(file, 100),
 
             current_term: 0,
-            voted_for: None,
+            voted_for: 0,
         }
     }
 
@@ -335,7 +342,7 @@ impl DurableState {
         // state into the right place.
         if let Ok(m) = self.pagecache.file.metadata() {
             if m.len() == 0 {
-                self.append(&[vec![]]);
+                self.append(&[vec![]], &[0]);
                 return;
             }
         }
@@ -350,17 +357,14 @@ impl DurableState {
         assert_eq!(metadata[4..8], 1_u32.to_le_bytes());
 
         self.current_term = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
-        let did_vote = metadata[16] == 1;
-        if did_vote {
-            self.voted_for = Some(u128::from_le_bytes(metadata[17..33].try_into().unwrap()));
-        }
+        self.voted_for = u128::from_le_bytes(metadata[16..32].try_into().unwrap());
 
-        let checksum = u32::from_le_bytes(metadata[41..45].try_into().unwrap());
-        if checksum != crc32c(&metadata[0..41]) {
+        let checksum = u32::from_le_bytes(metadata[40..44].try_into().unwrap());
+        if checksum != crc32c(&metadata[0..40]) {
             panic!("Bad checksum for data file.");
         }
 
-        let log_length = u64::from_le_bytes(metadata[33..41].try_into().unwrap()) as usize;
+        let log_length = u64::from_le_bytes(metadata[32..40].try_into().unwrap()) as usize;
 
         let mut scanned = 0;
         while scanned < log_length {
@@ -374,25 +378,29 @@ impl DurableState {
         }
     }
 
-    fn append(&mut self, commands: &[Vec<u8>]) {
-        self.append_from_index(commands, self.next_log_index);
+    fn append(&mut self, commands: &[Vec<u8>], command_ids: &[u128]) {
+        assert_eq!(commands.len(), command_ids.len());
+        self.append_from_index(commands, command_ids, self.next_log_index);
     }
 
     // Durably add logs to disk.
-    fn append_from_index(&mut self, commands: &[Vec<u8>], from_index: u64) {
+    fn append_from_index(&mut self, commands: &[Vec<u8>], command_ids: &[u128], from_index: u64) {
+        assert_eq!(commands.len(), command_ids.len());
+
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
         self.next_log_offset = self.offset_from_index(from_index);
         self.next_log_index = from_index;
 
         // Write out all new logs.
-        for command in commands.iter() {
+        for (i, command) in commands.iter().enumerate() {
             self.next_log_index += 1;
 
             let entry = LogEntry {
                 term: self.current_term,
                 // TODO: Do we need this clone here?
                 command: command.to_vec(),
+                client_serial_id: command_ids[i],
             };
 
             assert!(self.next_log_offset >= PAGESIZE);
@@ -408,7 +416,7 @@ impl DurableState {
     }
 
     // Durably save non-log data.
-    fn update(&mut self, term: u64, voted_for: Option<u128>) {
+    fn update(&mut self, term: u64, voted_for: u128) {
         self.current_term = term;
         self.voted_for = voted_for;
 
@@ -420,18 +428,13 @@ impl DurableState {
 
         metadata[8..16].copy_from_slice(&term.to_le_bytes());
 
-        if let Some(v) = voted_for {
-            metadata[16] = 1;
-            metadata[17..33].copy_from_slice(&v.to_le_bytes());
-        } else {
-            metadata[16] = 0;
-        }
+        metadata[16..32].copy_from_slice(&voted_for.to_le_bytes());
 
         let log_length = self.next_log_index;
-        metadata[33..41].copy_from_slice(&log_length.to_le_bytes());
+        metadata[32..40].copy_from_slice(&log_length.to_le_bytes());
 
-        let checksum = crc32c(&metadata[0..41]);
-        metadata[41..45].copy_from_slice(&checksum.to_le_bytes());
+        let checksum = crc32c(&metadata[0..40]);
+        metadata[40..44].copy_from_slice(&checksum.to_le_bytes());
 
         self.pagecache.write(0, metadata);
         self.pagecache.sync();
@@ -522,7 +525,7 @@ struct State {
 
     // Non-Raft state.
     stopped: bool,
-    notifications: Vec<(u64, mpsc::Sender<ApplyResult>)>,
+    notifications: Vec<(u128, mpsc::Sender<ApplyResult>)>,
 }
 
 //             REQUEST WIRE PROTOCOL
@@ -794,12 +797,8 @@ struct RPCMessage {
 }
 
 impl RPCMessage {
-    fn new(term: u64, body: RPCBody) -> RPCMessage {
-        RPCMessage {
-            from: 0,
-            term,
-            body,
-        }
+    fn new(term: u64, body: RPCBody, from: u128) -> RPCMessage {
+        RPCMessage { from, term, body }
     }
 
     fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
@@ -953,7 +952,12 @@ impl<SM: StateMachine> Drop for Server<SM> {
 }
 
 impl<SM: StateMachine> Server<SM> {
-    pub fn apply(&mut self, commands: Vec<Vec<u8>>) -> mpsc::Receiver<ApplyResult> {
+    pub fn apply(
+        &mut self,
+        commands: Vec<Vec<u8>>,
+        command_ids: Vec<u128>,
+    ) -> mpsc::Receiver<ApplyResult> {
+        assert_eq!(commands.len(), command_ids.len());
         let (result_sender, result_receiver): (
             mpsc::Sender<ApplyResult>,
             mpsc::Receiver<ApplyResult>,
@@ -966,21 +970,12 @@ impl<SM: StateMachine> Server<SM> {
             return result_receiver;
         }
 
-	// TODO: Should instead switch to unique client serial ids for
-	// commands as the Raft paper suggests. Otherwise the index
-	// that ends up being used for a command may not be the same
-	// as we expect here. That could happen if the user apply()-es
-	// and then the cluster goes through election. However, in
-	// that case, the user should no longer be notified by this
-	// server about anything. So that is probably another
-	// TODO. The request should fail and the client should retry
-	// on the new leader.
-        for i in 0..commands.len() {
-            let log_index = state.durable.next_log_index + i as u64;
-            state.notifications.push((log_index, result_sender.clone()));
+        for &id in command_ids.iter() {
+            assert_ne!(id, 0);
+            state.notifications.push((id, result_sender.clone()));
         }
 
-        state.durable.append(&commands);
+        state.durable.append(&commands, &command_ids);
         result_receiver
     }
 
@@ -1002,11 +997,8 @@ impl<SM: StateMachine> Server<SM> {
         // Reset the heartbeat timer.
         state.volatile.last_valid_message = Instant::now();
 
-        let canvote = if let Some(id) = state.durable.voted_for {
-            id == request.candidate_id
-        } else {
-            true
-        };
+        let canvote =
+            state.durable.voted_for == 0 || state.durable.voted_for == request.candidate_id;
         if !canvote {
             return (term, Some(false_request));
         }
@@ -1028,7 +1020,7 @@ impl<SM: StateMachine> Server<SM> {
             || (request.last_log_term == my_last_log.term && request.last_log_index >= log_length);
 
         if candidate_more_up_to_date {
-            state.durable.update(term, Some(request.candidate_id));
+            state.durable.update(term, request.candidate_id);
 
             // Reset heartbeat timer.
             state.volatile.last_valid_message = Instant::now();
@@ -1106,8 +1098,9 @@ impl<SM: StateMachine> Server<SM> {
         // - Reference [0] Page 4
         let mut state = self.state.lock().unwrap();
         if message.term > state.durable.current_term {
-            let voted_for = state.durable.voted_for;
-            state.durable.update(message.term, voted_for);
+            state
+                .durable
+                .update(message.term, 0 /* Reset voted_for since new term. */);
             state.volatile.condition = Condition::Follower;
         }
         drop(state);
@@ -1118,7 +1111,7 @@ impl<SM: StateMachine> Server<SM> {
             RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r),
             RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
         };
-        Some(RPCMessage::new(term, rsp?))
+        Some(RPCMessage::new(term, rsp?, self.config.server_id))
     }
 
     fn leader_maybe_new_quorum(&mut self) {
@@ -1194,6 +1187,8 @@ impl<SM: StateMachine> Server<SM> {
 
     fn candidate_become_leader(&mut self) {
         let mut state = self.state.lock().unwrap();
+        let term = state.durable.current_term;
+        state.durable.update(term, 0 /* Reset voted_for. */);
         state.volatile.reset();
         state.volatile.condition = Condition::Leader;
         drop(state);
@@ -1208,7 +1203,7 @@ impl<SM: StateMachine> Server<SM> {
 
         let term = state.durable.current_term + 1;
         let my_server_id = self.config.server_id;
-        state.durable.update(term, Some(my_server_id));
+        state.durable.update(term, my_server_id);
 
         // Trivial case. In a single-server cluster, the server is the
         // leader.
@@ -1226,6 +1221,7 @@ impl<SM: StateMachine> Server<SM> {
                 last_log_index: state.durable.next_log_index - 1,
                 last_log_term: state.durable.last_log_term,
             }),
+            self.config.server_id,
         );
         for server in self.config.cluster.iter() {
             // Skip self.
@@ -1250,9 +1246,12 @@ impl<SM: StateMachine> Server<SM> {
         if !to_apply.is_empty() {
             let results = self.sm.apply(to_apply);
             for (i, result) in results.into_iter().enumerate() {
+                let e = state.durable.log_at_index(starting_index + i as u64);
                 let mut notification_to_drop = None;
-                for (notification, (index, sender)) in state.notifications.iter().enumerate() {
-                    if *index == starting_index + i as u64 {
+                for (notification, (client_serial_id, sender)) in
+                    state.notifications.iter().enumerate()
+                {
+                    if *client_serial_id == e.client_serial_id {
                         notification_to_drop = Some(notification);
                         sender.send(ApplyResult::Ok(result)).unwrap();
                         break;
@@ -1318,6 +1317,10 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     pub fn new(data_directory: &std::path::Path, sm: SM, config: Config) -> Server<SM> {
+        for server in config.cluster.iter() {
+            assert_ne!(server.id, 0);
+        }
+
         let cluster_size = config.cluster.len();
         let id = config.server_id;
         let rpc_manager = RPCManager::new(config.server_id, config.cluster.clone());
@@ -1428,7 +1431,7 @@ mod tests {
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.dir).unwrap();
+            //std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
@@ -1439,14 +1442,14 @@ mod tests {
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(durable.current_term, 0);
-        assert_eq!(durable.voted_for, None);
+        assert_eq!(durable.voted_for, 0);
         assert_eq!(durable.next_log_index, 1);
         assert_eq!(durable.log_at_index(0).term, 0);
         assert_eq!(durable.log_at_index(0).command, vec![]);
 
-        durable.update(10234, Some(40592));
+        durable.update(10234, 40592);
         assert_eq!(durable.current_term, 10234);
-        assert_eq!(durable.voted_for, Some(40592));
+        assert_eq!(durable.voted_for, 40592);
         assert_eq!(durable.next_log_index, 1);
         assert_eq!(durable.log_at_index(0).term, 0);
         assert_eq!(durable.log_at_index(0).command, vec![]);
@@ -1454,12 +1457,12 @@ mod tests {
 
         let mut durable = DurableState::new(&tmp.dir, 1);
         assert_eq!(durable.current_term, 0);
-        assert_eq!(durable.voted_for, None);
+        assert_eq!(durable.voted_for, 0);
         assert_eq!(durable.next_log_index, 0);
 
         durable.restore();
         assert_eq!(durable.current_term, 10234);
-        assert_eq!(durable.voted_for, Some(40592));
+        assert_eq!(durable.voted_for, 40592);
         assert_eq!(durable.next_log_index, 1);
         assert_eq!(durable.log_at_index(0).term, 0);
         assert_eq!(durable.log_at_index(0).command, vec![]);
@@ -1477,7 +1480,7 @@ mod tests {
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(durable.next_log_index, 1);
-        durable.append(&v);
+        durable.append(&v, &[1, 1]);
         assert_eq!(durable.next_log_index, 3);
         let prev_offset = durable.next_log_offset;
         drop(durable);
@@ -1492,6 +1495,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: b"abcdef123456".to_vec(),
+                client_serial_id: 0,
             }
         );
         assert_eq!(
@@ -1499,6 +1503,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: b"foobar".to_vec(),
+                client_serial_id: 0,
             }
         );
 
@@ -1510,12 +1515,13 @@ mod tests {
         v.push(longcommand.to_vec());
         v.push(longcommand2.to_vec());
         v.push(longcommand3.to_vec());
-        durable.append(&v);
+        durable.append(&v, &v.iter().map(|_| 1).collect::<Vec<u128>>());
         assert_eq!(
             durable.log_at_index(3),
             LogEntry {
                 term: 0,
                 command: v[0].clone(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1523,6 +1529,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: v[1].clone(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1530,6 +1537,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand.to_vec(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1537,6 +1545,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand2.to_vec(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1544,6 +1553,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand3.to_vec(),
+                client_serial_id: 1,
             }
         );
         drop(durable);
@@ -1557,6 +1567,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: b"abcdef123456".to_vec(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1564,6 +1575,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: b"foobar".to_vec(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1571,6 +1583,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: b"foobar".to_vec(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1578,6 +1591,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: b"abcdef123456".to_vec(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1585,6 +1599,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand.to_vec(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1592,6 +1607,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand2.to_vec(),
+                client_serial_id: 1,
             }
         );
         assert_eq!(
@@ -1599,6 +1615,7 @@ mod tests {
             LogEntry {
                 term: 0,
                 command: longcommand3.to_vec(),
+                client_serial_id: 1,
             }
         );
     }
@@ -1617,14 +1634,17 @@ mod tests {
                         LogEntry {
                             term: 88,
                             command: "hey there".into(),
+                            client_serial_id: 102,
                         },
                         LogEntry {
                             term: 90,
                             command: "blub".into(),
+                            client_serial_id: 19,
                         },
                     ],
                     leader_commit: 95,
                 }),
+                0,
             ),
             RPCMessage::new(
                 91,
@@ -1636,6 +1656,7 @@ mod tests {
                     entries: vec![],
                     leader_commit: 95,
                 }),
+                0,
             ),
             RPCMessage::new(
                 10,
@@ -1643,6 +1664,7 @@ mod tests {
                     term: 10,
                     success: true,
                 }),
+                0,
             ),
             RPCMessage::new(
                 10,
@@ -1650,6 +1672,7 @@ mod tests {
                     term: 10,
                     success: false,
                 }),
+                0,
             ),
             RPCMessage::new(
                 1023,
@@ -1659,6 +1682,7 @@ mod tests {
                     last_log_index: 1823,
                     last_log_term: 193,
                 }),
+                0,
             ),
             RPCMessage::new(
                 1023,
@@ -1666,6 +1690,7 @@ mod tests {
                     term: 1023,
                     vote_granted: true,
                 }),
+                0,
             ),
             RPCMessage::new(
                 1023,
@@ -1673,6 +1698,7 @@ mod tests {
                     term: 1023,
                     vote_granted: false,
                 }),
+                0,
             ),
         ];
 
@@ -1693,10 +1719,10 @@ mod tests {
 
     fn new_test_server(tmp: &TmpDir, port: u16) -> Server<TestStateMachine> {
         let config = Config {
-            server_id: 0,
+            server_id: 1,
             server_index: 0,
             cluster: vec![ServerConfig {
-                id: 0,
+                id: 1,
                 address: format!("127.0.0.1:{port}").parse().unwrap(),
             }],
 
@@ -1711,7 +1737,7 @@ mod tests {
     fn test_rpc_manager() {
         let tmpdir = &TmpDir::new();
         let server = new_test_server(&tmpdir, 20001);
-        let mut rpcm = RPCManager::new(0, server.config.cluster.clone());
+        let mut rpcm = RPCManager::new(server.config.server_id, server.config.cluster.clone());
         rpcm.start();
 
         let msg = RPCMessage::new(
@@ -1722,8 +1748,9 @@ mod tests {
                 last_log_index: 1823,
                 last_log_term: 193,
             }),
+            server.config.server_id,
         );
-        rpcm.send(0, &msg);
+        rpcm.send(server.config.server_id, &msg);
         let received = rpcm.stream_receiver.recv().unwrap();
         assert_eq!(msg, received);
         let mut stop = rpcm.stop_mutex.lock().unwrap();
@@ -1744,7 +1771,7 @@ mod tests {
         let mut server = new_test_server(&tmpdir, 20002);
 
         // First test apply doesn't work as not a leader.
-        let result_receiver = server.apply(vec![vec![]]);
+        let result_receiver = server.apply(vec![vec![]], vec![1]);
         // Use try_recv() not recv() since recv() would block so the
         // test would hang if the logic were ever wrong. try_recv() is
         // correct since the message *must* at this point be available
@@ -1754,7 +1781,7 @@ mod tests {
         // Now after initializing (realizing there's only one server, so is leader), try again.
         server.init();
 
-        let result_receiver = server.apply(vec!["abc".as_bytes().to_vec()]);
+        let result_receiver = server.apply(vec!["abc".as_bytes().to_vec()], vec![1]);
         server.tick();
         // See above note about try_recv() vs recv().
         let result = result_receiver.try_recv().unwrap();
@@ -1773,7 +1800,11 @@ mod tests {
             last_log_index: 2,
             last_log_term: 1,
         };
-        let response = server.handle_message(&RPCMessage::new(1, RPCBody::RequestVoteRequest(msg)));
+        let response = server.handle_message(&RPCMessage::new(
+            1,
+            RPCBody::RequestVoteRequest(msg),
+            server.config.server_id,
+        ));
         assert_eq!(
             response,
             Some(RPCMessage::new(
@@ -1781,7 +1812,8 @@ mod tests {
                 RPCBody::RequestVoteResponse(RequestVoteResponse {
                     term: 1,
                     vote_granted: true,
-                })
+                }),
+                server.config.server_id
             )),
         );
     }
@@ -1796,8 +1828,11 @@ mod tests {
             term: 1,
             vote_granted: false,
         };
-        let response =
-            server.handle_message(&RPCMessage::new(1, RPCBody::RequestVoteResponse(msg)));
+        let response = server.handle_message(&RPCMessage::new(
+            1,
+            RPCBody::RequestVoteResponse(msg),
+            server.config.server_id,
+        ));
         assert_eq!(response, None);
     }
 
@@ -1815,8 +1850,11 @@ mod tests {
             entries: vec![],
             leader_commit: 95,
         };
-        let response =
-            server.handle_message(&RPCMessage::new(91, RPCBody::AppendEntriesRequest(msg)));
+        let response = server.handle_message(&RPCMessage::new(
+            91,
+            RPCBody::AppendEntriesRequest(msg),
+            server.config.server_id,
+        ));
         assert_eq!(
             response,
             Some(RPCMessage::new(
@@ -1824,7 +1862,8 @@ mod tests {
                 RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                     term: 91,
                     success: true,
-                })
+                }),
+                server.config.server_id,
             ))
         );
     }
@@ -1839,8 +1878,11 @@ mod tests {
             term: 1,
             success: false,
         };
-        let response =
-            server.handle_message(&RPCMessage::new(1, RPCBody::AppendEntriesResponse(msg)));
+        let response = server.handle_message(&RPCMessage::new(
+            1,
+            RPCBody::AppendEntriesResponse(msg),
+            server.config.server_id,
+        ));
         assert_eq!(response, None);
     }
 
