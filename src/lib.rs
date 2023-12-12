@@ -468,7 +468,7 @@ impl DurableState {
     }
 
     fn log_at_index(&mut self, i: u64) -> LogEntry {
-        let offset = self.offset_from_index(i);
+	let offset = self.offset_from_index(i);
         let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
         entry
     }
@@ -681,10 +681,10 @@ impl RequestVoteResponse {
 struct AppendEntriesRequest {
     term: u64,
     leader_id: u128,
-    prev_log_index: usize,
+    prev_log_index: u64,
     prev_log_term: u64,
     entries: Vec<LogEntry>,
-    leader_commit: usize,
+    leader_commit: u64,
 }
 
 impl AppendEntriesRequest {
@@ -717,9 +717,9 @@ impl AppendEntriesRequest {
         Some(RPCBody::AppendEntriesRequest(AppendEntriesRequest {
             term,
             leader_id,
-            prev_log_index: prev_log_index as usize,
+            prev_log_index,
             prev_log_term,
-            leader_commit: leader_commit as usize,
+            leader_commit,
             entries,
         }))
     }
@@ -727,9 +727,9 @@ impl AppendEntriesRequest {
     fn encode<T: std::io::Write>(&self, encoder: &mut RPCMessageEncoder<T>) {
         encoder.metadata(RPCBodyKind::AppendEntriesRequest as u8, self.term);
         encoder.data(&self.leader_id.to_le_bytes());
-        encoder.data(&(self.prev_log_index as u64).to_le_bytes());
+        encoder.data(&(self.prev_log_index).to_le_bytes());
         encoder.data(&self.prev_log_term.to_le_bytes());
-        encoder.data(&(self.leader_commit as u64).to_le_bytes());
+        encoder.data(&(self.leader_commit).to_le_bytes());
         encoder.data(&(self.entries.len() as u64).to_le_bytes());
         encoder.done();
 
@@ -976,6 +976,8 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         state.durable.append(&commands, &command_ids);
+
+	// TODO: How to handle timeouts?
         result_receiver
     }
 
@@ -1060,6 +1062,8 @@ impl<SM: StateMachine> Server<SM> {
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
         let term = state.durable.current_term;
+
+	// "1. Reply false if term < currentTerm (§5.1)." - Reference [0] Page 4
         if request.term < term {
             return (
                 term,
@@ -1073,7 +1077,13 @@ impl<SM: StateMachine> Server<SM> {
         // Reset heartbeat timer.
         state.volatile.last_valid_message = Instant::now();
 
-        // TODO: fill in.
+	// "Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm (§5.3)." - Reference [0] Page 4
+	if request.prev_log_index >= state.durable.next_log_index {
+	    
+	}
+
+	// TODO: fill in.
 
         (
             term,
