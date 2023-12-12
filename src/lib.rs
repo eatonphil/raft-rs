@@ -142,7 +142,7 @@ impl<'this> Write for PageCacheIO<'this> {
 // $Entry Start$ is `1` when the page is the start of an entry, not an
 // overflow page.
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LogEntry {
     // Actual data.
     command: Vec<u8>,
@@ -211,6 +211,8 @@ impl LogEntry {
             written += filled;
             pages += 1;
         }
+
+        writer.flush().unwrap();
 
         pages
     }
@@ -342,7 +344,11 @@ impl DurableState {
         // state into the right place.
         if let Ok(m) = self.pagecache.file.metadata() {
             if m.len() == 0 {
-                self.append(&[vec![]], &[0]);
+                self.append(&[LogEntry {
+                    term: 0,
+                    command: vec![],
+                    client_serial_id: 0,
+                }]);
                 return;
             }
         }
@@ -378,30 +384,20 @@ impl DurableState {
         }
     }
 
-    fn append(&mut self, commands: &[Vec<u8>], command_ids: &[u128]) {
-        assert_eq!(commands.len(), command_ids.len());
-        self.append_from_index(commands, command_ids, self.next_log_index);
+    fn append(&mut self, entries: &[LogEntry]) {
+        self.append_from_index(entries, self.next_log_index);
     }
 
     // Durably add logs to disk.
-    fn append_from_index(&mut self, commands: &[Vec<u8>], command_ids: &[u128], from_index: u64) {
-        assert_eq!(commands.len(), command_ids.len());
-
+    fn append_from_index(&mut self, entries: &[LogEntry], from_index: u64) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
         self.next_log_offset = self.offset_from_index(from_index);
         self.next_log_index = from_index;
 
         // Write out all new logs.
-        for (i, command) in commands.iter().enumerate() {
+        for entry in entries.iter() {
             self.next_log_index += 1;
-
-            let entry = LogEntry {
-                term: self.current_term,
-                // TODO: Do we need this clone here?
-                command: command.to_vec(),
-                client_serial_id: command_ids[i],
-            };
 
             assert!(self.next_log_offset >= PAGESIZE);
             let pages =
@@ -468,7 +464,7 @@ impl DurableState {
     }
 
     fn log_at_index(&mut self, i: u64) -> LogEntry {
-	let offset = self.offset_from_index(i);
+        let offset = self.offset_from_index(i);
         let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
         entry
     }
@@ -970,20 +966,27 @@ impl<SM: StateMachine> Server<SM> {
             return result_receiver;
         }
 
-        for &id in command_ids.iter() {
+        let mut entries = Vec::with_capacity(commands.len());
+        for (i, &id) in command_ids.iter().enumerate() {
             assert_ne!(id, 0);
             state.notifications.push((id, result_sender.clone()));
+
+            entries.push(LogEntry {
+                term: state.durable.current_term,
+                command: commands[i].clone(),
+                client_serial_id: id,
+            });
         }
 
-        state.durable.append(&commands, &command_ids);
+        state.durable.append(&entries);
 
-	// TODO: How to handle timeouts?
+        // TODO: How to handle timeouts?
         result_receiver
     }
 
     fn handle_request_vote_request(
         &mut self,
-        request: &RequestVoteRequest,
+        request: RequestVoteRequest,
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
         let term = state.durable.current_term;
@@ -1037,7 +1040,7 @@ impl<SM: StateMachine> Server<SM> {
 
     fn handle_request_vote_response(
         &mut self,
-        response: &RequestVoteResponse,
+        response: RequestVoteResponse,
     ) -> (u64, Option<RPCBody>) {
         let quorum = self.config.cluster.len() / 2;
         assert!(quorum > 0 || (self.config.cluster.len() == 1 && quorum == 0));
@@ -1058,32 +1061,47 @@ impl<SM: StateMachine> Server<SM> {
 
     fn handle_append_entries_request(
         &mut self,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
         let term = state.durable.current_term;
 
-	// "1. Reply false if term < currentTerm (§5.1)." - Reference [0] Page 4
-        if request.term < term {
-            return (
+        let false_response = (
+            term,
+            Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                 term,
-                Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-                    term,
-                    success: false,
-                })),
-            );
+                success: false,
+            })),
+        );
+
+        // "1. Reply false if term < currentTerm (§5.1)." - Reference [0] Page 4
+        if request.term < term {
+            return false_response;
         }
 
-        // Reset heartbeat timer.
+        // Reset heartbeat timer because we've now heard from a valid leader.
         state.volatile.last_valid_message = Instant::now();
 
-	// "Reply false if log doesn’t contain an entry at prevLogIndex
-	// whose term matches prevLogTerm (§5.3)." - Reference [0] Page 4
-	if request.prev_log_index >= state.durable.next_log_index {
-	    
-	}
+        // "Reply false if log doesn’t contain an entry at prevLogIndex
+        // whose term matches prevLogTerm (§5.3)." - Reference [0] Page 4
+        if request.prev_log_index >= state.durable.next_log_index {
+            return false_response;
+        }
 
-	// TODO: fill in.
+        let e = state.durable.log_at_index(request.prev_log_index);
+        if e.term != request.prev_log_term {
+            return false_response;
+        }
+
+        for (i, entry) in request.entries.into_iter().enumerate() {
+            let real_index = request.prev_log_index + 1 + i as u64;
+            let e = state.durable.log_at_index(real_index);
+            if e.term != entry.term {
+                state.durable.append_from_index(&[entry], real_index);
+            }
+        }
+
+        // TODO: fill in.
 
         (
             term,
@@ -1096,13 +1114,13 @@ impl<SM: StateMachine> Server<SM> {
 
     fn handle_append_entries_response(
         &mut self,
-        _response: &AppendEntriesResponse,
+        _response: AppendEntriesResponse,
     ) -> (u64, Option<RPCBody>) {
         // TODO: fill in.
         (0, None)
     }
 
-    fn handle_message(&mut self, message: &RPCMessage) -> Option<RPCMessage> {
+    fn handle_message(&mut self, message: RPCMessage) -> Option<(RPCMessage, u128)> {
         // "If RPC request or response contains term T > currentTerm:
         // set currentTerm = T, convert to follower (§5.1)."
         // - Reference [0] Page 4
@@ -1115,13 +1133,16 @@ impl<SM: StateMachine> Server<SM> {
         }
         drop(state);
 
-        let (term, rsp) = match &message.body {
+        let (term, rsp) = match message.body {
             RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r),
             RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r),
             RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r),
             RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
         };
-        Some(RPCMessage::new(term, rsp?, self.config.server_id))
+        Some((
+            RPCMessage::new(term, rsp?, self.config.server_id),
+            message.from,
+        ))
     }
 
     fn leader_maybe_new_quorum(&mut self) {
@@ -1315,8 +1336,8 @@ impl<SM: StateMachine> Server<SM> {
         self.apply_entries();
 
         if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
-            if let Some(response) = self.handle_message(&msg) {
-                self.rpc_manager.send(msg.from, &response);
+            if let Some((response, from)) = self.handle_message(msg) {
+                self.rpc_manager.send(from, &response);
             }
         }
     }
@@ -1441,7 +1462,7 @@ mod tests {
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-            //std::fs::remove_dir_all(&self.dir).unwrap();
+            std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
@@ -1482,15 +1503,23 @@ mod tests {
     fn test_log_append() {
         let tmp = TmpDir::new();
 
-        let mut v = Vec::<Vec<u8>>::new();
-        v.push("abcdef123456".as_bytes().to_vec());
-        v.push("foobar".as_bytes().to_vec());
+        let mut v = Vec::<LogEntry>::new();
+        v.push(LogEntry {
+            term: 0,
+            command: "abcdef123456".as_bytes().to_vec(),
+            client_serial_id: 0,
+        });
+        v.push(LogEntry {
+            term: 0,
+            command: "foobar".as_bytes().to_vec(),
+            client_serial_id: 0,
+        });
 
         // Write two entries and shut down.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(durable.next_log_index, 1);
-        durable.append(&v, &[1, 1]);
+        durable.append(&v);
         assert_eq!(durable.next_log_index, 3);
         let prev_offset = durable.next_log_offset;
         drop(durable);
@@ -1500,134 +1529,48 @@ mod tests {
         durable.restore();
         assert_eq!(prev_offset, durable.next_log_offset);
         assert_eq!(durable.next_log_index, 3);
-        assert_eq!(
-            durable.log_at_index(1),
-            LogEntry {
-                term: 0,
-                command: b"abcdef123456".to_vec(),
-                client_serial_id: 0,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(2),
-            LogEntry {
-                term: 0,
-                command: b"foobar".to_vec(),
-                client_serial_id: 0,
-            }
-        );
 
+        for (i, entry) in v.iter().enumerate() {
+            assert_eq!(durable.log_at_index(i as u64 + 1), *entry);
+        }
         // Add in double the existing entries and shut down.
+        let before_reverse = v.clone();
         v.reverse();
         let longcommand = b"a".repeat(10_000);
         let longcommand2 = b"a".repeat(PAGESIZE as usize);
         let longcommand3 = b"a".repeat(1 + PAGESIZE as usize);
-        v.push(longcommand.to_vec());
-        v.push(longcommand2.to_vec());
-        v.push(longcommand3.to_vec());
-        durable.append(&v, &v.iter().map(|_| 1).collect::<Vec<u128>>());
-        assert_eq!(
-            durable.log_at_index(3),
-            LogEntry {
-                term: 0,
-                command: v[0].clone(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(4),
-            LogEntry {
-                term: 0,
-                command: v[1].clone(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(5),
-            LogEntry {
-                term: 0,
-                command: longcommand.to_vec(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(6),
-            LogEntry {
-                term: 0,
-                command: longcommand2.to_vec(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(7),
-            LogEntry {
-                term: 0,
-                command: longcommand3.to_vec(),
-                client_serial_id: 1,
-            }
-        );
+        v.push(LogEntry {
+            command: longcommand.to_vec(),
+            term: 0,
+            client_serial_id: 0,
+        });
+        v.push(LogEntry {
+            command: longcommand2.to_vec(),
+            term: 0,
+            client_serial_id: 0,
+        });
+        v.push(LogEntry {
+            command: longcommand3.to_vec(),
+            term: 0,
+            client_serial_id: 0,
+        });
+        durable.append(&v);
+
+        let mut all = before_reverse;
+        all.append(&mut v);
+        for (i, entry) in all.iter().enumerate() {
+            assert_eq!(durable.log_at_index(i as u64 + 1), *entry);
+        }
+
         drop(durable);
 
         // Start up and restore. Should now have 8 entries.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(durable.next_log_index, 8);
-        assert_eq!(
-            durable.log_at_index(1),
-            LogEntry {
-                term: 0,
-                command: b"abcdef123456".to_vec(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(2),
-            LogEntry {
-                term: 0,
-                command: b"foobar".to_vec(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(3),
-            LogEntry {
-                term: 0,
-                command: b"foobar".to_vec(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(4),
-            LogEntry {
-                term: 0,
-                command: b"abcdef123456".to_vec(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(5),
-            LogEntry {
-                term: 0,
-                command: longcommand.to_vec(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(6),
-            LogEntry {
-                term: 0,
-                command: longcommand2.to_vec(),
-                client_serial_id: 1,
-            }
-        );
-        assert_eq!(
-            durable.log_at_index(7),
-            LogEntry {
-                term: 0,
-                command: longcommand3.to_vec(),
-                client_serial_id: 1,
-            }
-        );
+        for (i, entry) in all.iter().enumerate() {
+            assert_eq!(durable.log_at_index(i as u64 + 1), *entry);
+        }
     }
 
     #[test]
@@ -1810,20 +1753,20 @@ mod tests {
             last_log_index: 2,
             last_log_term: 1,
         };
-        let response = server.handle_message(&RPCMessage::new(
-            1,
-            RPCBody::RequestVoteRequest(msg),
-            server.config.server_id,
-        ));
+        let response =
+            server.handle_message(RPCMessage::new(1, RPCBody::RequestVoteRequest(msg), 100));
         assert_eq!(
             response,
-            Some(RPCMessage::new(
-                1,
-                RPCBody::RequestVoteResponse(RequestVoteResponse {
-                    term: 1,
-                    vote_granted: true,
-                }),
-                server.config.server_id
+            Some((
+                RPCMessage::new(
+                    1,
+                    RPCBody::RequestVoteResponse(RequestVoteResponse {
+                        term: 1,
+                        vote_granted: true,
+                    }),
+                    server.config.server_id
+                ),
+                100
             )),
         );
     }
@@ -1838,7 +1781,7 @@ mod tests {
             term: 1,
             vote_granted: false,
         };
-        let response = server.handle_message(&RPCMessage::new(
+        let response = server.handle_message(RPCMessage::new(
             1,
             RPCBody::RequestVoteResponse(msg),
             server.config.server_id,
@@ -1860,20 +1803,20 @@ mod tests {
             entries: vec![],
             leader_commit: 95,
         };
-        let response = server.handle_message(&RPCMessage::new(
-            91,
-            RPCBody::AppendEntriesRequest(msg),
-            server.config.server_id,
-        ));
+        let response =
+            server.handle_message(RPCMessage::new(91, RPCBody::AppendEntriesRequest(msg), 100));
         assert_eq!(
             response,
-            Some(RPCMessage::new(
-                91,
-                RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-                    term: 91,
-                    success: true,
-                }),
-                server.config.server_id,
+            Some((
+                RPCMessage::new(
+                    91,
+                    RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 91,
+                        success: false,
+                    }),
+                    server.config.server_id,
+                ),
+                100
             ))
         );
     }
@@ -1888,7 +1831,7 @@ mod tests {
             term: 1,
             success: false,
         };
-        let response = server.handle_message(&RPCMessage::new(
+        let response = server.handle_message(RPCMessage::new(
             1,
             RPCBody::AppendEntriesResponse(msg),
             server.config.server_id,
