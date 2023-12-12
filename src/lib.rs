@@ -1093,35 +1093,37 @@ impl<SM: StateMachine> Server<SM> {
             return false_response;
         }
 
-	// "If an existing entry conflicts with a new one (same index
-	// but different terms), delete the existing entry and all that
-	// follow it (§5.3)." - Reference [0] Page 4
-	let mut append_offset = 0;
-	let mut real_index = request.prev_log_index + 1;
+        // "If an existing entry conflicts with a new one (same index
+        // but different terms), delete the existing entry and all that
+        // follow it (§5.3)." - Reference [0] Page 4
+        let mut append_offset = 0;
+        let mut real_index = request.prev_log_index + 1;
         for entry in request.entries.iter() {
-	    if real_index == state.durable.next_log_index - 1 {
-		// Found a new entry, no need to look it up.
-		break;
-	    }
+            if real_index == state.durable.next_log_index {
+                // Found a new entry, no need to look it up.
+                break;
+            }
 
-	    let e = state.durable.log_at_index(real_index);
-	    if e.term != entry.term {
-		break;
-	    }
+            let e = state.durable.log_at_index(real_index);
+            if e.term != entry.term {
+                break;
+            }
 
-	    real_index += 1;
-	    append_offset += 1;
-	}
+            real_index += 1;
+            append_offset += 1;
+        }
 
-	// 4. Append any new entries not already in the log
-        state.durable.append_from_index(&request.entries[append_offset..], real_index);
+        // 4. Append any new entries not already in the log
+        state
+            .durable
+            .append_from_index(&request.entries[append_offset..], real_index);
 
-	// "If leaderCommit > commitIndex, set commitIndex =
-	// min(leaderCommit, index of last new entry)." - Reference [0] Page 4
-	if request.leader_commit > state.volatile.commit_index {
-	    state.volatile.commit_index = std::cmp::min(
-		request.leader_commit, state.durable.next_log_index - 1);
-	}
+        // "If leaderCommit > commitIndex, set commitIndex =
+        // min(leaderCommit, index of last new entry)." - Reference [0] Page 4
+        if request.leader_commit > state.volatile.commit_index {
+            state.volatile.commit_index =
+                std::cmp::min(request.leader_commit, state.durable.next_log_index - 1);
+        }
 
         (
             term,
@@ -1810,6 +1812,99 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_append_entries_request_all_new_data() {
+        let tmpdir = &TmpDir::new();
+        let mut server = new_test_server(&tmpdir, 20007);
+        server.init();
+
+        let e = LogEntry {
+            term: 0,
+            command: "hey there".as_bytes().to_vec(),
+            client_serial_id: 0,
+        };
+        let msg = AppendEntriesRequest {
+            term: 0,
+            leader_id: 2132,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![e.clone()],
+            leader_commit: 95,
+        };
+        let response =
+            server.handle_message(RPCMessage::new(0, RPCBody::AppendEntriesRequest(msg), 2132));
+        assert_eq!(
+            response,
+            Some((
+                RPCMessage::new(
+                    0,
+                    RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 0,
+                        success: true,
+                    }),
+                    server.config.server_id,
+                ),
+                2132,
+            ))
+        );
+
+        let mut state = server.state.lock().unwrap();
+        assert_eq!(state.durable.log_at_index(1), e);
+    }
+
+    #[test]
+    fn test_handle_append_entries_request_overwrite() {
+        let tmpdir = &TmpDir::new();
+        let mut server = new_test_server(&tmpdir, 20008);
+        server.init();
+
+        let entries = vec![LogEntry {
+            term: 0,
+            command: "abc".as_bytes().to_vec(),
+            client_serial_id: 0,
+        }];
+
+        let mut state = server.state.lock().unwrap();
+        state.durable.append(&entries);
+	assert_eq!(state.durable.log_at_index(1), entries[0]);
+        drop(state);
+
+        let e = LogEntry {
+	    // New term differing from what is stored although
+	    // inserted at index `1` should cause overwrite.
+            term: 1,
+            command: "hey there".as_bytes().to_vec(),
+            client_serial_id: 0,
+        };
+        let msg = AppendEntriesRequest {
+            term: 0,
+            leader_id: 2132,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![e.clone()],
+            leader_commit: 95,
+        };
+        let response =
+            server.handle_message(RPCMessage::new(0, RPCBody::AppendEntriesRequest(msg), 2132));
+        assert_eq!(
+            response,
+            Some((
+                RPCMessage::new(
+                    0,
+                    RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 0,
+                        success: true,
+                    }),
+                    server.config.server_id,
+                ),
+                2132,
+            ))
+        );
+
+        let mut state = server.state.lock().unwrap();
+        assert_eq!(state.durable.log_at_index(1), e);
+    }
+
+    #[test]
     fn test_handle_append_entries_request() {
         let tmpdir = &TmpDir::new();
         let mut server = new_test_server(&tmpdir, 20005);
@@ -1823,8 +1918,11 @@ mod tests {
             entries: vec![],
             leader_commit: 95,
         };
-        let response =
-            server.handle_message(RPCMessage::new(91, RPCBody::AppendEntriesRequest(msg), 100));
+        let response = server.handle_message(RPCMessage::new(
+            91,
+            RPCBody::AppendEntriesRequest(msg),
+            2132,
+        ));
         assert_eq!(
             response,
             Some((
@@ -1836,7 +1934,7 @@ mod tests {
                     }),
                     server.config.server_id,
                 ),
-                100
+                2132
             ))
         );
     }
