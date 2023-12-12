@@ -1093,15 +1093,35 @@ impl<SM: StateMachine> Server<SM> {
             return false_response;
         }
 
-        for (i, entry) in request.entries.into_iter().enumerate() {
-            let real_index = request.prev_log_index + 1 + i as u64;
-            let e = state.durable.log_at_index(real_index);
-            if e.term != entry.term {
-                state.durable.append_from_index(&[entry], real_index);
-            }
-        }
+	// "If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it (§5.3)." - Reference [0] Page 4
+	let mut append_offset = 0;
+	let mut real_index = request.prev_log_index + 1;
+        for entry in request.entries.iter() {
+	    if real_index == state.durable.next_log_index - 1 {
+		// Found a new entry, no need to look it up.
+		break;
+	    }
 
-        // TODO: fill in.
+	    let e = state.durable.log_at_index(real_index);
+	    if e.term != entry.term {
+		break;
+	    }
+
+	    real_index += 1;
+	    append_offset += 1;
+	}
+
+	// 4. Append any new entries not already in the log
+        state.durable.append_from_index(&request.entries[append_offset..], real_index);
+
+	// "If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)." - Reference [0] Page 4
+	if request.leader_commit > state.volatile.commit_index {
+	    state.volatile.commit_index = std::cmp::min(
+		request.leader_commit, state.durable.next_log_index - 1);
+	}
 
         (
             term,
