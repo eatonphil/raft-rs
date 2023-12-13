@@ -559,7 +559,7 @@ struct VolatileState {
 
     commit_index: u64,
     last_applied: u64,
-    last_valid_message: Instant,
+    election_timeout: Instant,
 
     // Leader-only state.
     next_index: Vec<u64>,
@@ -578,7 +578,7 @@ impl VolatileState {
             next_index: vec![0; cluster_size],
             match_index: vec![0; cluster_size],
             votes: 0,
-            last_valid_message: Instant::now(),
+            election_timeout: Instant::now(),
         }
     }
 
@@ -622,13 +622,14 @@ struct State {
 //
 //             RESPONSE WIRE PROTOCOL
 //
-// | Byte Range   | Value                  |
-// |--------------|------------------------|
-// |  0 - 16      | Sender Id              |
-// |  16          | Response Type          |
-// |  17 - 25     | Term                   |
-// |  25          | Success / Vote Granted |
-// |  26 - 30     | Checksum               |
+// | Byte Range | Value                                 |
+// |------------|---------------------------------------|
+// | 0 - 16     | Sender Id                             |
+// | 16         | Response Type                         |
+// | 17 - 25    | Term                                  |
+// | 25         | Success / Vote Granted                |
+// | 26 - 34    | (Request Vote) Checksum / Match Index |
+// | 34 - 38    | (Append Entries) Checksum             |
 
 struct RPCMessageEncoder<T: std::io::Write> {
     sender_id: u128,
@@ -817,6 +818,18 @@ impl AppendEntriesRequest {
 struct AppendEntriesResponse {
     term: u64,
     success: bool,
+
+    // When `success == true`, `match_index` is the value the leader
+    // should set this server's `match_index` to. `next_index` should
+    // be set to `match_index + 1`.
+    //
+    // When `success == false`, `match_index` is the value the leader
+    // should set this server's `next_index` to.
+    //
+    // This isn't something the Raft paper proscribes though it is
+    // used in the TLA+ spec. It seems necessary if you are supposed
+    // to allow multiple in-flight requests per follower.
+    match_index: u64,
 }
 
 impl AppendEntriesResponse {
@@ -825,24 +838,28 @@ impl AppendEntriesResponse {
         metadata: [u8; 25],
         term: u64,
     ) -> Option<RPCBody> {
-        let mut buffer: [u8; 30] = [0; 30];
+        let mut buffer: [u8; 38] = [0; 38];
         buffer[0..metadata.len()].copy_from_slice(&metadata);
         reader.read_exact(&mut buffer[metadata.len()..]).unwrap();
 
-        let checksum = u32::from_le_bytes(buffer[26..30].try_into().unwrap());
-        if checksum != crc32c(&buffer[0..26]) {
+	let match_index = u64::from_le_bytes(buffer[26..34].try_into().unwrap());
+
+        let checksum = u32::from_le_bytes(buffer[34..38].try_into().unwrap());
+        if checksum != crc32c(&buffer[0..34]) {
             return None;
         }
 
         Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
             term,
             success: buffer[25] == 1,
+	    match_index,
         }))
     }
 
     fn encode<T: std::io::Write>(&self, encoder: &mut RPCMessageEncoder<T>) {
         encoder.metadata(RPCBodyKind::AppendEntriesResponse as u8, self.term);
         encoder.data(&[self.success as u8]);
+	encoder.data(&self.match_index.to_le_bytes());
         encoder.done();
     }
 }
@@ -870,10 +887,6 @@ struct RPCMessage {
 }
 
 impl RPCMessage {
-    fn new(term: u64, body: RPCBody, from: u128) -> RPCMessage {
-        RPCMessage { from, term, body }
-    }
-
     fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
         let mut metadata: [u8; 25] = [0; 25];
         if let Err(e) = reader.read_exact(&mut metadata) {
@@ -1077,7 +1090,7 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         // Reset the heartbeat timer.
-        state.volatile.last_valid_message = Instant::now();
+        state.volatile.election_timeout = Instant::now();
 
         let canvote =
             state.durable.voted_for == 0 || state.durable.voted_for == request.candidate_id;
@@ -1104,8 +1117,12 @@ impl<SM: StateMachine> Server<SM> {
         if candidate_more_up_to_date {
             state.durable.update(term, request.candidate_id);
 
-            // Reset heartbeat timer.
-            state.volatile.last_valid_message = Instant::now();
+            // Reset election timer.
+	    //
+	    // "If election timeout elapses without receiving AppendEntries
+	    // RPC from current leader or granting vote to candidate:
+	    // convert to candidate" - Reference [0] Page 4
+            state.volatile.election_timeout = Instant::now();
         }
 
         let msg = RPCBody::RequestVoteResponse(RequestVoteResponse {
@@ -1119,11 +1136,15 @@ impl<SM: StateMachine> Server<SM> {
         &mut self,
         response: RequestVoteResponse,
     ) -> (u64, Option<RPCBody>) {
+	let mut state = self.state.lock().unwrap();
+	if state.volatile.condition != Condition::Candidate {
+	    return (0, None);
+	}
+	
         let quorum = self.config.cluster.len() / 2;
         assert!(quorum > 0 || (self.config.cluster.len() == 1 && quorum == 0));
 
         if response.vote_granted {
-            let mut state = self.state.lock().unwrap();
             state.volatile.votes += 1;
             // This will not handle the case where a single
             // server-cluster needs to become the leader.
@@ -1143,31 +1164,45 @@ impl<SM: StateMachine> Server<SM> {
         let mut state = self.state.lock().unwrap();
         let term = state.durable.current_term;
 
-        let false_response = (
-            term,
-            Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-                term,
-                success: false,
-            })),
-        );
+        let false_response = |match_index| -> (u64, Option<RPCBody>) {
+	    return (
+		term,
+		Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                    term,
+                    success: false,
+		    match_index,
+		}))
+	    );
+        };
 
         // "1. Reply false if term < currentTerm (§5.1)." - Reference [0] Page 4
         if request.term < term {
-            return false_response;
+            return false_response(0);
         }
 
+	// "If AppendEntries RPC received from new leader: convert to
+	// follower." - Reference [0] Page 4
+	if state.volatile.condition == Condition::Candidate {
+	    state.volatile.condition = Condition::Follower;
+	}
+
+	if state.volatile.condition != Condition::Follower {
+	    return false_response(0);
+	}
+
         // Reset heartbeat timer because we've now heard from a valid leader.
-        state.volatile.last_valid_message = Instant::now();
+        state.volatile.election_timeout = Instant::now();
 
         // "Reply false if log doesn’t contain an entry at prevLogIndex
         // whose term matches prevLogTerm (§5.3)." - Reference [0] Page 4
         if request.prev_log_index >= state.durable.next_log_index {
-            return false_response;
+            return false_response(state.durable.next_log_index - 1);
         }
 
         let e = state.durable.log_at_index(request.prev_log_index);
         if e.term != request.prev_log_term {
-            return false_response;
+	    assert!(request.prev_log_index > 0);
+            return false_response(request.prev_log_index - 1);
         }
 
         // "If an existing entry conflicts with a new one (same index
@@ -1207,16 +1242,37 @@ impl<SM: StateMachine> Server<SM> {
             Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                 term,
                 success: true,
+		match_index: request.prev_log_index + request.entries.len() as u64,
             })),
         )
     }
 
     fn handle_append_entries_response(
         &mut self,
-        _response: AppendEntriesResponse,
+        response: AppendEntriesResponse,
+	from: u128,
     ) -> (u64, Option<RPCBody>) {
-        // TODO: fill in.
-        (0, None)
+	let mut state = self.state.lock().unwrap();
+	if state.volatile.condition != Condition::Leader {
+	    return (0, None);
+	}
+
+	let server_index = self.config.cluster.iter().position(
+	    |server| server.id == from).unwrap();
+	if response.success {
+	    let new_next_index = response.match_index + 1;
+	    assert!(new_next_index >= state.volatile.next_index[server_index]);
+	    state.volatile.next_index[server_index] = new_next_index;
+
+	    assert!(response.match_index >= state.volatile.match_index[server_index]);
+	    state.volatile.match_index[server_index] = response.match_index;
+	} else {
+	    // If the request is false, match_index servers as the
+	    // next index to try.
+	    state.volatile.next_index[server_index] = std::cmp::max(1, response.match_index);
+	}
+
+	return (state.durable.current_term, None);
     }
 
     fn handle_message(&mut self, message: RPCMessage) -> Option<(RPCMessage, u128)> {
@@ -1236,10 +1292,19 @@ impl<SM: StateMachine> Server<SM> {
             RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r),
             RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r),
             RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r),
-            RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r),
+            RPCBody::AppendEntriesResponse(r) => self.handle_append_entries_response(r, message.from),
         };
-        Some((
-            RPCMessage::new(term, rsp?, self.config.server_id),
+
+	// Mostly for sanity checking in tests. Server must not try to
+	// send messages to itself.
+	assert_ne!(self.config.server_id, message.from);
+
+	Some((
+            RPCMessage{
+		term,
+		body: rsp?,
+		from: self.config.server_id,
+	    },
             message.from,
         ))
     }
@@ -1309,7 +1374,7 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        if state.volatile.last_valid_message.elapsed() > self.config.heartbeat_timeout {
+        if state.volatile.election_timeout.elapsed() > self.config.heartbeat_timeout {
             drop(state);
             self.candidate_request_votes();
         }
@@ -1321,8 +1386,22 @@ impl<SM: StateMachine> Server<SM> {
         state.durable.update(term, 0 /* Reset voted_for. */);
         state.volatile.reset();
         state.volatile.condition = Condition::Leader;
+
+	for i in 0..self.config.cluster.len() {
+	    // "for each server, index of the next log entry
+	    // to send to that server (initialized to leader
+	    // last log index + 1)" - Reference [0] Page 4
+	    state.volatile.next_index[i] = state.durable.next_log_index;
+
+	    // "for each server, index of highest log entry
+	    // known to be replicated on server
+	    // (initialized to 0, increases monotonically)" - Reference [0] Page 4
+	    state.volatile.match_index[i] = 0;
+	}
+	
         drop(state);
-        self.leader_send_heartbeat();
+
+	self.leader_send_heartbeat();
     }
 
     fn candidate_request_votes(&mut self) {
@@ -1343,16 +1422,16 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        let msg = &RPCMessage::new(
+        let msg = &RPCMessage{
             term,
-            RPCBody::RequestVoteRequest(RequestVoteRequest {
+            body: RPCBody::RequestVoteRequest(RequestVoteRequest {
                 term,
                 candidate_id: self.config.server_id,
                 last_log_index: state.durable.next_log_index - 1,
                 last_log_term: state.durable.last_log_term,
             }),
-            self.config.server_id,
-        );
+            from: self.config.server_id,
+        };
         for server in self.config.cluster.iter() {
             // Skip self.
             if server.id == my_server_id {
@@ -1609,9 +1688,9 @@ mod server_tests {
     #[test]
     fn test_rpc_message_encode_decode() {
         let tests = vec![
-            RPCMessage::new(
-                88,
-                RPCBody::AppendEntriesRequest(AppendEntriesRequest {
+            RPCMessage{
+                term: 88,
+                body: RPCBody::AppendEntriesRequest(AppendEntriesRequest {
                     term: 88,
                     leader_id: 2132,
                     prev_log_index: 1823,
@@ -1630,11 +1709,11 @@ mod server_tests {
                     ],
                     leader_commit: 95,
                 }),
-                0,
-            ),
-            RPCMessage::new(
-                91,
-                RPCBody::AppendEntriesRequest(AppendEntriesRequest {
+                from: 9999,
+            },
+            RPCMessage{
+                term: 91,
+                body: RPCBody::AppendEntriesRequest(AppendEntriesRequest {
                     term: 91,
                     leader_id: 2132,
                     prev_log_index: 1823,
@@ -1642,57 +1721,59 @@ mod server_tests {
                     entries: vec![],
                     leader_commit: 95,
                 }),
-                0,
-            ),
-            RPCMessage::new(
-                10,
-                RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                from: 9999,
+            },
+            RPCMessage{
+                term: 10,
+                body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                     term: 10,
                     success: true,
+		    match_index: 1,
                 }),
-                0,
-            ),
-            RPCMessage::new(
-                10,
-                RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                from: 9999,
+            },
+            RPCMessage{
+                term: 10,
+                body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                     term: 10,
                     success: false,
+		    match_index: 0,
                 }),
-                0,
-            ),
-            RPCMessage::new(
-                1023,
-                RPCBody::RequestVoteRequest(RequestVoteRequest {
+                from: 9999,
+            },
+            RPCMessage{
+                term: 1023,
+                body: RPCBody::RequestVoteRequest(RequestVoteRequest {
                     term: 1023,
                     candidate_id: 2132,
                     last_log_index: 1823,
                     last_log_term: 193,
                 }),
-                0,
-            ),
-            RPCMessage::new(
-                1023,
-                RPCBody::RequestVoteResponse(RequestVoteResponse {
+                from: 9999,
+            },
+            RPCMessage{
+                term: 1023,
+                body: RPCBody::RequestVoteResponse(RequestVoteResponse {
                     term: 1023,
                     vote_granted: true,
                 }),
-                0,
-            ),
-            RPCMessage::new(
-                1023,
-                RPCBody::RequestVoteResponse(RequestVoteResponse {
+                from: 9999,
+            },
+            RPCMessage{
+                term: 1023,
+                body: RPCBody::RequestVoteResponse(RequestVoteResponse {
                     term: 1023,
                     vote_granted: false,
                 }),
-                0,
-            ),
+                from: 9999,
+            },
         ];
 
         for rpcmessage in tests.into_iter() {
             let mut file = Vec::new();
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufwriter = BufWriter::new(&mut cursor);
-            rpcmessage.encode(0, bufwriter);
+            rpcmessage.encode(rpcmessage.from, bufwriter);
 
             drop(cursor);
 
@@ -1726,17 +1807,17 @@ mod server_tests {
         let mut rpcm = RPCManager::new(server.config.server_id, server.config.cluster.clone());
         rpcm.start();
 
-        let msg = RPCMessage::new(
-            1023,
-            RPCBody::RequestVoteRequest(RequestVoteRequest {
+        let msg = RPCMessage{
+            term: 1023,
+            body: RPCBody::RequestVoteRequest(RequestVoteRequest {
                 term: 1023,
                 candidate_id: 2132,
                 last_log_index: 1823,
                 last_log_term: 193,
             }),
-            server.config.server_id,
-        );
-        rpcm.send(server.config.server_id, &msg);
+            from: 9999,
+        };
+        rpcm.send(msg.from, &msg);
         let received = rpcm.stream_receiver.recv().unwrap();
         assert_eq!(msg, received);
         let mut stop = rpcm.stop_mutex.lock().unwrap();
@@ -1787,19 +1868,23 @@ mod server_tests {
             last_log_term: 1,
         };
         let response =
-            server.handle_message(RPCMessage::new(1, RPCBody::RequestVoteRequest(msg), 100));
+            server.handle_message(RPCMessage{
+		term: 1,
+		body: RPCBody::RequestVoteRequest(msg),
+		from: 9999
+	    });
         assert_eq!(
             response,
             Some((
-                RPCMessage::new(
-                    1,
-                    RPCBody::RequestVoteResponse(RequestVoteResponse {
+                RPCMessage{
+                    term: 1,
+                    body: RPCBody::RequestVoteResponse(RequestVoteResponse {
                         term: 1,
                         vote_granted: true,
                     }),
-                    server.config.server_id
-                ),
-                100
+                    from: server.config.server_id
+                },
+                9999,
             )),
         );
     }
@@ -1814,11 +1899,11 @@ mod server_tests {
             term: 1,
             vote_granted: false,
         };
-        let response = server.handle_message(RPCMessage::new(
-            1,
-            RPCBody::RequestVoteResponse(msg),
-            server.config.server_id,
-        ));
+        let response = server.handle_message(RPCMessage{
+            term: msg.term,
+            body: RPCBody::RequestVoteResponse(msg),
+            from: server.config.server_id,
+        });
         assert_eq!(response, None);
     }
 
@@ -1827,6 +1912,11 @@ mod server_tests {
         let tmpdir = &TmpDir::new();
         let mut server = new_test_server(&tmpdir, 20007);
         server.init();
+
+	// Must be a follower to accept entries.
+	let mut state = server.state.lock().unwrap();
+	state.volatile.condition = Condition::Follower;
+	drop(state);
 
         let e = LogEntry {
             term: 0,
@@ -1842,18 +1932,23 @@ mod server_tests {
             leader_commit: 95,
         };
         let response =
-            server.handle_message(RPCMessage::new(0, RPCBody::AppendEntriesRequest(msg), 2132));
+            server.handle_message(RPCMessage{
+		term: 0,
+		body: RPCBody::AppendEntriesRequest(msg),
+		from: 2132
+	    });
         assert_eq!(
             response,
             Some((
-                RPCMessage::new(
-                    0,
-                    RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                RPCMessage{
+                    term: 0,
+                    body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                         term: 0,
                         success: true,
+			match_index: 1,
                     }),
-                    server.config.server_id,
-                ),
+                    from: server.config.server_id,
+                },
                 2132,
             ))
         );
@@ -1867,6 +1962,11 @@ mod server_tests {
         let tmpdir = &TmpDir::new();
         let mut server = new_test_server(&tmpdir, 20008);
         server.init();
+
+		// Must be a follower to accept entries.
+	let mut state = server.state.lock().unwrap();
+	state.volatile.condition = Condition::Follower;
+	drop(state);
 
         let entries = vec![LogEntry {
             term: 0,
@@ -1895,18 +1995,23 @@ mod server_tests {
             leader_commit: 95,
         };
         let response =
-            server.handle_message(RPCMessage::new(0, RPCBody::AppendEntriesRequest(msg), 2132));
+            server.handle_message(RPCMessage{
+		term: 0,
+		body: RPCBody::AppendEntriesRequest(msg),
+		from: 2132
+	    });
         assert_eq!(
             response,
             Some((
-                RPCMessage::new(
-                    0,
-                    RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                RPCMessage{
+                    term: 0,
+                    body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                         term: 0,
                         success: true,
+			match_index: 1,
                     }),
-                    server.config.server_id,
-                ),
+                    from: server.config.server_id,
+                },
                 2132,
             ))
         );
@@ -1929,22 +2034,23 @@ mod server_tests {
             entries: vec![],
             leader_commit: 95,
         };
-        let response = server.handle_message(RPCMessage::new(
-            91,
-            RPCBody::AppendEntriesRequest(msg),
-            2132,
-        ));
+        let response = server.handle_message(RPCMessage{
+            term: 91,
+            body: RPCBody::AppendEntriesRequest(msg),
+            from: 2132,
+        });
         assert_eq!(
             response,
             Some((
-                RPCMessage::new(
-                    91,
-                    RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                RPCMessage{
+                    term: 91,
+                    body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                         term: 91,
                         success: false,
+			match_index: 0,
                     }),
-                    server.config.server_id,
-                ),
+                    from: server.config.server_id,
+                },
                 2132
             ))
         );
@@ -1959,12 +2065,13 @@ mod server_tests {
         let msg = AppendEntriesResponse {
             term: 1,
             success: false,
+	    match_index: 0,
         };
-        let response = server.handle_message(RPCMessage::new(
-            1,
-            RPCBody::AppendEntriesResponse(msg),
-            server.config.server_id,
-        ));
+        let response = server.handle_message(RPCMessage{
+            term: msg.term,
+            body: RPCBody::AppendEntriesResponse(msg),
+            from: 9999,
+        });
         assert_eq!(response, None);
     }
 }
