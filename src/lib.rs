@@ -1301,10 +1301,6 @@ impl<SM: StateMachine> Server<SM> {
             }
         };
 
-        // Mostly for sanity checking in tests. Server must not try to
-        // send messages to itself.
-        assert_ne!(self.config.server_id, message.from);
-
         Some((
             RPCMessage {
                 term,
@@ -1790,14 +1786,18 @@ mod server_tests {
         }
     }
 
-    fn new_test_server(tmp: &TmpDir, port: u16) -> Server<TestStateMachine> {
+    fn new_test_server(tmp: &TmpDir, port: u16, servers: usize) -> Server<TestStateMachine> {
+        let mut cluster = vec![];
+        for i in 0..servers {
+            cluster.push(ServerConfig {
+                id: 1 + i as u128,
+                address: format!("127.0.0.1:{}", port + i as u16).parse().unwrap(),
+            })
+        }
         let config = Config {
             server_id: 1,
             server_index: 0,
-            cluster: vec![ServerConfig {
-                id: 1,
-                address: format!("127.0.0.1:{port}").parse().unwrap(),
-            }],
+            cluster,
 
             heartbeat_timeout: Duration::from_secs(10),
         };
@@ -1809,23 +1809,25 @@ mod server_tests {
     #[test]
     fn test_rpc_manager() {
         let tmpdir = &TmpDir::new();
-        let server = new_test_server(&tmpdir, 20001);
-        let mut rpcm = RPCManager::new(server.config.server_id, server.config.cluster.clone());
+        let server = new_test_server(&tmpdir, 20010, 2);
+
+        let mut rpcm = RPCManager::new(server.config.cluster[0].id, server.config.cluster.clone());
         rpcm.start();
 
         let msg = RPCMessage {
             term: 1023,
             body: RPCBody::RequestVoteRequest(RequestVoteRequest {
                 term: 1023,
-                candidate_id: 2132,
+                candidate_id: 2,
                 last_log_index: 1823,
                 last_log_term: 193,
             }),
-            from: 9999,
+            from: 1,
         };
-        rpcm.send(msg.from, &msg);
+        rpcm.send(server.config.server_id, &msg);
         let received = rpcm.stream_receiver.recv().unwrap();
         assert_eq!(msg, received);
+
         let mut stop = rpcm.stop_mutex.lock().unwrap();
         *stop = true;
     }
@@ -1841,7 +1843,7 @@ mod server_tests {
     #[test]
     fn test_single_server_apply_end_to_end() {
         let tmpdir = &TmpDir::new();
-        let mut server = new_test_server(&tmpdir, 20002);
+        let mut server = new_test_server(&tmpdir, 20002, 1);
 
         // First test apply doesn't work as not a leader.
         let result_receiver = server.apply(vec![vec![]], vec![1]);
@@ -1864,7 +1866,7 @@ mod server_tests {
     #[test]
     fn test_handle_request_vote_request() {
         let tmpdir = &TmpDir::new();
-        let mut server = new_test_server(&tmpdir, 20003);
+        let mut server = new_test_server(&tmpdir, 20003, 1);
         server.init();
 
         let msg = RequestVoteRequest {
@@ -1897,7 +1899,7 @@ mod server_tests {
     #[test]
     fn test_handle_request_vote_response() {
         let tmpdir = &TmpDir::new();
-        let mut server = new_test_server(&tmpdir, 20004);
+        let mut server = new_test_server(&tmpdir, 20004, 1);
         server.init();
 
         let msg = RequestVoteResponse {
@@ -1915,7 +1917,7 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_request_all_new_data() {
         let tmpdir = &TmpDir::new();
-        let mut server = new_test_server(&tmpdir, 20007);
+        let mut server = new_test_server(&tmpdir, 20007, 1);
         server.init();
 
         // Must be a follower to accept entries.
@@ -1964,7 +1966,7 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_request_overwrite() {
         let tmpdir = &TmpDir::new();
-        let mut server = new_test_server(&tmpdir, 20008);
+        let mut server = new_test_server(&tmpdir, 20008, 1);
         server.init();
 
         // Must be a follower to accept entries.
@@ -2026,7 +2028,7 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_request() {
         let tmpdir = &TmpDir::new();
-        let mut server = new_test_server(&tmpdir, 20005);
+        let mut server = new_test_server(&tmpdir, 20005, 1);
         server.init();
 
         let msg = AppendEntriesRequest {
@@ -2062,7 +2064,7 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_response() {
         let tmpdir = &TmpDir::new();
-        let mut server = new_test_server(&tmpdir, 20006);
+        let mut server = new_test_server(&tmpdir, 20006, 1);
         server.init();
 
         let msg = AppendEntriesResponse {
