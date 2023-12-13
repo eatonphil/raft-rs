@@ -1165,14 +1165,14 @@ impl<SM: StateMachine> Server<SM> {
         let term = state.durable.current_term;
 
         let false_response = |match_index| -> (u64, Option<RPCBody>) {
-            return (
+            (
                 term,
                 Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
                     term,
                     success: false,
                     match_index,
                 })),
-            );
+            )
         };
 
         // "1. Reply false if term < currentTerm (§5.1)." - Reference [0] Page 4
@@ -1276,7 +1276,7 @@ impl<SM: StateMachine> Server<SM> {
             state.volatile.next_index[server_index] = std::cmp::max(1, response.match_index);
         }
 
-        return (state.durable.current_term, None);
+        (state.durable.current_term, None)
     }
 
     fn handle_message(&mut self, message: RPCMessage) -> Option<(RPCMessage, u128)> {
