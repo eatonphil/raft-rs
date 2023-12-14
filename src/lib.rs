@@ -559,7 +559,11 @@ struct VolatileState {
 
     commit_index: u64,
     last_applied: u64,
-    election_timeout: Instant,
+
+    // Timeouts
+    election_frequency: Duration, // Read-only.
+    election_timeout: Instant,    // Randomly set based on election_frequency.
+    rand: Random,
 
     // Leader-only state.
     next_index: Vec<u64>,
@@ -570,7 +574,7 @@ struct VolatileState {
 }
 
 impl VolatileState {
-    fn new(cluster_size: usize) -> VolatileState {
+    fn new(cluster_size: usize, election_frequency: Duration) -> VolatileState {
         VolatileState {
             condition: Condition::Follower,
             commit_index: 0,
@@ -578,7 +582,10 @@ impl VolatileState {
             next_index: vec![0; cluster_size],
             match_index: vec![0; cluster_size],
             votes: 0,
-            election_timeout: Instant::now(),
+
+            election_frequency,
+            election_timeout: Instant::now() + election_frequency,
+            rand: Random::new(),
         }
     }
 
@@ -589,6 +596,19 @@ impl VolatileState {
             self.match_index[i] = 0;
         }
         self.votes = 0;
+    }
+
+    fn reset_election_timeout(&mut self) {
+        let jitter =
+            (self.rand.generate_f64() / f64::MAX) * (self.election_frequency.as_secs_f64() / 2.0);
+        self.election_timeout = Instant::now() + self.election_frequency;
+
+        // Duration apparently isn't allowed to be negative.
+        if jitter < 0.0 {
+            self.election_timeout -= Duration::from_secs_f64(-1.0 * jitter);
+        } else {
+            self.election_timeout += Duration::from_secs_f64(jitter);
+        }
     }
 }
 
@@ -1019,7 +1039,7 @@ pub struct Config {
     cluster: Vec<ServerConfig>,
 
     // Timing configuration.
-    heartbeat_timeout: Duration,
+    election_frequency: Duration,
 }
 
 pub struct Server<SM: StateMachine> {
@@ -1090,7 +1110,7 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         // Reset the heartbeat timer.
-        state.volatile.election_timeout = Instant::now();
+        state.volatile.reset_election_timeout();
 
         let canvote =
             state.durable.voted_for == 0 || state.durable.voted_for == request.candidate_id;
@@ -1366,7 +1386,7 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         let time_for_heartbeat =
-            state.volatile.election_timeout.elapsed() > self.config.heartbeat_timeout;
+            state.volatile.election_timeout.elapsed() > self.config.election_frequency / 2;
 
         let my_server_id = self.config.server_id;
         for (i, server) in self.config.cluster.iter().enumerate() {
@@ -1428,7 +1448,7 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        if state.volatile.election_timeout.elapsed() > self.config.heartbeat_timeout {
+        if state.volatile.election_timeout.elapsed() > self.config.election_frequency {
             drop(state);
             self.candidate_request_votes();
         }
@@ -1587,6 +1607,7 @@ impl<SM: StateMachine> Server<SM> {
         let cluster_size = config.cluster.len();
         let id = config.server_id;
         let rpc_manager = RPCManager::new(config.server_id, config.cluster.clone());
+        let election_frequency = config.election_frequency;
         Server {
             rpc_manager,
             config,
@@ -1594,7 +1615,7 @@ impl<SM: StateMachine> Server<SM> {
 
             state: Mutex::new(State {
                 durable: DurableState::new(data_directory, id),
-                volatile: VolatileState::new(cluster_size),
+                volatile: VolatileState::new(cluster_size, election_frequency),
                 stopped: false,
                 notifications: Vec::new(),
             }),
@@ -1851,7 +1872,7 @@ mod server_tests {
             server_index: 0,
             cluster,
 
-            heartbeat_timeout: Duration::from_secs(10),
+            election_frequency: Duration::from_secs(10),
         };
 
         let sm = TestStateMachine {};
@@ -2280,5 +2301,83 @@ mod crc32c_tests {
             }
             assert_eq!(c.sum(), *output);
         }
+    }
+}
+
+struct Random {
+    // TODO: This is only relevant for macOS and Linux.
+    source: std::fs::File,
+    pool: [u8; 4 * PAGESIZE as usize],
+    offset: usize,
+}
+
+impl Random {
+    fn new() -> Random {
+        let os = std::env::consts::OS;
+        assert!(os == "linux" || os == "macos");
+
+        let file = std::fs::File::options()
+            .read(true)
+            .open("/dev/urandom")
+            .expect("Could not open data file.");
+        return Random {
+            source: file,
+            pool: [0; 4 * PAGESIZE as usize],
+            offset: 0,
+        };
+    }
+
+    fn refill(&mut self) {
+        self.source.read_exact(&mut self.pool).unwrap();
+    }
+
+    fn generate_bytes(&mut self, dest: &mut [u8]) {
+        let mut written = 0;
+        while written < dest.len() {
+            if self.offset == self.pool.len() {
+                self.refill();
+                self.offset = 0;
+            }
+
+            let to_read = std::cmp::min(self.pool.len() - self.offset, dest.len() - written);
+            dest[written..written + to_read]
+                .copy_from_slice(&self.pool[self.offset..self.offset + to_read]);
+            written += to_read;
+
+            self.offset += to_read;
+            assert!(self.offset <= self.pool.len());
+        }
+    }
+
+    fn generate_f64(&mut self) -> f64 {
+        let mut bytes = [0; 8];
+        self.generate_bytes(&mut bytes);
+        return f64::from_le_bytes(bytes);
+    }
+}
+
+#[cfg(test)]
+mod random_tests {
+    use super::*;
+
+    #[test]
+    fn test_random() {
+        let mut r = Random::new();
+
+        // Requires a refill.
+        let mut bytes = vec![0; r.pool.len() * 2];
+        let _ = r.generate_bytes(bytes.as_mut_slice());
+
+        // Creates a non-zero offset.
+        let mut small_bytes = vec![0; 1];
+        let _ = r.generate_bytes(small_bytes.as_mut_slice());
+
+        // Requires a refill that takes into consideration a non-zero
+        // offset.
+        let _ = r.generate_bytes(bytes.as_mut_slice());
+
+        // Since big is a multiple of the pool size, the offset should
+        // still be one.
+        assert_eq!(r.offset, 1);
     }
 }
