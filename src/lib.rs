@@ -547,7 +547,7 @@ impl DurableState {
     }
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 enum Condition {
     Leader,
     Follower,
@@ -814,7 +814,7 @@ impl AppendEntriesRequest {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct AppendEntriesResponse {
     term: u64,
     success: bool,
@@ -1253,6 +1253,7 @@ impl<SM: StateMachine> Server<SM> {
         from: u128,
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
+        println!("HERE! {:?}", state.volatile.condition);
         if state.volatile.condition != Condition::Leader {
             return (0, None);
         }
@@ -2064,20 +2065,76 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_response() {
         let tmpdir = &TmpDir::new();
-        let mut server = new_test_server(&tmpdir, 20006, 1);
+        let mut server = new_test_server(&tmpdir, 20006, 2);
         server.init();
 
+        let mut state = server.state.lock().unwrap();
+        // Multiple servers in the cluster so all start as follower.
+        assert_eq!(state.volatile.condition, Condition::Follower);
+        // Set to leader.
+        state.volatile.condition = Condition::Leader;
+        assert_eq!(state.volatile.condition, Condition::Leader);
+        assert_eq!(state.durable.current_term, 0);
+        drop(state);
+
         let msg = AppendEntriesResponse {
+            // Newer term than server so the server will become a
+            // follower and not process the request.
             term: 1,
-            success: false,
-            match_index: 0,
+            success: true,
+            match_index: 12,
         };
         let response = server.handle_message(RPCMessage {
             term: msg.term,
-            body: RPCBody::AppendEntriesResponse(msg),
-            from: 9999,
+            body: RPCBody::AppendEntriesResponse(msg.clone()),
+            from: 2,
         });
         assert_eq!(response, None);
+
+        // Term has been updated, server is now follower.
+        let mut state = server.state.lock().unwrap();
+        assert_eq!(state.volatile.condition, Condition::Follower);
+        assert_eq!(state.durable.current_term, 1);
+
+        // Reset state to leader for next tests.
+        state.volatile.condition = Condition::Leader;
+        drop(state);
+
+        // This time the existing `term: 1` is for the same term so no
+        // transition to follower.
+        let response = server.handle_message(RPCMessage {
+            term: msg.term,
+            body: RPCBody::AppendEntriesResponse(msg.clone()),
+            from: 2,
+        });
+        assert_eq!(response, None);
+
+        // Since the response was marked as successful, the
+        // `match_index` and `next_index` for this server should have
+        // been updated according to `msg.match_index`.
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.volatile.next_index[1], msg.match_index + 1);
+        assert_eq!(state.volatile.match_index[1], msg.match_index);
+        drop(state);
+
+        // Let's do another check for `match_index` if the response is
+        // marked as not successful.
+        let msg = AppendEntriesResponse {
+            // Newer term than server so the server will become a
+            // follower and not process the request.
+            term: 1,
+            success: false,
+            match_index: 12,
+        };
+        let response = server.handle_message(RPCMessage {
+            term: msg.term,
+            body: RPCBody::AppendEntriesResponse(msg.clone()),
+            from: 2,
+        });
+        assert_eq!(response, None);
+
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.volatile.next_index[1], msg.match_index);
     }
 }
 
