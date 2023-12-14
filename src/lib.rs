@@ -1389,7 +1389,15 @@ impl<SM: StateMachine> Server<SM> {
 
             let mut entries = vec![];
             if state.durable.next_log_index >= next_index {
-                entries.push(state.durable.log_at_index(next_index));
+                // TODO: How many entries to send at a time?
+                for i in 0..10 {
+                    let index = i + next_index;
+                    if index == state.durable.next_log_index {
+                        break;
+                    }
+
+                    entries.push(state.durable.log_at_index(index));
+                }
             } else if !time_for_heartbeat {
                 // No need to send a blank request at this time.
                 continue;
