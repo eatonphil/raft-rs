@@ -2320,11 +2320,11 @@ impl Random {
             .read(true)
             .open("/dev/urandom")
             .expect("Could not open data file.");
-        return Random {
+        Random {
             source: file,
             pool: [0; 4 * PAGESIZE as usize],
             offset: 0,
-        };
+        }
     }
 
     fn refill(&mut self) {
@@ -2352,7 +2352,7 @@ impl Random {
     fn generate_f64(&mut self) -> f64 {
         let mut bytes = [0; 8];
         self.generate_bytes(&mut bytes);
-        return f64::from_le_bytes(bytes);
+        f64::from_le_bytes(bytes)
     }
 }
 
