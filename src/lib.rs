@@ -1360,14 +1360,55 @@ impl<SM: StateMachine> Server<SM> {
         // "Upon election: send initial empty AppendEntries RPCs
         // (heartbeat) to each server; repeat during idle periods to
         // prevent election timeouts (§5.2)." - Reference [0] Page 4
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Leader {
             return;
         }
 
-        // TODO: fill in.
+        let time_for_heartbeat =
+            state.volatile.election_timeout.elapsed() > self.config.heartbeat_timeout;
 
-        _ = 1; // Make clippy happy.
+        let my_server_id = self.config.server_id;
+        for (i, server) in self.config.cluster.iter().enumerate() {
+            // Skip self.
+            if server.id == my_server_id {
+                continue;
+            }
+
+            let next_index = state.volatile.next_index[i];
+            let prev_log_index = std::cmp::max(next_index, 1) - 1;
+
+            // Handle common case where we don't need to look up a log
+            // from pagecache if we're at the latest entry.
+            let prev_log_term = if prev_log_index == state.durable.next_log_index - 1 {
+                state.durable.last_log_term
+            } else {
+                let prev_log = state.durable.log_at_index(prev_log_index);
+                prev_log.term
+            };
+
+            let mut entries = vec![];
+            if state.durable.next_log_index >= next_index {
+                entries.push(state.durable.log_at_index(next_index));
+            } else if !time_for_heartbeat {
+                // No need to send a blank request at this time.
+                continue;
+            }
+
+            let msg = RPCMessage {
+                from: my_server_id,
+                body: RPCBody::AppendEntriesRequest(AppendEntriesRequest {
+                    term: state.durable.current_term,
+                    leader_id: my_server_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit: state.volatile.commit_index,
+                }),
+                term: state.durable.current_term,
+            };
+            self.rpc_manager.send(server.id, &msg);
+        }
     }
 
     fn follower_maybe_become_candidate(&mut self) {
