@@ -2350,7 +2350,7 @@ impl Random {
 
         self.state[3] = self.state[3].rotate_left(45);
 
-        return result;
+        result
     }
 
     fn generate_bytes(&mut self, dest: &mut [u8]) {
