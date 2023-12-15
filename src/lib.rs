@@ -2350,7 +2350,7 @@ impl Random {
     }
 
     fn generate_f64(&mut self) -> f64 {
-        return self.next() as f64;
+        self.next() as f64
     }
 }
 
