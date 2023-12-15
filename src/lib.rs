@@ -2313,9 +2313,7 @@ struct Random {
 
 impl Random {
     fn new() -> Random {
-        Random {
-            state: [0; 4],
-        }
+        Random { state: [0; 4] }
     }
 
     fn seed(&mut self) {
