@@ -575,6 +575,9 @@ struct VolatileState {
 
 impl VolatileState {
     fn new(cluster_size: usize, election_frequency: Duration) -> VolatileState {
+        let mut rand = Random::new();
+        rand.seed();
+
         VolatileState {
             condition: Condition::Follower,
             commit_index: 0,
@@ -585,7 +588,7 @@ impl VolatileState {
 
             election_frequency,
             election_timeout: Instant::now() + election_frequency,
-            rand: Random::new(),
+            rand,
         }
     }
 
@@ -1386,7 +1389,7 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         let time_for_heartbeat =
-            state.volatile.election_timeout.elapsed() > self.config.election_frequency / 2;
+            state.volatile.election_timeout - self.config.election_frequency / 2 > Instant::now();
 
         let my_server_id = self.config.server_id;
         for (i, server) in self.config.cluster.iter().enumerate() {
@@ -1448,7 +1451,7 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        if state.volatile.election_timeout.elapsed() > self.config.election_frequency {
+        if state.volatile.election_timeout > Instant::now() {
             drop(state);
             self.candidate_request_votes();
         }
@@ -2305,48 +2308,76 @@ mod crc32c_tests {
 }
 
 struct Random {
-    // TODO: This is only relevant for macOS and Linux.
-    source: std::fs::File,
-    pool: [u8; 4 * PAGESIZE as usize],
-    offset: usize,
+    state: [u64; 4],
+    pool: Vec<u8>,
 }
 
 impl Random {
     fn new() -> Random {
+        Random {
+            state: [0; 4],
+            pool: Vec::new(),
+        }
+    }
+
+    fn seed(&mut self) {
         let os = std::env::consts::OS;
         assert!(os == "linux" || os == "macos");
 
-        let file = std::fs::File::options()
+        let mut file = std::fs::File::options()
             .read(true)
             .open("/dev/urandom")
-            .expect("Could not open data file.");
-        Random {
-            source: file,
-            pool: [0; 4 * PAGESIZE as usize],
-            offset: 0,
+            .unwrap();
+        let mut bytes = vec![0; 8 * self.state.len()];
+        file.read_exact(bytes.as_mut_slice()).unwrap();
+        for i in 0..self.state.len() {
+            self.state[i] = u64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
         }
     }
 
-    fn refill(&mut self) {
-        self.source.read_exact(&mut self.pool).unwrap();
+    // Port of https://prng.di.unimi.it/xoshiro256plusplus.c.
+    fn next(&mut self) -> u64 {
+        let result: u64 = self.state[0].wrapping_add(self.state[3]);
+
+        let t: u64 = self.state[1] << 17;
+
+        self.state[2] ^= self.state[0];
+        self.state[3] ^= self.state[1];
+        self.state[1] ^= self.state[2];
+        self.state[0] ^= self.state[3];
+
+        self.state[2] ^= t;
+
+        self.state[3] = self.state[3].rotate_left(45);
+
+        return result;
     }
 
     fn generate_bytes(&mut self, dest: &mut [u8]) {
-        let mut written = 0;
-        while written < dest.len() {
-            if self.offset == self.pool.len() {
-                self.refill();
-                self.offset = 0;
+        if dest.len() > self.pool.len() {
+            // First figure out how many times we must call .next().
+            let mut nexts_needed = dest.len() / 8;
+            if dest.len() % 8 != 0 {
+                nexts_needed += 1;
             }
 
-            let to_read = std::cmp::min(self.pool.len() - self.offset, dest.len() - written);
-            dest[written..written + to_read]
-                .copy_from_slice(&self.pool[self.offset..self.offset + to_read]);
-            written += to_read;
+            // Subtract all existing full calls to .next() in the pool.
+            if nexts_needed > self.pool.len() / 8 {
+                nexts_needed -= self.pool.len() / 8;
+            } else {
+                nexts_needed = 0;
+            }
 
-            self.offset += to_read;
-            assert!(self.offset <= self.pool.len());
+            while nexts_needed > 0 {
+                let bytes = self.next().to_le_bytes();
+                self.pool.extend_from_slice(&bytes);
+                nexts_needed -= 1;
+            }
         }
+
+        let from_start = self.pool.len() - dest.len();
+        dest.copy_from_slice(&self.pool[from_start..]);
+        self.pool.truncate(from_start);
     }
 
     fn generate_f64(&mut self) -> f64 {
@@ -2363,21 +2394,31 @@ mod random_tests {
     #[test]
     fn test_random() {
         let mut r = Random::new();
+        r.seed();
 
-        // Requires a refill.
-        let mut bytes = vec![0; r.pool.len() * 2];
+        let _ = r.generate_f64();
+        assert_eq!(r.pool.len(), 0);
+
+        let mut bytes = vec![0; 17];
         let _ = r.generate_bytes(bytes.as_mut_slice());
+        assert_eq!(r.pool.len(), 7);
 
-        // Creates a non-zero offset.
-        let mut small_bytes = vec![0; 1];
-        let _ = r.generate_bytes(small_bytes.as_mut_slice());
+        let _ = r.generate_f64();
+        assert_eq!(r.pool.len(), 7);
 
-        // Requires a refill that takes into consideration a non-zero
-        // offset.
+        let mut bytes = vec![0; 7];
         let _ = r.generate_bytes(bytes.as_mut_slice());
+        assert_eq!(r.pool.len(), 0);
 
-        // Since big is a multiple of the pool size, the offset should
-        // still be one.
-        assert_eq!(r.offset, 1);
+        let _ = r.generate_f64();
+        assert_eq!(r.pool.len(), 0);
     }
+}
+
+#[cfg(test)]
+mod e2e_tests {
+    //   use super::*;
+
+    //    #[test]
+    //    fn test_converge_leader_no_
 }
