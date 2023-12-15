@@ -2309,14 +2309,12 @@ mod crc32c_tests {
 
 struct Random {
     state: [u64; 4],
-    pool: Vec<u8>,
 }
 
 impl Random {
     fn new() -> Random {
         Random {
             state: [0; 4],
-            pool: Vec::new(),
         }
     }
 
@@ -2353,37 +2351,8 @@ impl Random {
         result
     }
 
-    fn generate_bytes(&mut self, dest: &mut [u8]) {
-        if dest.len() > self.pool.len() {
-            // First figure out how many times we must call .next().
-            let mut nexts_needed = dest.len() / 8;
-            if dest.len() % 8 != 0 {
-                nexts_needed += 1;
-            }
-
-            // Subtract all existing full calls to .next() in the pool.
-            if nexts_needed > self.pool.len() / 8 {
-                nexts_needed -= self.pool.len() / 8;
-            } else {
-                nexts_needed = 0;
-            }
-
-            while nexts_needed > 0 {
-                let bytes = self.next().to_le_bytes();
-                self.pool.extend_from_slice(&bytes);
-                nexts_needed -= 1;
-            }
-        }
-
-        let from_start = self.pool.len() - dest.len();
-        dest.copy_from_slice(&self.pool[from_start..]);
-        self.pool.truncate(from_start);
-    }
-
     fn generate_f64(&mut self) -> f64 {
-        let mut bytes = [0; 8];
-        self.generate_bytes(&mut bytes);
-        f64::from_le_bytes(bytes)
+        return self.next() as f64;
     }
 }
 
@@ -2397,21 +2366,6 @@ mod random_tests {
         r.seed();
 
         let _ = r.generate_f64();
-        assert_eq!(r.pool.len(), 0);
-
-        let mut bytes = vec![0; 17];
-        let _ = r.generate_bytes(bytes.as_mut_slice());
-        assert_eq!(r.pool.len(), 7);
-
-        let _ = r.generate_f64();
-        assert_eq!(r.pool.len(), 7);
-
-        let mut bytes = vec![0; 7];
-        let _ = r.generate_bytes(bytes.as_mut_slice());
-        assert_eq!(r.pool.len(), 0);
-
-        let _ = r.generate_f64();
-        assert_eq!(r.pool.len(), 0);
     }
 }
 
