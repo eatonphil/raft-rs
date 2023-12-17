@@ -940,7 +940,7 @@ struct RPCMessage {
 impl RPCMessage {
     fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
         let mut metadata: [u8; 25] = [0; 25];
-        if let Err(_) = reader.read_exact(&mut metadata) {
+        if reader.read_exact(&mut metadata).is_err() {
             // TODO: Should probably log the above ignored error?
             return None;
         }
