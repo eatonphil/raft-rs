@@ -554,6 +554,12 @@ enum Condition {
     Candidate,
 }
 
+impl std::fmt::Display for Condition {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 struct VolatileState {
     condition: Condition,
 
@@ -600,28 +606,50 @@ impl VolatileState {
         }
         self.votes = 0;
     }
-
-    fn reset_election_timeout(&mut self) {
-        let jitter =
-            (self.rand.generate_f64() / f64::MAX) * (self.election_frequency.as_secs_f64() / 2.0);
-        self.election_timeout = Instant::now() + self.election_frequency;
-
-        // Duration apparently isn't allowed to be negative.
-        if jitter < 0.0 {
-            self.election_timeout -= Duration::from_secs_f64(-1.0 * jitter);
-        } else {
-            self.election_timeout += Duration::from_secs_f64(jitter);
-        }
-    }
 }
 
 struct State {
+    logger: Logger,
     durable: DurableState,
     volatile: VolatileState,
 
     // Non-Raft state.
     stopped: bool,
     notifications: Vec<(u128, mpsc::Sender<ApplyResult>)>,
+}
+
+impl State {
+    fn log<S: AsRef<str> + std::fmt::Display>(&self, msg: S) {
+        self.logger
+            .log(self.durable.current_term, self.volatile.condition, msg);
+    }
+
+    fn reset_election_timeout(&mut self) {
+        let random_percent = self.volatile.rand.generate_percent();
+        let positive = self.volatile.rand.generate_bool();
+        let jitter = random_percent as f64 * (self.volatile.election_frequency.as_secs_f64() / 3.0);
+        let mut new_timeout = self.volatile.election_frequency;
+
+        // Duration apparently isn't allowed to be negative.
+        if positive {
+            new_timeout += Duration::from_secs_f64(jitter);
+        } else {
+            new_timeout -= Duration::from_secs_f64(jitter);
+        }
+
+        self.volatile.election_timeout = Instant::now() + new_timeout;
+
+        self.log(format!(
+            "Resetting election timeout: +{}s.",
+            new_timeout.as_secs_f64()
+        ));
+    }
+
+    fn transition(&mut self, condition: Condition) {
+        assert_ne!(self.volatile.condition, condition);
+        self.log(format!("Became {}.", condition));
+        self.volatile.condition = condition;
+    }
 }
 
 //             REQUEST WIRE PROTOCOL
@@ -912,14 +940,9 @@ struct RPCMessage {
 impl RPCMessage {
     fn decode<T: std::io::Read>(mut reader: BufReader<T>) -> Option<RPCMessage> {
         let mut metadata: [u8; 25] = [0; 25];
-        if let Err(e) = reader.read_exact(&mut metadata) {
-            if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut
-            {
-                return None;
-            }
-
-            panic!("Could not read request: {:#?}.", e);
+        if let Err(_) = reader.read_exact(&mut metadata) {
+            // TODO: Should probably log the above ignored error?
+            return None;
         }
 
         let server_id = u128::from_le_bytes(metadata[0..16].try_into().unwrap());
@@ -956,12 +979,29 @@ impl RPCMessage {
     }
 }
 
+struct Logger {
+    server_id: u128,
+}
+
+impl Logger {
+    fn log<S: AsRef<str> + std::fmt::Display>(&self, term: u64, condition: Condition, msg: S) {
+        println!(
+            "[S: {: <3} T: {: <3} C: {: <9}] {}",
+            self.server_id,
+            term,
+            format!("{}", condition),
+            msg
+        );
+    }
+}
+
 struct RPCManager {
     cluster: Vec<ServerConfig>,
     server_id: u128,
     stream_sender: mpsc::Sender<RPCMessage>,
     stream_receiver: mpsc::Receiver<RPCMessage>,
     stop_mutex: Arc<Mutex<bool>>,
+    logger: Logger,
 }
 
 impl RPCManager {
@@ -975,6 +1015,7 @@ impl RPCManager {
             server_id,
             stream_sender,
             stream_receiver,
+            logger: Logger { server_id },
             stop_mutex: Arc::new(Mutex::new(false)),
         }
     }
@@ -1011,14 +1052,29 @@ impl RPCManager {
         });
     }
 
-    fn send(&mut self, to_server_id: u128, message: &RPCMessage) {
+    fn send(
+        &mut self,
+        condition: Condition,
+        to_server_id: u128,
+        message: &RPCMessage,
+        expect_response: bool,
+    ) {
         let address = self.address_from_id(to_server_id);
         let thread_stream_sender = self.stream_sender.clone();
         let server_id = self.server_id;
 
+        self.logger.log(
+            message.term,
+            condition,
+            format!("Sending {:?} to {}", message.body, to_server_id),
+        );
         let stream = std::net::TcpStream::connect(address).unwrap();
         let bufwriter = BufWriter::new(stream.try_clone().unwrap());
         message.encode(server_id, bufwriter);
+
+        if !expect_response {
+            return;
+        }
 
         std::thread::spawn(move || {
             let bufreader = BufReader::new(stream);
@@ -1100,6 +1156,7 @@ impl<SM: StateMachine> Server<SM> {
     fn handle_request_vote_request(
         &mut self,
         request: RequestVoteRequest,
+        _: u128,
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
         let term = state.durable.current_term;
@@ -1111,9 +1168,9 @@ impl<SM: StateMachine> Server<SM> {
         if request.term < term {
             return (term, Some(false_request));
         }
-
-        // Reset the heartbeat timer.
-        state.volatile.reset_election_timeout();
+        // If it isn't less than, local state would already have been
+        // modified so me.term == request.term in handle_message.
+        assert_eq!(request.term, term);
 
         let canvote =
             state.durable.voted_for == 0 || state.durable.voted_for == request.candidate_id;
@@ -1133,11 +1190,16 @@ impl<SM: StateMachine> Server<SM> {
         // more up-to-date." - Reference [0] Page 8
 
         let log_length = state.durable.next_log_index;
-        let my_last_log = &state.durable.log_at_index(log_length - 1);
-        let candidate_more_up_to_date = request.last_log_term > my_last_log.term
-            || (request.last_log_term == my_last_log.term && request.last_log_index >= log_length);
+        let last_log_term = state.durable.last_log_term;
+        let vote_granted = request.last_log_term > last_log_term
+            || (request.last_log_term == last_log_term
+                && (request.last_log_index == 0 || request.last_log_index >= log_length));
+        state.log(format!(
+            "RVR mll: {log_length}, mlt: {}; rll: {}, rlt: {}",
+            last_log_term, request.last_log_index, request.last_log_term
+        ));
 
-        if candidate_more_up_to_date {
+        if vote_granted {
             state.durable.update(term, request.candidate_id);
 
             // Reset election timer.
@@ -1145,19 +1207,17 @@ impl<SM: StateMachine> Server<SM> {
             // "If election timeout elapses without receiving AppendEntries
             // RPC from current leader or granting vote to candidate:
             // convert to candidate" - Reference [0] Page 4
-            state.volatile.election_timeout = Instant::now();
+            state.reset_election_timeout();
         }
 
-        let msg = RPCBody::RequestVoteResponse(RequestVoteResponse {
-            term,
-            vote_granted: candidate_more_up_to_date,
-        });
+        let msg = RPCBody::RequestVoteResponse(RequestVoteResponse { term, vote_granted });
         (term, Some(msg))
     }
 
     fn handle_request_vote_response(
         &mut self,
         response: RequestVoteResponse,
+        _: u128,
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Candidate {
@@ -1183,6 +1243,7 @@ impl<SM: StateMachine> Server<SM> {
     fn handle_append_entries_request(
         &mut self,
         request: AppendEntriesRequest,
+        from: u128,
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
         let term = state.durable.current_term;
@@ -1200,32 +1261,45 @@ impl<SM: StateMachine> Server<SM> {
 
         // "1. Reply false if term < currentTerm (§5.1)." - Reference [0] Page 4
         if request.term < term {
+            state.log(format!(
+                "Cannot accept AppendEntries from {} because it is out of date ({} < {}).",
+                from, request.term, term
+            ));
             return false_response(0);
         }
 
         // "If AppendEntries RPC received from new leader: convert to
         // follower." - Reference [0] Page 4
         if state.volatile.condition == Condition::Candidate {
-            state.volatile.condition = Condition::Follower;
+            state.transition(Condition::Follower);
         }
 
         if state.volatile.condition != Condition::Follower {
+            assert_eq!(state.volatile.condition, Condition::Leader);
+            state.log(format!(
+                "Cannot accept AppendEntries from {} because I am a leader.",
+                from
+            ));
             return false_response(0);
         }
 
         // Reset heartbeat timer because we've now heard from a valid leader.
-        state.volatile.election_timeout = Instant::now();
+        state.reset_election_timeout();
 
         // "Reply false if log doesn’t contain an entry at prevLogIndex
         // whose term matches prevLogTerm (§5.3)." - Reference [0] Page 4
-        if request.prev_log_index >= state.durable.next_log_index {
-            return false_response(state.durable.next_log_index - 1);
-        }
+        if request.prev_log_index > 0 {
+            if request.prev_log_index >= state.durable.next_log_index {
+                state.log(format!("Cannot accept AppendEntries from {} because prev_log_index ({}) is ahead of my log ({}).", from, request.prev_log_index, state.durable.next_log_index));
+                return false_response(std::cmp::max(state.durable.next_log_index, 1) - 1);
+            }
 
-        let e = state.durable.log_at_index(request.prev_log_index);
-        if e.term != request.prev_log_term {
-            assert!(request.prev_log_index > 0);
-            return false_response(request.prev_log_index - 1);
+            let e = state.durable.log_at_index(request.prev_log_index);
+            if e.term != request.prev_log_term {
+                assert!(request.prev_log_index > 0);
+                state.log(format!("Cannot accept AppendEntries from {} because prev_log_term ({}) does not match mine ({}).", from, request.prev_log_term, e.term));
+                return false_response(request.prev_log_index - 1);
+            }
         }
 
         // "If an existing entry conflicts with a new one (same index
@@ -1256,8 +1330,10 @@ impl<SM: StateMachine> Server<SM> {
         // "If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)." - Reference [0] Page 4
         if request.leader_commit > state.volatile.commit_index {
-            state.volatile.commit_index =
-                std::cmp::min(request.leader_commit, state.durable.next_log_index - 1);
+            state.volatile.commit_index = std::cmp::min(
+                request.leader_commit,
+                std::cmp::max(state.durable.next_log_index, 1) - 1,
+            );
         }
 
         (
@@ -1276,7 +1352,6 @@ impl<SM: StateMachine> Server<SM> {
         from: u128,
     ) -> (u64, Option<RPCBody>) {
         let mut state = self.state.lock().unwrap();
-        println!("HERE! {:?}", state.volatile.condition);
         if state.volatile.condition != Condition::Leader {
             return (0, None);
         }
@@ -1312,14 +1387,16 @@ impl<SM: StateMachine> Server<SM> {
             state
                 .durable
                 .update(message.term, 0 /* Reset voted_for since new term. */);
-            state.volatile.condition = Condition::Follower;
+            if state.volatile.condition != Condition::Follower {
+                state.transition(Condition::Follower);
+            }
         }
         drop(state);
 
         let (term, rsp) = match message.body {
-            RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r),
-            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r),
-            RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r),
+            RPCBody::RequestVoteRequest(r) => self.handle_request_vote_request(r, message.from),
+            RPCBody::RequestVoteResponse(r) => self.handle_request_vote_response(r, message.from),
+            RPCBody::AppendEntriesRequest(r) => self.handle_append_entries_request(r, message.from),
             RPCBody::AppendEntriesResponse(r) => {
                 self.handle_append_entries_response(r, message.from)
             }
@@ -1403,12 +1480,13 @@ impl<SM: StateMachine> Server<SM> {
 
             // Handle common case where we don't need to look up a log
             // from pagecache if we're at the latest entry.
-            let prev_log_term = if prev_log_index == state.durable.next_log_index - 1 {
-                state.durable.last_log_term
-            } else {
-                let prev_log = state.durable.log_at_index(prev_log_index);
-                prev_log.term
-            };
+            let prev_log_term =
+                if prev_log_index == std::cmp::max(state.durable.next_log_index, 1) - 1 {
+                    state.durable.last_log_term
+                } else {
+                    let prev_log = state.durable.log_at_index(prev_log_index);
+                    prev_log.term
+                };
 
             let mut entries = vec![];
             if state.durable.next_log_index >= next_index {
@@ -1438,7 +1516,8 @@ impl<SM: StateMachine> Server<SM> {
                 }),
                 term: state.durable.current_term,
             };
-            self.rpc_manager.send(server.id, &msg);
+            self.rpc_manager
+                .send(state.volatile.condition, server.id, &msg, true);
         }
     }
 
@@ -1451,18 +1530,34 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        if state.volatile.election_timeout > Instant::now() {
+        if state.volatile.election_timeout < Instant::now() {
             drop(state);
-            self.candidate_request_votes();
+            self.follower_become_candidate();
+        }
+    }
+
+    fn candidate_maybe_timeout(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        if state.volatile.condition != Condition::Candidate {
+            return;
+        }
+
+        // Election timed out. Revert to follower and restart election.
+        if state.volatile.election_timeout > Instant::now() {
+            state.transition(Condition::Follower);
         }
     }
 
     fn candidate_become_leader(&mut self) {
         let mut state = self.state.lock().unwrap();
+        if state.volatile.condition != Condition::Candidate {
+            return;
+        }
+
         let term = state.durable.current_term;
         state.durable.update(term, 0 /* Reset voted_for. */);
         state.volatile.reset();
-        state.volatile.condition = Condition::Leader;
+        state.transition(Condition::Leader);
 
         for i in 0..self.config.cluster.len() {
             // "for each server, index of the next log entry
@@ -1481,12 +1576,13 @@ impl<SM: StateMachine> Server<SM> {
         self.leader_send_heartbeat();
     }
 
-    fn candidate_request_votes(&mut self) {
+    fn follower_become_candidate(&mut self) {
         let mut state = self.state.lock().unwrap();
-        if state.volatile.condition != Condition::Candidate {
+        if state.volatile.condition != Condition::Follower {
             return;
         }
 
+        state.transition(Condition::Candidate);
         let term = state.durable.current_term + 1;
         let my_server_id = self.config.server_id;
         state.durable.update(term, my_server_id);
@@ -1504,7 +1600,7 @@ impl<SM: StateMachine> Server<SM> {
             body: RPCBody::RequestVoteRequest(RequestVoteRequest {
                 term,
                 candidate_id: self.config.server_id,
-                last_log_index: state.durable.next_log_index - 1,
+                last_log_index: std::cmp::max(state.durable.next_log_index, 1) - 1,
                 last_log_term: state.durable.last_log_term,
             }),
             from: self.config.server_id,
@@ -1515,7 +1611,8 @@ impl<SM: StateMachine> Server<SM> {
                 continue;
             }
 
-            self.rpc_manager.send(server.id, msg);
+            self.rpc_manager
+                .send(state.volatile.condition, server.id, msg, true);
         }
     }
 
@@ -1556,16 +1653,19 @@ impl<SM: StateMachine> Server<SM> {
 
         self.rpc_manager.start();
 
+        let mut state = self.state.lock().unwrap();
+        state.reset_election_timeout();
         if self.config.cluster.len() == 1 {
-            let mut state = self.state.lock().unwrap();
-            state.volatile.condition = Condition::Leader;
+            state.transition(Condition::Leader);
         }
     }
 
     pub fn stop(&mut self) {
         let mut state = self.state.lock().unwrap();
         // Prevent server from accepting any more log entries.
-        state.volatile.condition = Condition::Follower;
+        if state.volatile.condition != Condition::Follower {
+            state.transition(Condition::Follower);
+        }
         state.stopped = true;
 
         // Stop RPCManager.
@@ -1587,12 +1687,28 @@ impl<SM: StateMachine> Server<SM> {
         // Follower operations.
         self.follower_maybe_become_candidate();
 
+        // Candidate operations.
+        self.candidate_maybe_timeout();
+
         // All condition operations.
         self.apply_entries();
 
         if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
+            let state = self.state.lock().unwrap();
+            state.log(format!(
+                "Received message from {}: {:?}",
+                msg.from, msg.body
+            ));
+            drop(state);
+
             if let Some((response, from)) = self.handle_message(msg) {
-                self.rpc_manager.send(from, &response);
+                let state = self.state.lock().unwrap();
+                let condition = state.volatile.condition;
+                drop(state);
+
+                let expect_response = false;
+                self.rpc_manager
+                    .send(condition, from, &response, expect_response);
             }
         }
     }
@@ -1619,6 +1735,7 @@ impl<SM: StateMachine> Server<SM> {
             state: Mutex::new(State {
                 durable: DurableState::new(data_directory, id),
                 volatile: VolatileState::new(cluster_size, election_frequency),
+                logger: Logger { server_id: id },
                 stopped: false,
                 notifications: Vec::new(),
             }),
@@ -1665,28 +1782,54 @@ mod server_tests {
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, 0);
         assert_eq!(durable.next_log_index, 1);
-        assert_eq!(durable.log_at_index(0).term, 0);
-        assert_eq!(durable.log_at_index(0).command, vec![]);
+        assert_eq!(
+            durable.log_at_index(0),
+            LogEntry {
+                term: 0,
+                command: vec![],
+                client_serial_id: 0
+            }
+        );
 
         durable.update(10234, 40592);
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, 40592);
         assert_eq!(durable.next_log_index, 1);
-        assert_eq!(durable.log_at_index(0).term, 0);
-        assert_eq!(durable.log_at_index(0).command, vec![]);
+        assert_eq!(
+            durable.log_at_index(0),
+            LogEntry {
+                term: 0,
+                command: vec![],
+                client_serial_id: 0
+            }
+        );
         drop(durable);
 
         let mut durable = DurableState::new(&tmp.dir, 1);
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, 0);
         assert_eq!(durable.next_log_index, 0);
+        assert_eq!(
+            durable.log_at_index(0),
+            LogEntry {
+                term: 0,
+                command: vec![],
+                client_serial_id: 0
+            }
+        );
 
         durable.restore();
         assert_eq!(durable.current_term, 10234);
         assert_eq!(durable.voted_for, 40592);
         assert_eq!(durable.next_log_index, 1);
-        assert_eq!(durable.log_at_index(0).term, 0);
-        assert_eq!(durable.log_at_index(0).command, vec![]);
+        assert_eq!(
+            durable.log_at_index(0),
+            LogEntry {
+                term: 0,
+                command: vec![],
+                client_serial_id: 0
+            }
+        );
     }
 
     #[test]
@@ -1721,7 +1864,7 @@ mod server_tests {
         assert_eq!(durable.next_log_index, 3);
 
         for (i, entry) in v.iter().enumerate() {
-            assert_eq!(durable.log_at_index(i as u64 + 1), *entry);
+            assert_eq!(durable.log_at_index(1 + i as u64), *entry);
         }
         // Add in double the existing entries and shut down.
         let before_reverse = v.clone();
@@ -1749,7 +1892,7 @@ mod server_tests {
         let mut all = before_reverse;
         all.append(&mut v);
         for (i, entry) in all.iter().enumerate() {
-            assert_eq!(durable.log_at_index(i as u64 + 1), *entry);
+            assert_eq!(durable.log_at_index(1 + i as u64), *entry);
         }
 
         drop(durable);
@@ -1759,7 +1902,7 @@ mod server_tests {
         durable.restore();
         assert_eq!(durable.next_log_index, 8);
         for (i, entry) in all.iter().enumerate() {
-            assert_eq!(durable.log_at_index(i as u64 + 1), *entry);
+            assert_eq!(durable.log_at_index(1 + i as u64), *entry);
         }
     }
 
@@ -1862,7 +2005,7 @@ mod server_tests {
         }
     }
 
-    fn new_test_server(tmp: &TmpDir, port: u16, servers: usize) -> Server<TestStateMachine> {
+    pub fn new_test_server(tmp: &TmpDir, port: u16, servers: usize) -> Server<TestStateMachine> {
         let mut cluster = vec![];
         for i in 0..servers {
             cluster.push(ServerConfig {
@@ -1900,7 +2043,7 @@ mod server_tests {
             }),
             from: 1,
         };
-        rpcm.send(server.config.server_id, &msg);
+        rpcm.send(Condition::Follower, server.config.server_id, &msg, true);
         let received = rpcm.stream_receiver.recv().unwrap();
         assert_eq!(msg, received);
 
@@ -1908,7 +2051,7 @@ mod server_tests {
         *stop = true;
     }
 
-    struct TestStateMachine {}
+    pub struct TestStateMachine {}
 
     impl StateMachine for TestStateMachine {
         fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
@@ -1998,7 +2141,7 @@ mod server_tests {
 
         // Must be a follower to accept entries.
         let mut state = server.state.lock().unwrap();
-        state.volatile.condition = Condition::Follower;
+        state.transition(Condition::Follower);
         drop(state);
 
         let e = LogEntry {
@@ -2047,7 +2190,7 @@ mod server_tests {
 
         // Must be a follower to accept entries.
         let mut state = server.state.lock().unwrap();
-        state.volatile.condition = Condition::Follower;
+        state.transition(Condition::Follower);
         drop(state);
 
         let entries = vec![LogEntry {
@@ -2349,8 +2492,30 @@ impl Random {
         result
     }
 
+    fn generate_bool(&mut self) -> bool {
+        self.generate_f64() < 0.0
+    }
+
     fn generate_f64(&mut self) -> f64 {
-        self.next() as f64
+        let i = self.next();
+
+        // Reinterpret integer bytes as f64 bytes.
+        f64::from_le_bytes(i.to_le_bytes())
+    }
+
+    fn generate_u32(&mut self) -> u32 {
+        let i = self.next();
+
+        // Reinterpret integer bytes as u32 bytes.
+        u32::from_le_bytes(i.to_le_bytes()[0..4].try_into().unwrap())
+    }
+
+    fn generate_percent(&mut self) -> f32 {
+        let u = self.generate_u32();
+        let p = (u as f64 / u32::MAX as f64) as f32;
+        assert!(p >= 0.0);
+        assert!(p <= 1.0);
+        p
     }
 }
 
@@ -2369,8 +2534,85 @@ mod random_tests {
 
 #[cfg(test)]
 mod e2e_tests {
-    //   use super::*;
+    use super::*;
 
-    //    #[test]
-    //    fn test_converge_leader_no_
+    #[test]
+    fn test_converge_leader_no_entries() {
+        if std::env::var("RAFT_E2E").is_err() {
+            return;
+        }
+
+        let tmpdir = server_tests::TmpDir::new();
+
+        let mut cluster = vec![];
+        const SERVERS: u8 = 3;
+        let port = 20030;
+        for i in 0..SERVERS {
+            cluster.push(ServerConfig {
+                id: 1 + i as u128,
+                address: format!("127.0.0.1:{}", port + i as u16).parse().unwrap(),
+            })
+        }
+
+        let mut servers = vec![];
+        for i in 0..SERVERS {
+            let config = Config {
+                server_id: 1 + i as u128,
+                server_index: i as usize,
+                cluster: cluster.clone(),
+
+                election_frequency: Duration::from_millis(2000),
+            };
+
+            let sm = server_tests::TestStateMachine {};
+            servers.push(Server::new(&tmpdir.dir, sm, config));
+            servers[i as usize].init();
+        }
+
+        let mut post_election_ticks = 20;
+        let mut leader_elected = 0;
+        let mut total_ticks = 0;
+        while leader_elected == 0 || post_election_ticks > 0 {
+            total_ticks += 1;
+
+            for server in servers.iter_mut() {
+                server.tick();
+
+                let state = server.state.lock().unwrap();
+                state.log(format!(
+                    "Tick: {total_ticks}. Post Election Ticks: {post_election_ticks}."
+                ));
+                // If it's a leader, it should be the same leader as before.
+                if state.volatile.condition == Condition::Leader {
+                    if leader_elected == 0 {
+                        leader_elected = server.config.server_id;
+                    } else {
+                        // Once one is elected it shouldn't change.
+                        assert_eq!(leader_elected, server.config.server_id);
+                        post_election_ticks -= 1;
+                    }
+                }
+
+                // And the other way around. If it was a leader, it should still be a leader.
+                if leader_elected == server.config.server_id {
+                    assert_eq!(state.volatile.condition, Condition::Leader);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // A leader should have been elected.
+        assert_ne!(leader_elected, 0);
+
+        for server in servers.iter() {
+            let state = server.state.lock().unwrap();
+            if server.config.server_id == leader_elected {
+                // Leader should be a leader.
+                assert_eq!(state.volatile.condition, Condition::Leader);
+            } else {
+                // All other servers should not be a leader.
+                assert_ne!(state.volatile.condition, Condition::Leader);
+            }
+        }
+    }
 }
