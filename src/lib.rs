@@ -1530,7 +1530,7 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        if state.volatile.election_timeout < Instant::now() {
+        if Instant::now() > state.volatile.election_timeout {
             drop(state);
             self.follower_become_candidate();
         }
@@ -1543,7 +1543,7 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         // Election timed out. Revert to follower and restart election.
-        if state.volatile.election_timeout > Instant::now() {
+        if Instant::now() > state.volatile.election_timeout {
             state.transition(Condition::Follower);
         }
     }
@@ -1582,10 +1582,16 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
+        // "On conversion to candidate, start election:
+        //   • Increment currentTerm
+        //   • Vote for self
+        //   • Reset election timer
+        //   • Send RequestVote RPCs to all other servers" - Reference [0] Page 4
         state.transition(Condition::Candidate);
         let term = state.durable.current_term + 1;
         let my_server_id = self.config.server_id;
         state.durable.update(term, my_server_id);
+        state.reset_election_timeout();
 
         // Trivial case. In a single-server cluster, the server is the
         // leader.
@@ -1682,7 +1688,10 @@ impl<SM: StateMachine> Server<SM> {
         if state.stopped {
             return;
         }
-        state.log("Tick.");
+        state.log(format!(
+            "Tick. Timeout in: +{}s.",
+            (state.volatile.election_timeout - Instant::now()).as_secs_f64()
+        ));
         drop(state);
 
         // Leader operations.
