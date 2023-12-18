@@ -2655,7 +2655,7 @@ mod e2e_tests {
             })
         }
 
-        let tick_freq = Duration::from_millis(10);
+        let tick_freq = Duration::from_millis(1);
 
         let mut servers = vec![];
         for i in 0..SERVERS {
