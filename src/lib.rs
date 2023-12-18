@@ -2635,15 +2635,11 @@ mod e2e_tests {
         seed
     }
 
-    #[test]
-    fn test_converge_leader_no_entries() {
-        if std::env::var("RAFT_E2E").is_err() {
-            return;
-        }
-
+    fn test_cluster(
+        tmpdir: &server_tests::TmpDir,
+    ) -> (Vec<Server<server_tests::TestStateMachine>>, Duration) {
         let random_seed = get_seed();
-
-        let tmpdir = server_tests::TmpDir::new();
+        let tick_freq = Duration::from_millis(1);
 
         let mut cluster = vec![];
         const SERVERS: u8 = 3;
@@ -2654,8 +2650,6 @@ mod e2e_tests {
                 address: format!("127.0.0.1:{}", port + i as u16).parse().unwrap(),
             })
         }
-
-        let tick_freq = Duration::from_millis(1);
 
         let mut servers = vec![];
         for i in 0..SERVERS {
@@ -2674,6 +2668,13 @@ mod e2e_tests {
             servers[i as usize].init();
         }
 
+        return (servers, tick_freq);
+    }
+
+    fn assert_leader_converge(
+        servers: &mut Vec<Server<server_tests::TestStateMachine>>,
+        tick_freq: Duration,
+    ) -> u128 {
         let mut post_election_ticks = 20;
         let mut leader_elected = 0;
         while leader_elected == 0 || post_election_ticks > 0 {
@@ -2690,12 +2691,25 @@ mod e2e_tests {
         }
 
         assert_leader_election_final_state(&servers, leader_elected);
+        return leader_elected;
+    }
+
+    #[test]
+    fn test_converge_leader_no_entries() {
+        if std::env::var("RAFT_E2E").is_err() {
+            return;
+        }
+
+        let tmpdir = server_tests::TmpDir::new();
+        let (mut servers, tick_freq) = test_cluster(&tmpdir);
+
+        let old_leader = assert_leader_converge(&mut servers, tick_freq);
 
         println!("\n\n----- EPOCH -----\n\n");
 
         // Now what happens if the old leader stops doing anything?
-        let old_leader = leader_elected;
-        leader_elected = 0;
+        let mut leader_elected = 0;
+        let mut post_election_ticks = 20;
         while leader_elected == 0 {
             for server in servers.iter_mut() {
                 if server.config.server_id == old_leader {
@@ -2724,20 +2738,71 @@ mod e2e_tests {
 
         // And if all are back up do we converge again?
 
-        leader_elected = 0;
-        while leader_elected == 0 || post_election_ticks > 0 {
+        _ = assert_leader_converge(&mut servers, tick_freq);
+    }
+
+    #[test]
+    fn test_apply() {
+        if std::env::var("RAFT_E2E").is_err() {
+            return;
+        }
+
+        let tmpdir = server_tests::TmpDir::new();
+        let (mut servers, tick_freq) = test_cluster(&tmpdir);
+
+        let leader_id = assert_leader_converge(&mut servers, tick_freq);
+
+        let cmds = vec!["abc".as_bytes().to_vec()];
+        let cmd_ids = vec![1];
+        let channel = 'channel: {
+            for server in servers.iter_mut() {
+                if server.config.server_id == leader_id {
+                    break 'channel server.apply(cmds, cmd_ids);
+                }
+            }
+
+            unreachable!("Invalid leader.");
+        };
+
+        // Message should be applied in cluster within 20 ticks.
+        for _ in 0..20 {
+            if let Ok(result) = channel.try_recv() {
+                if let ApplyResult::Ok(msg) = result {
+                    assert_eq!(msg, "abc".as_bytes().to_vec());
+                } else {
+                    panic!("Expected ok result.");
+                }
+                break;
+            }
+
             for server in servers.iter_mut() {
                 server.tick();
-
-                assert_leader_election_duration_state(
-                    &server,
-                    &mut leader_elected,
-                    &mut post_election_ticks,
-                );
             }
+
             std::thread::sleep(tick_freq);
         }
 
-        assert_leader_election_final_state(&servers, leader_elected);
+        // Within another 20 ticks, all servers should have applied
+        // the same message. (Only 2/3 are required for committing,
+        // remember).
+        let mut applied = vec![false; servers.len()];
+        for _ in 0..20 {
+            for (i, server) in servers.iter_mut().enumerate() {
+                server.tick();
+
+                let mut state = server.state.lock().unwrap();
+                if state.volatile.commit_index == 1 {
+                    assert_eq!(
+                        state.durable.log_at_index(1).command,
+                        "abc".as_bytes().to_vec()
+                    );
+                    applied[i] = true;
+                }
+            }
+        }
+
+        for i in 0..applied.len() {
+            assert!(applied[i]);
+        }
     }
 }
