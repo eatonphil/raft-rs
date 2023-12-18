@@ -580,10 +580,7 @@ struct VolatileState {
 }
 
 impl VolatileState {
-    fn new(cluster_size: usize, election_frequency: Duration) -> VolatileState {
-        let mut rand = Random::new();
-        rand.seed();
-
+    fn new(cluster_size: usize, election_frequency: Duration, rand: Random) -> VolatileState {
         VolatileState {
             condition: Condition::Follower,
             commit_index: 0,
@@ -1099,6 +1096,9 @@ pub struct Config {
 
     // Timing configuration.
     election_frequency: Duration,
+
+    // Random.
+    random_seed: [u64; 4],
 }
 
 pub struct Server<SM: StateMachine> {
@@ -1661,7 +1661,11 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     pub fn stop(&mut self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+	    Ok(s) => s,
+	    Err(p) => p.into_inner(),
+	};
+	state.log("Stopping.");
         // Prevent server from accepting any more log entries.
         if state.volatile.condition != Condition::Follower {
             state.transition(Condition::Follower);
@@ -1678,6 +1682,7 @@ impl<SM: StateMachine> Server<SM> {
         if state.stopped {
             return;
         }
+	state.log("Tick.");
         drop(state);
 
         // Leader operations.
@@ -1727,6 +1732,8 @@ impl<SM: StateMachine> Server<SM> {
         let id = config.server_id;
         let rpc_manager = RPCManager::new(config.server_id, config.cluster.clone());
         let election_frequency = config.election_frequency;
+
+	let rand = Random::new(config.random_seed);
         Server {
             rpc_manager,
             config,
@@ -1734,7 +1741,7 @@ impl<SM: StateMachine> Server<SM> {
 
             state: Mutex::new(State {
                 durable: DurableState::new(data_directory, id),
-                volatile: VolatileState::new(cluster_size, election_frequency),
+                volatile: VolatileState::new(cluster_size, election_frequency, rand),
                 logger: Logger { server_id: id },
                 stopped: false,
                 notifications: Vec::new(),
@@ -2019,6 +2026,8 @@ mod server_tests {
             cluster,
 
             election_frequency: Duration::from_secs(10),
+
+	    random_seed: [0; 4],
         };
 
         let sm = TestStateMachine {};
@@ -2455,11 +2464,11 @@ struct Random {
 }
 
 impl Random {
-    fn new() -> Random {
-        Random { state: [0; 4] }
+    fn new(seed: [u64; 4]) -> Random {
+        Random { state: seed }
     }
 
-    fn seed(&mut self) {
+    fn seed() -> [u64; 4] {
         let os = std::env::consts::OS;
         assert!(os == "linux" || os == "macos");
 
@@ -2467,11 +2476,13 @@ impl Random {
             .read(true)
             .open("/dev/urandom")
             .unwrap();
-        let mut bytes = vec![0; 8 * self.state.len()];
+	let mut seed = [0; 4];
+        let mut bytes = vec![0; 8 * seed.len()];
         file.read_exact(bytes.as_mut_slice()).unwrap();
-        for i in 0..self.state.len() {
-            self.state[i] = u64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
+        for i in 0..seed.len() {
+            seed[i] = u64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
         }
+	seed
     }
 
     // Port of https://prng.di.unimi.it/xoshiro256plusplus.c.
@@ -2512,10 +2523,7 @@ impl Random {
 
     fn generate_percent(&mut self) -> f32 {
         let u = self.generate_u32();
-        let p = (u as f64 / u32::MAX as f64) as f32;
-        assert!(p >= 0.0);
-        assert!(p <= 1.0);
-        p
+	(u as f64 / u32::MAX as f64) as f32
     }
 }
 
@@ -2525,10 +2533,14 @@ mod random_tests {
 
     #[test]
     fn test_random() {
-        let mut r = Random::new();
-        r.seed();
-
+        let mut r = Random::new([0; 4]);
         let _ = r.generate_f64();
+	let _ = r.generate_bool();
+	let _ = r.generate_u32();
+
+	let p = r.generate_percent();
+	assert!(p >= 0.0);
+        assert!(p <= 1.0);
     }
 }
 
@@ -2536,11 +2548,84 @@ mod random_tests {
 mod e2e_tests {
     use super::*;
 
+    fn assert_leader_election_duration_state(server: &Server<server_tests::TestStateMachine>, leader_elected: &mut u128, post_election_ticks: &mut usize) {
+	let state = server.state.lock().unwrap();
+        // If it's a leader, it should be the same leader as before.
+        if state.volatile.condition == Condition::Leader {
+            if *leader_elected == 0 {
+                *leader_elected = server.config.server_id;
+            } else {
+                // Once one is elected it shouldn't change.
+                assert_eq!(*leader_elected, server.config.server_id);
+                *post_election_ticks -= 1;
+            }
+        }
+
+        // And the other way around. If it was a leader, it should still be a leader.
+        if *leader_elected == server.config.server_id {
+            assert_eq!(state.volatile.condition, Condition::Leader);
+        }
+    }
+
+    fn assert_leader_election_final_state(servers: &Vec::<Server<server_tests::TestStateMachine>>, leader_elected: u128) {
+	// A leader should have been elected.
+        assert_ne!(leader_elected, 0);
+
+        for server in servers.iter() {
+            let state = server.state.lock().unwrap();
+            if server.config.server_id == leader_elected {
+                // Leader should be a leader.
+                assert_eq!(state.volatile.condition, Condition::Leader);
+            } else {
+                // All other servers should not be a leader.
+                assert_ne!(state.volatile.condition, Condition::Leader);
+            }
+        }
+    }
+
+    fn get_seed() -> [u64; 4] {
+	let mut seed = Random::seed();
+	let seed_to_string = |s: [u64; 4]| -> String {
+	    let mut string = String::new();
+	    for chunk in s.iter() {
+		for byte in chunk.to_le_bytes().iter() {
+		    string = format!("{}{:02X?}", string, byte);
+		}
+	    }
+	    assert_eq!(string.len(), 8*4*2);
+	    return string;
+	};
+	if let Ok(s) = std::env::var("RAFT_SEED") {
+	    assert_eq!(s.len(), 8*4*2);
+	    let mut i = 0;
+	    while i < s.len() {
+		let mut bytes = [0; 8];
+		let mut j = 0;
+		while j < bytes.len() * 2 {
+		    bytes[j / 2] = u8::from_str_radix(&s[i + j..i + j + 2], 16).unwrap();
+		    j += 2;
+		}
+
+		println!("{}", i / 16);
+		seed[i / 16] = u64::from_le_bytes(bytes);
+		i += 16;
+	    }
+
+	    assert_eq!(seed_to_string(seed), s);
+	}
+
+	println!("SEED: {}", seed_to_string(seed));
+
+	seed
+    }
+
     #[test]
     fn test_converge_leader_no_entries() {
         if std::env::var("RAFT_E2E").is_err() {
             return;
         }
+
+	let random_seed = get_seed();
 
         let tmpdir = server_tests::TmpDir::new();
 
@@ -2554,6 +2639,8 @@ mod e2e_tests {
             })
         }
 
+	let tick_freq = Duration::from_millis(10);
+
         let mut servers = vec![];
         for i in 0..SERVERS {
             let config = Config {
@@ -2561,7 +2648,9 @@ mod e2e_tests {
                 server_index: i as usize,
                 cluster: cluster.clone(),
 
-                election_frequency: Duration::from_millis(2000),
+                election_frequency: 20 * tick_freq,
+
+		random_seed,
             };
 
             let sm = server_tests::TestStateMachine {};
@@ -2571,48 +2660,58 @@ mod e2e_tests {
 
         let mut post_election_ticks = 20;
         let mut leader_elected = 0;
-        let mut total_ticks = 0;
         while leader_elected == 0 || post_election_ticks > 0 {
-            total_ticks += 1;
-
             for server in servers.iter_mut() {
                 server.tick();
 
-                let state = server.state.lock().unwrap();
-                state.log(format!(
-                    "Tick: {total_ticks}. Post Election Ticks: {post_election_ticks}."
-                ));
-                // If it's a leader, it should be the same leader as before.
-                if state.volatile.condition == Condition::Leader {
-                    if leader_elected == 0 {
-                        leader_elected = server.config.server_id;
-                    } else {
-                        // Once one is elected it shouldn't change.
-                        assert_eq!(leader_elected, server.config.server_id);
-                        post_election_ticks -= 1;
-                    }
-                }
-
-                // And the other way around. If it was a leader, it should still be a leader.
-                if leader_elected == server.config.server_id {
-                    assert_eq!(state.volatile.condition, Condition::Leader);
-                }
+		assert_leader_election_duration_state(&server, &mut leader_elected, &mut post_election_ticks);
+		
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(tick_freq);
         }
 
-        // A leader should have been elected.
-        assert_ne!(leader_elected, 0);
+	assert_leader_election_final_state(&servers, leader_elected);
 
-        for server in servers.iter() {
-            let state = server.state.lock().unwrap();
-            if server.config.server_id == leader_elected {
-                // Leader should be a leader.
-                assert_eq!(state.volatile.condition, Condition::Leader);
-            } else {
-                // All other servers should not be a leader.
-                assert_ne!(state.volatile.condition, Condition::Leader);
+	println!("\n\n----- EPOCH -----\n\n");
+	
+	// Now what happens if the old leader stops doing anything?
+	let old_leader = leader_elected;
+	leader_elected = 0;
+	while leader_elected == 0 {
+	    for server in servers.iter_mut() {
+		if server.config.server_id == old_leader {
+		    let mut state = server.state.lock().unwrap();
+		    if state.volatile.condition == Condition::Leader {
+			state.transition(Condition::Follower);
+		    }
+		    continue;
+		}
+
+		server.tick();
+
+		assert_leader_election_duration_state(&server, &mut leader_elected, &mut post_election_ticks);
+	    }
+
+	    std::thread::sleep(tick_freq);
+	}
+
+	assert_leader_election_final_state(&servers, leader_elected);
+
+	println!("\n\n----- EPOCH -----\n\n");
+
+	// And if all are back up do we converge again?
+
+	leader_elected = 0;
+        while leader_elected == 0 || post_election_ticks > 0 {
+            for server in servers.iter_mut() {
+                server.tick();
+
+		assert_leader_election_duration_state(&server, &mut leader_elected, &mut post_election_ticks);
+		
             }
+            std::thread::sleep(tick_freq);
         }
+
+	assert_leader_election_final_state(&servers, leader_elected);
     }
 }
