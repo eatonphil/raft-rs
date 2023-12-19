@@ -1031,19 +1031,22 @@ impl RPCManager {
         let address = self.address_from_id(self.server_id);
         let listener =
             std::net::TcpListener::bind(address).expect("Could not bind to configured address.");
+        listener.set_nonblocking(true).unwrap();
 
         let thread_stop = self.stop_mutex.clone();
         let thread_stream_sender = self.stream_sender.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
+            for result in listener.incoming() {
                 let stop = thread_stop.lock().unwrap();
                 if *stop {
                     break;
                 }
 
-                let bufreader = BufReader::new(stream);
-                if let Some(msg) = RPCMessage::decode(bufreader) {
-                    thread_stream_sender.send(msg).unwrap();
+                if let Ok(stream) = result {
+                    let bufreader = BufReader::new(stream);
+                    if let Some(msg) = RPCMessage::decode(bufreader) {
+                        thread_stream_sender.send(msg).unwrap();
+                    }
                 }
             }
         });
@@ -1430,18 +1433,11 @@ impl<SM: StateMachine> Server<SM> {
             if i <= state.volatile.commit_index && self.config.cluster.len() > 1 {
                 break;
             }
+            state.log(format!("Checking for quorum ({quorum}) at index: {i}."));
 
             assert!(quorum > 0 || (self.config.cluster.len() == 1 && quorum == 0));
             let e = state.durable.log_at_index(i);
             for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
-                // Here so that in the case of there being a single
-                // server in the cluster, we still (trivially) achieve
-                // new quorums.
-                if quorum == 0 {
-                    state.volatile.commit_index = i;
-                    break 'outer;
-                }
-
                 // self always counts as part of quorum, so skip it in
                 // the count. quorum_needed already takes self into
                 // consideration (`len() / 2` not `len() / 2 + 1`).
@@ -1450,8 +1446,18 @@ impl<SM: StateMachine> Server<SM> {
                 }
 
                 if match_index >= i && e.term == state.durable.current_term {
+                    state.log(format!("Exists for ({}) at {i}.", server_index));
                     quorum -= 1;
+                    if quorum == 0 {
+                        break;
+                    }
                 }
+            }
+
+            if quorum == 0 {
+                state.volatile.commit_index = i;
+                state.log(format!("New quorum at index: {i}."));
+                break 'outer;
             }
         }
     }
@@ -2622,7 +2628,6 @@ mod e2e_tests {
                     j += 2;
                 }
 
-                println!("{}", i / 16);
                 seed[i / 16] = u64::from_le_bytes(bytes);
                 i += 16;
             }
@@ -2674,11 +2679,16 @@ mod e2e_tests {
     fn assert_leader_converge(
         servers: &mut Vec<Server<server_tests::TestStateMachine>>,
         tick_freq: Duration,
+        skip_id: u128,
     ) -> u128 {
         let mut post_election_ticks = 20;
         let mut leader_elected = 0;
         while leader_elected == 0 || post_election_ticks > 0 {
             for server in servers.iter_mut() {
+                if server.config.server_id == skip_id {
+                    continue;
+                }
+
                 server.tick();
 
                 assert_leader_election_duration_state(
@@ -2703,7 +2713,7 @@ mod e2e_tests {
         let tmpdir = server_tests::TmpDir::new();
         let (mut servers, tick_freq) = test_cluster(&tmpdir);
 
-        let old_leader = assert_leader_converge(&mut servers, tick_freq);
+        let old_leader = assert_leader_converge(&mut servers, tick_freq, 0);
 
         println!("\n\n----- EPOCH -----\n\n");
 
@@ -2738,7 +2748,7 @@ mod e2e_tests {
 
         // And if all are back up do we converge again?
 
-        _ = assert_leader_converge(&mut servers, tick_freq);
+        _ = assert_leader_converge(&mut servers, tick_freq, 0);
     }
 
     #[test]
@@ -2747,62 +2757,80 @@ mod e2e_tests {
             return;
         }
 
-        let tmpdir = server_tests::TmpDir::new();
-        let (mut servers, tick_freq) = test_cluster(&tmpdir);
+        // Skipping server 0 does nothing since 0 is not a valid
+        // server id. Skipping `1` checks to make sure application
+        // still happens even with 2/3 servers up.
+        for skip_id in [0, 1].into_iter() {
+            let tmpdir = server_tests::TmpDir::new();
+            let (mut servers, tick_freq) = test_cluster(&tmpdir);
 
-        let leader_id = assert_leader_converge(&mut servers, tick_freq);
+            let leader_id = assert_leader_converge(&mut servers, tick_freq, skip_id);
+            assert_ne!(leader_id, skip_id);
 
-        let cmds = vec!["abc".as_bytes().to_vec()];
-        let cmd_ids = vec![1];
-        let channel = 'channel: {
-            for server in servers.iter_mut() {
-                if server.config.server_id == leader_id {
-                    break 'channel server.apply(cmds, cmd_ids);
+            let cmds = vec!["abc".as_bytes().to_vec()];
+            let cmd_ids = vec![1];
+            let channel = 'channel: {
+                for server in servers.iter_mut() {
+                    if server.config.server_id == leader_id {
+                        break 'channel server.apply(cmds, cmd_ids);
+                    }
+                }
+
+                unreachable!("Invalid leader.");
+            };
+
+            // Message should be applied in cluster within 20 ticks.
+            for _ in 0..20 {
+                if let Ok(result) = channel.try_recv() {
+                    if let ApplyResult::Ok(msg) = result {
+                        assert_eq!(msg, "abc".as_bytes().to_vec());
+                    } else {
+                        panic!("Expected ok result.");
+                    }
+                    break;
+                }
+
+                for server in servers.iter_mut() {
+                    if server.config.server_id == skip_id {
+                        continue;
+                    }
+
+                    server.tick();
+                }
+
+                std::thread::sleep(tick_freq);
+            }
+
+            // Within another 20 ticks, all servers should have applied
+            // the same message. (Only 2/3 are required for committing,
+            // remember).
+            let mut applied = vec![false; servers.len()];
+            for _ in 0..20 {
+                for (i, server) in servers.iter_mut().enumerate() {
+                    if server.config.server_id == skip_id {
+                        continue;
+                    }
+
+                    server.tick();
+
+                    let mut state = server.state.lock().unwrap();
+                    if state.volatile.commit_index == 1 {
+                        assert_eq!(
+                            state.durable.log_at_index(1).command,
+                            "abc".as_bytes().to_vec()
+                        );
+                        applied[i] = true;
+                    }
                 }
             }
 
-            unreachable!("Invalid leader.");
-        };
-
-        // Message should be applied in cluster within 20 ticks.
-        for _ in 0..20 {
-            if let Ok(result) = channel.try_recv() {
-                if let ApplyResult::Ok(msg) = result {
-                    assert_eq!(msg, "abc".as_bytes().to_vec());
-                } else {
-                    panic!("Expected ok result.");
+            for i in 0..applied.len() {
+                if servers[i].config.server_id == skip_id {
+                    continue;
                 }
-                break;
+
+                assert!(applied[i]);
             }
-
-            for server in servers.iter_mut() {
-                server.tick();
-            }
-
-            std::thread::sleep(tick_freq);
-        }
-
-        // Within another 20 ticks, all servers should have applied
-        // the same message. (Only 2/3 are required for committing,
-        // remember).
-        let mut applied = vec![false; servers.len()];
-        for _ in 0..20 {
-            for (i, server) in servers.iter_mut().enumerate() {
-                server.tick();
-
-                let mut state = server.state.lock().unwrap();
-                if state.volatile.commit_index == 1 {
-                    assert_eq!(
-                        state.durable.log_at_index(1).command,
-                        "abc".as_bytes().to_vec()
-                    );
-                    applied[i] = true;
-                }
-            }
-        }
-
-        for i in 0..applied.len() {
-            assert!(applied[i]);
         }
     }
 }
