@@ -1036,17 +1036,32 @@ impl RPCManager {
         let thread_stop = self.stop_mutex.clone();
         let thread_stream_sender = self.stream_sender.clone();
         std::thread::spawn(move || {
-            for result in listener.incoming() {
+            'outer: for result in listener.incoming() {
                 let stop = thread_stop.lock().unwrap();
                 if *stop {
                     break;
                 }
 
-                if let Ok(stream) = result {
-                    let bufreader = BufReader::new(stream);
-                    if let Some(msg) = RPCMessage::decode(bufreader) {
-                        thread_stream_sender.send(msg).unwrap();
-                    }
+		match result {
+		    Ok(stream) => {
+			let bufreader = BufReader::new(stream);
+			if let Some(msg) = RPCMessage::decode(bufreader) {
+                            thread_stream_sender.send(msg).unwrap();
+			}
+		    },
+		    Err(e) => {
+			if e.kind() == std::io::ErrorKind::WouldBlock {
+			    // TODO: This isn't safe. For some reason on
+			    // macOS this must not be zero which is
+			    // strange. But this must be less than the
+			    // tick frequency too otherwise there will
+			    // be unnecessary elections.
+			    std::thread::sleep(Duration::from_micros(500));
+			    continue 'outer;
+			}
+
+			panic!("{:?}", e);
+		    },
                 }
             }
         });
@@ -2683,8 +2698,14 @@ mod e2e_tests {
     ) -> u128 {
         let mut post_election_ticks = 20;
         let mut leader_elected = 0;
+	let mut max_ticks = 100;
         while leader_elected == 0 || post_election_ticks > 0 {
-            for server in servers.iter_mut() {
+	    max_ticks -= 1;
+	    if max_ticks == 0 {
+		panic!("Ran too long without leader election. Something is wrong.");
+	    }
+
+	    for server in servers.iter_mut() {
                 if server.config.server_id == skip_id {
                     continue;
                 }
