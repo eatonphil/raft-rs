@@ -2801,9 +2801,11 @@ mod e2e_tests {
                 std::thread::sleep(tick_freq);
             }
 
-            // Within another 20 ticks, all servers should have applied
-            // the same message. (Only 2/3 are required for committing,
-            // remember).
+            // Within another 20 ticks, all (but skipped) servers
+            // should have applied the same message. (Only 2/3 are
+            // required for committing, remember).  Actually this case
+            // isn't meaningful unless we expanded the cluster size to
+            // 5 because then a quorum would be 3.
             let mut applied = vec![false; servers.len()];
             for _ in 0..20 {
                 for (i, server) in servers.iter_mut().enumerate() {
@@ -2829,6 +2831,30 @@ mod e2e_tests {
                     continue;
                 }
 
+                assert!(applied[i]);
+            }
+
+            // And within another 20 ticks where we DONT SKIP skip_id,
+            // ALL servers in the cluster should have the message.
+            // That is, a downed server should catch up with message
+            // it missed when it does come back up.
+            for _ in 0..20 {
+                for (i, server) in servers.iter_mut().enumerate() {
+                    server.tick();
+
+                    let mut state = server.state.lock().unwrap();
+                    if state.volatile.commit_index == 1 {
+                        assert_eq!(
+                            state.durable.log_at_index(1).command,
+                            "abc".as_bytes().to_vec()
+                        );
+                        applied[i] = true;
+                    }
+                }
+            }
+
+            for i in 0..applied.len() {
+                println!("Applied? {i}.");
                 assert!(applied[i]);
             }
         }
