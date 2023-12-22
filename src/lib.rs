@@ -1042,26 +1042,26 @@ impl RPCManager {
                     break;
                 }
 
-		match result {
-		    Ok(stream) => {
-			let bufreader = BufReader::new(stream);
-			if let Some(msg) = RPCMessage::decode(bufreader) {
+                match result {
+                    Ok(stream) => {
+                        let bufreader = BufReader::new(stream);
+                        if let Some(msg) = RPCMessage::decode(bufreader) {
                             thread_stream_sender.send(msg).unwrap();
-			}
-		    },
-		    Err(e) => {
-			if e.kind() == std::io::ErrorKind::WouldBlock {
-			    // TODO: This isn't safe. For some reason on
-			    // macOS this must not be zero which is
-			    // strange. But this must be less than the
-			    // tick frequency too otherwise there will
-			    // be unnecessary elections.
-			    std::thread::sleep(Duration::from_micros(500));
-			    continue 'outer;
-			}
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            // TODO: This isn't safe. For some reason on
+                            // macOS this must not be zero which is
+                            // strange. But this must be less than the
+                            // tick frequency too otherwise there will
+                            // be unnecessary elections.
+                            std::thread::sleep(Duration::from_micros(500));
+                            continue 'outer;
+                        }
 
-			panic!("{:?}", e);
-		    },
+                        panic!("{:?}", e);
+                    }
                 }
             }
         });
@@ -1083,7 +1083,16 @@ impl RPCManager {
             condition,
             format!("Sending {:?} to {}", message.body, to_server_id),
         );
-        let stream = std::net::TcpStream::connect(address).unwrap();
+        let stream = if let Ok(stream) = std::net::TcpStream::connect(address) {
+            stream
+        } else {
+            self.logger.log(
+                message.term,
+                condition,
+                "Could not connect to {to_server_id}.",
+            );
+            return;
+        };
         let bufwriter = BufWriter::new(stream.try_clone().unwrap());
         message.encode(server_id, bufwriter);
 
@@ -2698,14 +2707,14 @@ mod e2e_tests {
     ) -> u128 {
         let mut post_election_ticks = 20;
         let mut leader_elected = 0;
-	let mut max_ticks = 100;
+        let mut max_ticks = 100;
         while leader_elected == 0 || post_election_ticks > 0 {
-	    max_ticks -= 1;
-	    if max_ticks == 0 {
-		panic!("Ran too long without leader election. Something is wrong.");
-	    }
+            max_ticks -= 1;
+            if max_ticks == 0 {
+                panic!("Ran too long without leader election. Something is wrong.");
+            }
 
-	    for server in servers.iter_mut() {
+            for server in servers.iter_mut() {
                 if server.config.server_id == skip_id {
                     continue;
                 }
@@ -2785,6 +2794,12 @@ mod e2e_tests {
             let tmpdir = server_tests::TmpDir::new();
             let (mut servers, tick_freq) = test_cluster(&tmpdir);
 
+            for server in servers.iter_mut() {
+                if server.config.server_id == skip_id {
+                    //server.stop();
+                }
+            }
+
             let leader_id = assert_leader_converge(&mut servers, tick_freq, skip_id);
             assert_ne!(leader_id, skip_id);
 
@@ -2853,6 +2868,14 @@ mod e2e_tests {
                 }
 
                 assert!(applied[i]);
+            }
+
+            println!("\n\nBringing skipped server back.\n\n");
+
+            for server in servers.iter_mut() {
+                if server.config.server_id == skip_id {
+                    server.init();
+                }
             }
 
             // And within another 20 ticks where we DONT SKIP skip_id,
