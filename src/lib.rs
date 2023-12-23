@@ -581,6 +581,7 @@ struct VolatileState {
 
 impl VolatileState {
     fn new(cluster_size: usize, election_frequency: Duration, rand: Random) -> VolatileState {
+	let jitter = election_frequency.as_secs_f64() / 3.0;
         VolatileState {
             condition: Condition::Follower,
             commit_index: 0,
@@ -590,7 +591,7 @@ impl VolatileState {
             votes: 0,
 
             election_frequency,
-            election_timeout: Instant::now() + election_frequency,
+            election_timeout: Instant::now() + Duration::from_secs_f64(jitter),
             rand,
         }
     }
@@ -642,10 +643,12 @@ impl State {
         ));
     }
 
-    fn transition(&mut self, condition: Condition) {
+    fn transition(&mut self, condition: Condition, term_increase: u64, voted_for: u128) {
         assert_ne!(self.volatile.condition, condition);
         self.log(format!("Became {}.", condition));
         self.volatile.condition = condition;
+	// Reset vote.
+	self.durable.update(self.durable.current_term + term_increase, voted_for);
     }
 }
 
@@ -1031,37 +1034,22 @@ impl RPCManager {
         let address = self.address_from_id(self.server_id);
         let listener =
             std::net::TcpListener::bind(address).expect("Could not bind to configured address.");
-        listener.set_nonblocking(true).unwrap();
 
-        let thread_stop = self.stop_mutex.clone();
+	let thread_stop = self.stop_mutex.clone();
         let thread_stream_sender = self.stream_sender.clone();
         std::thread::spawn(move || {
-            'outer: for result in listener.incoming() {
-                let stop = thread_stop.lock().unwrap();
-                if *stop {
-                    break;
-                }
+            for stream in listener.incoming().flatten() {
+		// For this logic to be triggered, we must create a
+		// connection to our own server after setting
+		// `thread_stop` to `true`.
+		let stop = thread_stop.lock().unwrap();
+		if *stop {
+		    break;
+		}
 
-                match result {
-                    Ok(stream) => {
-                        let bufreader = BufReader::new(stream);
-                        if let Some(msg) = RPCMessage::decode(bufreader) {
-                            thread_stream_sender.send(msg).unwrap();
-                        }
-                    }
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            // TODO: This isn't safe. For some reason on
-                            // macOS this must not be zero which is
-                            // strange. But this must be less than the
-                            // tick frequency too otherwise there will
-                            // be unnecessary elections.
-                            std::thread::sleep(Duration::from_micros(500));
-                            continue 'outer;
-                        }
-
-                        panic!("{:?}", e);
-                    }
+		let bufreader = BufReader::new(stream);
+                if let Some(msg) = RPCMessage::decode(bufreader) {
+                    thread_stream_sender.send(msg).unwrap();
                 }
             }
         });
@@ -1089,7 +1077,7 @@ impl RPCManager {
             self.logger.log(
                 message.term,
                 condition,
-                "Could not connect to {to_server_id}.",
+                format!("Could not connect to {to_server_id}."),
             );
             return;
         };
@@ -1298,7 +1286,7 @@ impl<SM: StateMachine> Server<SM> {
         // "If AppendEntries RPC received from new leader: convert to
         // follower." - Reference [0] Page 4
         if state.volatile.condition == Condition::Candidate {
-            state.transition(Condition::Follower);
+            state.transition(Condition::Follower, 0, 0);
         }
 
         if state.volatile.condition != Condition::Follower {
@@ -1411,12 +1399,12 @@ impl<SM: StateMachine> Server<SM> {
         // - Reference [0] Page 4
         let mut state = self.state.lock().unwrap();
         if message.term > state.durable.current_term {
-            state
-                .durable
-                .update(message.term, 0 /* Reset voted_for since new term. */);
             if state.volatile.condition != Condition::Follower {
-                state.transition(Condition::Follower);
-            }
+		let term_diff = message.term - state.durable.current_term;
+                state.transition(Condition::Follower, term_diff, 0);
+            } else {
+		state.durable.update(message.term, 0);
+	    }
         }
         drop(state);
 
@@ -1574,7 +1562,7 @@ impl<SM: StateMachine> Server<SM> {
 
         // Election timed out. Revert to follower and restart election.
         if Instant::now() > state.volatile.election_timeout {
-            state.transition(Condition::Follower);
+            state.transition(Condition::Follower, 0, 0);
         }
     }
 
@@ -1584,10 +1572,8 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        let term = state.durable.current_term;
-        state.durable.update(term, 0 /* Reset voted_for. */);
         state.volatile.reset();
-        state.transition(Condition::Leader);
+        state.transition(Condition::Leader, 0, 0);
 
         for i in 0..self.config.cluster.len() {
             // "for each server, index of the next log entry
@@ -1617,10 +1603,7 @@ impl<SM: StateMachine> Server<SM> {
         //   • Vote for self
         //   • Reset election timer
         //   • Send RequestVote RPCs to all other servers" - Reference [0] Page 4
-        state.transition(Condition::Candidate);
-        let term = state.durable.current_term + 1;
-        let my_server_id = self.config.server_id;
-        state.durable.update(term, my_server_id);
+        state.transition(Condition::Candidate, 1, self.config.server_id);
         state.reset_election_timeout();
 
         // Trivial case. In a single-server cluster, the server is the
@@ -1632,9 +1615,9 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         let msg = &RPCMessage {
-            term,
+            term: state.durable.current_term,
             body: RPCBody::RequestVoteRequest(RequestVoteRequest {
-                term,
+                term: state.durable.current_term,
                 candidate_id: self.config.server_id,
                 last_log_index: std::cmp::max(state.durable.next_log_index, 1) - 1,
                 last_log_term: state.durable.last_log_term,
@@ -1643,7 +1626,7 @@ impl<SM: StateMachine> Server<SM> {
         };
         for server in self.config.cluster.iter() {
             // Skip self.
-            if server.id == my_server_id {
+            if server.id == self.config.server_id {
                 continue;
             }
 
@@ -1690,9 +1673,8 @@ impl<SM: StateMachine> Server<SM> {
         self.rpc_manager.start();
 
         let mut state = self.state.lock().unwrap();
-        state.reset_election_timeout();
         if self.config.cluster.len() == 1 {
-            state.transition(Condition::Leader);
+            state.transition(Condition::Leader, 0, 0);
         }
     }
 
@@ -1704,13 +1686,18 @@ impl<SM: StateMachine> Server<SM> {
         state.log("Stopping.");
         // Prevent server from accepting any more log entries.
         if state.volatile.condition != Condition::Follower {
-            state.transition(Condition::Follower);
+            state.transition(Condition::Follower, 0, 0);
         }
         state.stopped = true;
 
         // Stop RPCManager.
         let mut stop = self.rpc_manager.stop_mutex.lock().unwrap();
         *stop = true;
+	drop(stop);
+
+	// Make an empty connection to self so the stop_mutex logic gets triggered.
+	let address = self.rpc_manager.address_from_id(self.config.server_id);
+	_ = std::net::TcpStream::connect(address);
     }
 
     pub fn tick(&mut self) {
@@ -1737,24 +1724,28 @@ impl<SM: StateMachine> Server<SM> {
         // All condition operations.
         self.apply_entries();
 
-        if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
-            let state = self.state.lock().unwrap();
-            state.log(format!(
-                "Received message from {}: {:?}",
-                msg.from, msg.body
-            ));
-            drop(state);
+	loop {
+            if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
+		let state = self.state.lock().unwrap();
+		state.log(format!(
+                    "Received message from {}: {:?}",
+                    msg.from, msg.body
+		));
+		drop(state);
 
-            if let Some((response, from)) = self.handle_message(msg) {
-                let state = self.state.lock().unwrap();
-                let condition = state.volatile.condition;
-                drop(state);
+		if let Some((response, from)) = self.handle_message(msg) {
+                    let state = self.state.lock().unwrap();
+                    let condition = state.volatile.condition;
+                    drop(state);
 
-                let expect_response = false;
-                self.rpc_manager
-                    .send(condition, from, &response, expect_response);
-            }
-        }
+                    let expect_response = false;
+                    self.rpc_manager
+			.send(condition, from, &response, expect_response);
+		}
+            } else {
+		break;
+	    }
+	}
     }
 
     pub fn restore(&self) {
@@ -2189,7 +2180,7 @@ mod server_tests {
 
         // Must be a follower to accept entries.
         let mut state = server.state.lock().unwrap();
-        state.transition(Condition::Follower);
+        state.transition(Condition::Follower, 0, 0);
         drop(state);
 
         let e = LogEntry {
@@ -2238,7 +2229,7 @@ mod server_tests {
 
         // Must be a follower to accept entries.
         let mut state = server.state.lock().unwrap();
-        state.transition(Condition::Follower);
+        state.transition(Condition::Follower, 0, 0);
         drop(state);
 
         let entries = vec![LogEntry {
@@ -2564,6 +2555,10 @@ impl Random {
         let u = self.generate_u32();
         (u as f64 / u32::MAX as f64) as f32
     }
+
+    fn generate_seed(&mut self) -> [u64; 4] {
+        [self.next(), self.next(), self.next(), self.next()]
+    }
 }
 
 #[cfg(test)]
@@ -2659,20 +2654,20 @@ mod e2e_tests {
             assert_eq!(seed_to_string(seed), s);
         }
 
-        println!("SEED: {}", seed_to_string(seed));
+        println!("RAFT_SEED={}", seed_to_string(seed));
 
         seed
     }
 
     fn test_cluster(
         tmpdir: &server_tests::TmpDir,
+	port: u16,
     ) -> (Vec<Server<server_tests::TestStateMachine>>, Duration) {
         let random_seed = get_seed();
         let tick_freq = Duration::from_millis(1);
 
         let mut cluster = vec![];
         const SERVERS: u8 = 3;
-        let port = 20030;
         for i in 0..SERVERS {
             cluster.push(ServerConfig {
                 id: 1 + i as u128,
@@ -2681,6 +2676,7 @@ mod e2e_tests {
         }
 
         let mut servers = vec![];
+        let mut per_server_random_seed_generator = Random::new(random_seed);
         for i in 0..SERVERS {
             let config = Config {
                 server_id: 1 + i as u128,
@@ -2689,7 +2685,7 @@ mod e2e_tests {
 
                 election_frequency: 20 * tick_freq,
 
-                random_seed,
+                random_seed: per_server_random_seed_generator.generate_seed(),
             };
 
             let sm = server_tests::TestStateMachine {};
@@ -2736,12 +2732,8 @@ mod e2e_tests {
 
     #[test]
     fn test_converge_leader_no_entries() {
-        if std::env::var("RAFT_E2E").is_err() {
-            return;
-        }
-
         let tmpdir = server_tests::TmpDir::new();
-        let (mut servers, tick_freq) = test_cluster(&tmpdir);
+        let (mut servers, tick_freq) = test_cluster(&tmpdir, 20030);
 
         let old_leader = assert_leader_converge(&mut servers, tick_freq, 0);
 
@@ -2755,7 +2747,7 @@ mod e2e_tests {
                 if server.config.server_id == old_leader {
                     let mut state = server.state.lock().unwrap();
                     if state.volatile.condition == Condition::Leader {
-                        state.transition(Condition::Follower);
+                        state.transition(Condition::Follower, 0, 0);
                     }
                     continue;
                 }
@@ -2783,20 +2775,17 @@ mod e2e_tests {
 
     #[test]
     fn test_apply() {
-        if std::env::var("RAFT_E2E").is_err() {
-            return;
-        }
-
         // Skipping server 0 does nothing since 0 is not a valid
         // server id. Skipping `1` checks to make sure application
         // still happens even with 2/3 servers up.
         for skip_id in [0, 1].into_iter() {
             let tmpdir = server_tests::TmpDir::new();
-            let (mut servers, tick_freq) = test_cluster(&tmpdir);
+	    let port = 20033;
+            let (mut servers, tick_freq) = test_cluster(&tmpdir, port);
 
             for server in servers.iter_mut() {
-                if server.config.server_id == skip_id {
-                    //server.stop();
+                if server.config.server_id == skip_id as u128 {
+                    server.stop();
                 }
             }
 
@@ -2860,6 +2849,8 @@ mod e2e_tests {
                         applied[i] = true;
                     }
                 }
+
+		std::thread::sleep(tick_freq);
             }
 
             for i in 0..applied.len() {
@@ -2872,11 +2863,10 @@ mod e2e_tests {
 
             println!("\n\nBringing skipped server back.\n\n");
 
-            for server in servers.iter_mut() {
-                if server.config.server_id == skip_id {
-                    server.init();
-                }
-            }
+	    drop(servers);
+	    let (mut servers, tick_freq) = test_cluster(&tmpdir, port);
+
+	    _ = assert_leader_converge(&mut servers, tick_freq, skip_id);
 
             // And within another 20 ticks where we DONT SKIP skip_id,
             // ALL servers in the cluster should have the message.
@@ -2895,6 +2885,8 @@ mod e2e_tests {
                         applied[i] = true;
                     }
                 }
+
+		std::thread::sleep(tick_freq);
             }
 
             for i in 0..applied.len() {
