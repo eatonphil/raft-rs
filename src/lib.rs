@@ -614,7 +614,6 @@ struct State {
     // Non-Raft state.
     stopped: bool,
     notifications: Vec<(u128, mpsc::Sender<ApplyResult>)>,
-    request_id: u64,
 }
 
 impl State {
@@ -628,9 +627,7 @@ impl State {
     }
 
     fn next_request_id(&mut self) -> u64 {
-        let i = self.request_id;
-        self.request_id = self.request_id.wrapping_add(1);
-        return i;
+	self.volatile.rand.generate_u64()
     }
 
     fn reset_election_timeout(&mut self) {
@@ -1028,8 +1025,8 @@ impl RPCMessage {
         })
     }
 
-    fn encode<T: std::io::Write>(&self, request_id: u64, sender_id: u128, writer: BufWriter<T>) {
-        let encoder = &mut RPCMessageEncoder::new(request_id, sender_id, writer);
+    fn encode<T: std::io::Write>(&self, sender_id: u128, writer: BufWriter<T>) {
+        let encoder = &mut RPCMessageEncoder::new(self.request_id(), sender_id, writer);
         match &self.body {
             RPCBody::RequestVoteRequest(rvr) => rvr.encode(encoder),
             RPCBody::RequestVoteResponse(rvr) => rvr.encode(encoder),
@@ -1126,7 +1123,6 @@ impl RPCManager {
         &mut self,
         log_length: u64,
         condition: Condition,
-        request_id: u64,
         to_server_id: u128,
         message: &RPCMessage,
         expect_response: bool,
@@ -1153,7 +1149,7 @@ impl RPCManager {
             return;
         };
         let bufwriter = BufWriter::new(stream.try_clone().unwrap());
-        message.encode(request_id, server_id, bufwriter);
+        message.encode(server_id, bufwriter);
 
         if !expect_response {
             return;
@@ -1247,7 +1243,7 @@ impl<SM: StateMachine> Server<SM> {
         let mut state = self.state.lock().unwrap();
         let term = state.durable.current_term;
         let false_request = RPCBody::RequestVoteResponse(RequestVoteResponse {
-            request_id: state.next_request_id(),
+            request_id: request.request_id,
             term,
             vote_granted: false,
         });
@@ -1298,7 +1294,7 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         let msg = RPCBody::RequestVoteResponse(RequestVoteResponse {
-            request_id: state.next_request_id(),
+            request_id: request.request_id,
             term,
             vote_granted,
         });
@@ -1338,11 +1334,10 @@ impl<SM: StateMachine> Server<SM> {
     ) -> Option<RPCBody> {
         let mut state = self.state.lock().unwrap();
         let term = state.durable.current_term;
-        let response_id = state.next_request_id();
 
         let false_response = |match_index| -> Option<RPCBody> {
             Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-                request_id: response_id,
+                request_id: request.request_id,
                 term,
                 success: false,
                 match_index,
@@ -1427,7 +1422,7 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         Some(RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-            request_id: state.next_request_id(),
+            request_id: request.request_id,
             term,
             success: true,
             match_index: request.prev_log_index + request.entries.len() as u64,
@@ -1578,7 +1573,7 @@ impl<SM: StateMachine> Server<SM> {
         if state.volatile.condition != Condition::Leader {
             return;
         }
-        let response_id = state.next_request_id();
+        let request_id = state.next_request_id();
 
         let time_for_heartbeat =
             state.volatile.election_timeout - self.config.election_frequency / 2 > Instant::now();
@@ -1628,7 +1623,7 @@ impl<SM: StateMachine> Server<SM> {
             let msg = RPCMessage {
                 from: my_server_id,
                 body: RPCBody::AppendEntriesRequest(AppendEntriesRequest {
-                    request_id: response_id,
+                    request_id,
                     term: state.durable.current_term,
                     leader_id: my_server_id,
                     prev_log_index,
@@ -1640,7 +1635,6 @@ impl<SM: StateMachine> Server<SM> {
             self.rpc_manager.send(
                 state.durable.next_log_index,
                 state.volatile.condition,
-                state.next_request_id(),
                 server.id,
                 &msg,
                 true,
@@ -1744,7 +1738,6 @@ impl<SM: StateMachine> Server<SM> {
             self.rpc_manager.send(
                 state.durable.next_log_index,
                 state.volatile.condition,
-                state.next_request_id(),
                 server.id,
                 msg,
                 true,
@@ -1850,17 +1843,15 @@ impl<SM: StateMachine> Server<SM> {
             drop(state);
 
             if let Some((response, from)) = self.handle_message(msg) {
-                let mut state = self.state.lock().unwrap();
+                let state = self.state.lock().unwrap();
                 let condition = state.volatile.condition;
                 let log_length = state.durable.next_log_index;
-                let response_id = state.next_request_id();
                 drop(state);
 
                 let expect_response = false;
                 self.rpc_manager.send(
                     log_length,
                     condition,
-                    response_id,
                     from,
                     &response,
                     expect_response,
@@ -1891,7 +1882,6 @@ impl<SM: StateMachine> Server<SM> {
             sm,
 
             state: Mutex::new(State {
-                request_id: 0,
                 durable: DurableState::new(data_directory, id),
                 volatile: VolatileState::new(cluster_size, election_frequency, rand),
                 logger: Logger { server_id: id },
@@ -2154,7 +2144,7 @@ mod server_tests {
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufwriter = BufWriter::new(&mut cursor);
             println!("Testing transformation of {:?}.", rpcmessage);
-            rpcmessage.encode(0, rpcmessage.from, bufwriter);
+            rpcmessage.encode(rpcmessage.from, bufwriter);
 
             drop(cursor);
 
@@ -2208,7 +2198,6 @@ mod server_tests {
         rpcm.send(
             0,
             Condition::Follower,
-            0,
             server.config.server_id,
             &msg,
             true,
@@ -2258,7 +2247,7 @@ mod server_tests {
         server.init();
 
         let msg = RequestVoteRequest {
-            request_id: 0,
+            request_id: 88,
             term: 1,
             candidate_id: 2,
             last_log_index: 2,
@@ -2273,7 +2262,7 @@ mod server_tests {
             Some((
                 RPCMessage {
                     body: RPCBody::RequestVoteResponse(RequestVoteResponse {
-                        request_id: 1,
+                        request_id: 88,
                         term: 1,
                         vote_granted: true,
                     }),
@@ -2319,7 +2308,7 @@ mod server_tests {
             client_serial_id: 0,
         };
         let msg = AppendEntriesRequest {
-            request_id: 0,
+            request_id: 90,
             term: 0,
             leader_id: 2132,
             prev_log_index: 0,
@@ -2336,7 +2325,7 @@ mod server_tests {
             Some((
                 RPCMessage {
                     body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-                        request_id: 1,
+                        request_id: 90,
                         term: 0,
                         success: true,
                         match_index: 1,
@@ -2381,7 +2370,7 @@ mod server_tests {
             client_serial_id: 0,
         };
         let msg = AppendEntriesRequest {
-            request_id: 0,
+            request_id: 100,
             term: 0,
             leader_id: 2132,
             prev_log_index: 0,
@@ -2398,7 +2387,7 @@ mod server_tests {
             Some((
                 RPCMessage {
                     body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-                        request_id: 1,
+                        request_id: 100,
                         term: 0,
                         success: true,
                         match_index: 1,
@@ -2627,6 +2616,7 @@ impl Random {
         Random { state: seed }
     }
 
+    #[allow(dead_code)]
     fn seed() -> [u64; 4] {
         let os = std::env::consts::OS;
         assert!(os == "linux" || os == "macos");
@@ -2662,6 +2652,10 @@ impl Random {
         result
     }
 
+    fn generate_u64(&mut self) -> u64 {
+	self.next()
+    }
+
     fn generate_bool(&mut self) -> bool {
         self.generate_f64() < 0.0
     }
@@ -2685,6 +2679,7 @@ impl Random {
         (u as f64 / u32::MAX as f64) as f32
     }
 
+    #[allow(dead_code)]
     fn generate_seed(&mut self) -> [u64; 4] {
         [self.next(), self.next(), self.next(), self.next()]
     }
