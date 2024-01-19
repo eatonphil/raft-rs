@@ -627,15 +627,15 @@ impl State {
     }
 
     fn next_request_id(&mut self) -> u64 {
-	self.volatile.rand.generate_u64()
+        self.volatile.rand.generate_u64()
     }
 
     fn reset_election_timeout(&mut self) {
         let random_percent = self.volatile.rand.generate_percent();
         let positive = self.volatile.rand.generate_bool();
-        let jitter = random_percent as f64 * (self.volatile.election_frequency.as_secs_f64() / 3.0);
-        let mut new_timeout = self.volatile.election_frequency;
+        let jitter = random_percent as f64 * (self.volatile.election_frequency.as_secs_f64() / 4.0);
 
+        let mut new_timeout = self.volatile.election_frequency;
         // Duration apparently isn't allowed to be negative.
         if positive {
             new_timeout += Duration::from_secs_f64(jitter);
@@ -646,8 +646,8 @@ impl State {
         self.volatile.election_timeout = Instant::now() + new_timeout;
 
         self.log(format!(
-            "Resetting election timeout: +{}s.",
-            new_timeout.as_secs_f64()
+            "Resetting election timeout: {}ms.",
+            new_timeout.as_millis()
         ));
     }
 
@@ -1049,11 +1049,15 @@ impl Logger {
         msg: S,
     ) {
         println!(
-            "[S: {: <3} T: {: <3} L: {: <3} C: {: <9}] {}",
+            "[S: {: <3} T: {: <3} L: {: <3} C: {}] {}",
             self.server_id,
             term,
             log_length,
-            format!("{}", condition),
+            match condition {
+                Condition::Leader => "L",
+                Condition::Candidate => "C",
+                Condition::Follower => "F",
+            },
             msg
         );
     }
@@ -1573,10 +1577,13 @@ impl<SM: StateMachine> Server<SM> {
         if state.volatile.condition != Condition::Leader {
             return;
         }
-        let request_id = state.next_request_id();
 
-        let time_for_heartbeat =
-            state.volatile.election_timeout - self.config.election_frequency / 2 > Instant::now();
+        let time_for_heartbeat = state.volatile.election_timeout > Instant::now();
+        // "The broadcast time should be an order of magnitude less
+        // than the election timeout so that leaders can reliably send
+        // the heartbeat messages required to keep followers from
+        // starting elections" - Reference [0] Page 10
+        state.volatile.election_timeout = Instant::now() + (self.config.election_frequency / 10);
 
         let my_server_id = self.config.server_id;
         for (i, server) in self.config.cluster.iter().enumerate() {
@@ -1623,7 +1630,7 @@ impl<SM: StateMachine> Server<SM> {
             let msg = RPCMessage {
                 from: my_server_id,
                 body: RPCBody::AppendEntriesRequest(AppendEntriesRequest {
-                    request_id,
+                    request_id: state.next_request_id(),
                     term: state.durable.current_term,
                     leader_id: my_server_id,
                     prev_log_index,
@@ -1677,6 +1684,7 @@ impl<SM: StateMachine> Server<SM> {
 
         state.volatile.reset();
         state.transition(Condition::Leader, 0, 0);
+        state.volatile.election_timeout = Instant::now();
 
         for i in 0..self.config.cluster.len() {
             // "for each server, index of the next log entry
@@ -1717,23 +1725,22 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        let response_id = state.next_request_id();
-
-        let msg = &RPCMessage {
-            body: RPCBody::RequestVoteRequest(RequestVoteRequest {
-                request_id: response_id,
-                term: state.durable.current_term,
-                candidate_id: self.config.server_id,
-                last_log_index: std::cmp::max(state.durable.next_log_index, 1) - 1,
-                last_log_term: state.durable.last_log_term,
-            }),
-            from: self.config.server_id,
-        };
         for server in self.config.cluster.iter() {
             // Skip self.
             if server.id == self.config.server_id {
                 continue;
             }
+
+            let msg = &RPCMessage {
+                body: RPCBody::RequestVoteRequest(RequestVoteRequest {
+                    request_id: state.next_request_id(),
+                    term: state.durable.current_term,
+                    candidate_id: self.config.server_id,
+                    last_log_index: std::cmp::max(state.durable.next_log_index, 1) - 1,
+                    last_log_term: state.durable.last_log_term,
+                }),
+                from: self.config.server_id,
+            };
 
             self.rpc_manager.send(
                 state.durable.next_log_index,
@@ -1811,13 +1818,14 @@ impl<SM: StateMachine> Server<SM> {
     }
 
     pub fn tick(&mut self) {
+        let t1 = Instant::now();
         let state = self.state.lock().unwrap();
         if state.stopped {
             return;
         }
         state.log(format!(
-            "Tick. Timeout in: +{}s.",
-            (state.volatile.election_timeout - Instant::now()).as_secs_f64()
+            "Tick start. Timeout in: {}ms.",
+            (state.volatile.election_timeout - Instant::now()).as_millis()
         ));
         drop(state);
 
@@ -1836,11 +1844,22 @@ impl<SM: StateMachine> Server<SM> {
 
         if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
             let state = self.state.lock().unwrap();
+
+            // "If a server receives a request with a stale term
+            // number, it rejects the request." - Reference [0] Page 5.
+            // Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
+            let stale = msg.term() < state.durable.current_term;
+
             state.log(format!(
-                "Received message from {}: {:?}.",
-                msg.from, msg.body
+                "{} message from {}: {:?}.",
+                if stale { "Dropping stale" } else { "Received" },
+                msg.from,
+                msg.body,
             ));
             drop(state);
+            if stale {
+                return;
+            }
 
             if let Some((response, from)) = self.handle_message(msg) {
                 let state = self.state.lock().unwrap();
@@ -1849,14 +1868,15 @@ impl<SM: StateMachine> Server<SM> {
                 drop(state);
 
                 let expect_response = false;
-                self.rpc_manager.send(
-                    log_length,
-                    condition,
-                    from,
-                    &response,
-                    expect_response,
-                );
+                self.rpc_manager
+                    .send(log_length, condition, from, &response, expect_response);
             }
+        }
+
+        let took = (Instant::now() - t1).as_millis();
+        if took > 0 {
+            let state = self.state.lock().unwrap();
+            state.log(format!("WARNING! Tick completed in {}ms.", took));
         }
     }
 
@@ -2195,13 +2215,7 @@ mod server_tests {
             }),
             from: 1,
         };
-        rpcm.send(
-            0,
-            Condition::Follower,
-            server.config.server_id,
-            &msg,
-            true,
-        );
+        rpcm.send(0, Condition::Follower, server.config.server_id, &msg, true);
         let received = rpcm.stream_receiver.recv().unwrap();
         assert_eq!(msg, received);
 
@@ -2653,7 +2667,7 @@ impl Random {
     }
 
     fn generate_u64(&mut self) -> u64 {
-	self.next()
+        self.next()
     }
 
     fn generate_bool(&mut self) -> bool {
@@ -2807,7 +2821,7 @@ mod e2e_tests {
                 server_index: i as usize,
                 cluster: cluster.clone(),
 
-                election_frequency: 20 * tick_freq,
+                election_frequency: 500 * tick_freq,
 
                 random_seed: per_server_random_seed_generator.generate_seed(),
             };
@@ -2825,9 +2839,9 @@ mod e2e_tests {
         tick_freq: Duration,
         skip_id: u128,
     ) -> u128 {
-        let mut post_election_ticks = 20;
+        let mut post_election_ticks = 50;
         let mut leader_elected = 0;
-        let mut max_ticks = 100;
+        let mut max_ticks = 200;
         while leader_elected == 0 || post_election_ticks > 0 {
             max_ticks -= 1;
             if max_ticks == 0 {
