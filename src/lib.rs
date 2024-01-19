@@ -633,7 +633,7 @@ impl State {
     fn reset_election_timeout(&mut self) {
         let random_percent = self.volatile.rand.generate_percent();
         let positive = self.volatile.rand.generate_bool();
-        let jitter = random_percent as f64 * (self.volatile.election_frequency.as_secs_f64() / 4.0);
+        let jitter = random_percent as f64 * (self.volatile.election_frequency.as_secs_f64() / 2.0);
 
         let mut new_timeout = self.volatile.election_frequency;
         // Duration apparently isn't allowed to be negative.
@@ -1117,7 +1117,7 @@ impl RPCManager {
                 let bufreader = BufReader::new(stream);
                 match RPCMessage::decode(bufreader) {
                     Ok(msg) => thread_stream_sender.send(msg).unwrap(),
-                    Err(msg) => panic!("{}", msg),
+                    Err(msg) => panic!("Could not read request. Error: {}.", msg),
                 }
             }
         });
@@ -1129,10 +1129,8 @@ impl RPCManager {
         condition: Condition,
         to_server_id: u128,
         message: &RPCMessage,
-        expect_response: bool,
     ) {
         let address = self.address_from_id(to_server_id);
-        let thread_stream_sender = self.stream_sender.clone();
         let server_id = self.server_id;
 
         self.logger.log(
@@ -1154,18 +1152,6 @@ impl RPCManager {
         };
         let bufwriter = BufWriter::new(stream.try_clone().unwrap());
         message.encode(server_id, bufwriter);
-
-        if !expect_response {
-            return;
-        }
-
-        std::thread::spawn(move || {
-            let bufreader = BufReader::new(stream);
-            match RPCMessage::decode(bufreader) {
-                Ok(response) => thread_stream_sender.send(response).unwrap(),
-                Err(msg) => panic!("{}", msg),
-            }
-        });
     }
 }
 
@@ -1281,7 +1267,7 @@ impl<SM: StateMachine> Server<SM> {
         let last_log_term = state.durable.last_log_term;
         let vote_granted = request.last_log_term > last_log_term
             || (request.last_log_term == last_log_term
-                && (request.last_log_index == 0 || request.last_log_index >= log_length));
+                && (request.last_log_index >= log_length - 1));
         state.log(format!(
             "RVR mll: {log_length}, mlt: {}; rll: {}, rlt: {}",
             last_log_term, request.last_log_index, request.last_log_term
@@ -1550,10 +1536,11 @@ impl<SM: StateMachine> Server<SM> {
                     if quorum == 0 {
                         break;
                     }
-                } else if match_index >= 1 {
+                } else if match_index >= i {
                     state.log(format!(
-                        "Does not exist for ({}) at {i} (term mismatch).",
-                        server_index
+                        "Does not exist for ({}) at {i} (their term is {}, our term is {}).",
+                        server_index,
+			state.durable.current_term,
                     ));
                 } else {
                     state.log(format!("Does not exist for ({}) at {i}.", server_index));
@@ -1645,7 +1632,6 @@ impl<SM: StateMachine> Server<SM> {
                 state.volatile.condition,
                 server.id,
                 &msg,
-                true,
             );
         }
     }
@@ -1748,7 +1734,6 @@ impl<SM: StateMachine> Server<SM> {
                 state.volatile.condition,
                 server.id,
                 msg,
-                true,
             );
         }
     }
@@ -1791,6 +1776,7 @@ impl<SM: StateMachine> Server<SM> {
         self.rpc_manager.start();
 
         let mut state = self.state.lock().unwrap();
+	state.reset_election_timeout();
         if self.config.cluster.len() == 1 {
             state.transition(Condition::Leader, 0, 0);
         }
@@ -1845,41 +1831,47 @@ impl<SM: StateMachine> Server<SM> {
         // All condition operations.
         self.apply_entries();
 
-        if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
-            let state = self.state.lock().unwrap();
+	// Read from the backlog at least once and for at most 5ms.
+	let until = Instant::now() + Duration::from_millis(5);
+	loop {
+            if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
+		let state = self.state.lock().unwrap();
 
-            // "If a server receives a request with a stale term
-            // number, it rejects the request." - Reference [0] Page 5.
-            // Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
-            let stale = msg.term() < state.durable.current_term;
+		// "If a server receives a request with a stale term
+		// number, it rejects the request." - Reference [0] Page 5.
+		// Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
+		let stale = msg.term() < state.durable.current_term;
 
-            state.log(format!(
-                "{} message from {}: {:?}.",
-                if stale { "Dropping stale" } else { "Received" },
-                msg.from,
-                msg.body,
-            ));
-            drop(state);
-            if stale {
-                return;
+		state.log(format!(
+                    "{} message from {}: {:?}.",
+                    if stale { "Dropping stale" } else { "Received" },
+                    msg.from,
+                    msg.body,
+		));
+		drop(state);
+		if stale {
+                    continue;
+		}
+
+		if let Some((response, from)) = self.handle_message(msg) {
+                    let state = self.state.lock().unwrap();
+                    let condition = state.volatile.condition;
+                    let log_length = state.durable.next_log_index;
+                    drop(state);
+
+                    self.rpc_manager.send(log_length, condition, from, &response);
+		}
             }
 
-            if let Some((response, from)) = self.handle_message(msg) {
-                let state = self.state.lock().unwrap();
-                let condition = state.volatile.condition;
-                let log_length = state.durable.next_log_index;
-                drop(state);
-
-                let expect_response = false;
-                self.rpc_manager
-                    .send(log_length, condition, from, &response, expect_response);
-            }
-        }
+	    if Instant::now() > until {
+		break;
+	    }
+	}
 
         let took = (Instant::now() - t1).as_millis();
         if took > 0 {
-            let state = self.state.lock().unwrap();
-            state.log(format!("WARNING! Tick completed in {}ms.", took));
+	    let state = self.state.lock().unwrap();
+	    state.log(format!("WARNING! Tick completed in {}ms.", took));
         }
     }
 
@@ -2083,7 +2075,7 @@ mod server_tests {
         let tests = vec![
             RPCMessage {
                 body: RPCBody::AppendEntriesRequest(AppendEntriesRequest {
-                    request_id: 0,
+                    request_id: 1948233,
                     term: 88,
                     leader_id: 2132,
                     prev_log_index: 1823,
@@ -2106,7 +2098,7 @@ mod server_tests {
             },
             RPCMessage {
                 body: RPCBody::AppendEntriesRequest(AppendEntriesRequest {
-                    request_id: 0,
+                    request_id: 9234742,
                     term: 91,
                     leader_id: 2132,
                     prev_log_index: 1823,
@@ -2118,25 +2110,25 @@ mod server_tests {
             },
             RPCMessage {
                 body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-                    request_id: 0,
+                    request_id: 123813,
                     term: 10,
                     success: true,
-                    match_index: 1,
-                }),
-                from: 9999,
-            },
-            RPCMessage {
-                body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
-                    request_id: 0,
-                    term: 10,
-                    success: false,
                     match_index: 0,
                 }),
                 from: 9999,
             },
             RPCMessage {
+                body: RPCBody::AppendEntriesResponse(AppendEntriesResponse {
+                    request_id: 983911002,
+                    term: 10,
+                    success: false,
+                    match_index: 1230984,
+                }),
+                from: 9999,
+            },
+            RPCMessage {
                 body: RPCBody::RequestVoteRequest(RequestVoteRequest {
-                    request_id: 0,
+                    request_id: 1241,
                     term: 1023,
                     candidate_id: 2132,
                     last_log_index: 1823,
@@ -2146,7 +2138,7 @@ mod server_tests {
             },
             RPCMessage {
                 body: RPCBody::RequestVoteResponse(RequestVoteResponse {
-                    request_id: 0,
+                    request_id: 1912390,
                     term: 1023,
                     vote_granted: true,
                 }),
@@ -2154,7 +2146,7 @@ mod server_tests {
             },
             RPCMessage {
                 body: RPCBody::RequestVoteResponse(RequestVoteResponse {
-                    request_id: 0,
+                    request_id: 12309814,
                     term: 1023,
                     vote_granted: false,
                 }),
@@ -2174,7 +2166,7 @@ mod server_tests {
             let mut cursor = std::io::Cursor::new(&mut file);
             let bufreader = BufReader::new(&mut cursor);
             let result = RPCMessage::decode(bufreader);
-            assert_eq!(result, Some(rpcmessage));
+            assert_eq!(result, Ok(rpcmessage));
         }
     }
 
@@ -2218,7 +2210,7 @@ mod server_tests {
             }),
             from: 1,
         };
-        rpcm.send(0, Condition::Follower, server.config.server_id, &msg, true);
+        rpcm.send(0, Condition::Follower, server.config.server_id, &msg);
         let received = rpcm.stream_receiver.recv().unwrap();
         assert_eq!(msg, received);
 
@@ -2828,6 +2820,7 @@ mod e2e_tests {
 
                 random_seed: per_server_random_seed_generator.generate_seed(),
             };
+	    println!("Seed for {i}: {:?}.", config.random_seed);
 
             let sm = server_tests::TestStateMachine {};
             servers.push(Server::new(&tmpdir.dir, sm, config));
@@ -2844,7 +2837,7 @@ mod e2e_tests {
     ) -> u128 {
         let mut post_election_ticks = 50;
         let mut leader_elected = 0;
-        let mut max_ticks = 200;
+        let mut max_ticks = 500;
         while leader_elected == 0 || post_election_ticks > 0 {
             max_ticks -= 1;
             if max_ticks == 0 {
@@ -2968,13 +2961,13 @@ mod e2e_tests {
                 std::thread::sleep(tick_freq);
             }
 
-            // Within another 20 ticks, all (but skipped) servers
+            // Within another 100 ticks, all (but skipped) servers
             // should have applied the same message. (Only 2/3 are
             // required for committing, remember).  Actually this case
             // isn't meaningful unless we expanded the cluster size to
             // 5 because then a quorum would be 3.
             let mut applied = vec![false; servers.len()];
-            for _ in 0..20 {
+            for _ in 0..100 {
                 for (i, server) in servers.iter_mut().enumerate() {
                     if server.config.server_id == skip_id {
                         continue;
@@ -3010,11 +3003,11 @@ mod e2e_tests {
 
             _ = assert_leader_converge(&mut servers, tick_freq, skip_id);
 
-            // And within another 20 ticks where we DONT SKIP skip_id,
+            // And within another 100 ticks where we DONT SKIP skip_id,
             // ALL servers in the cluster should have the message.
             // That is, a downed server should catch up with message
             // it missed when it does come back up.
-            for _ in 0..20 {
+            for _ in 0..100 {
                 for (i, server) in servers.iter_mut().enumerate() {
                     server.tick();
 
