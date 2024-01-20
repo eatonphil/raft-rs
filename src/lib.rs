@@ -1538,9 +1538,8 @@ impl<SM: StateMachine> Server<SM> {
                     }
                 } else if match_index >= i {
                     state.log(format!(
-                        "Does not exist for ({}) at {i} (their term is {}, our term is {}).",
-                        server_index,
-			state.durable.current_term,
+                        "Does not exist for ({}) at {i} (term is {}, our term is {}).",
+                        server_index, e.term, state.durable.current_term,
                     ));
                 } else {
                     state.log(format!("Does not exist for ({}) at {i}.", server_index));
@@ -1685,6 +1684,21 @@ impl<SM: StateMachine> Server<SM> {
             state.volatile.match_index[i] = 0;
         }
 
+        // "First, a leader must have the latest information on which
+        // entries are committed. The Leader Completeness Property
+        // guarantees that a leader has all committed entries, but at
+        // the start of its term, it may not know which those are. To
+        // find out, it needs to commit an entry from its term. Raft
+        // handles this by having each leader commit a blank no-op
+        // entry into the log at the start of its term." - Reference
+        // [0] Page 13
+        let term = state.durable.current_term;
+        state.durable.append(&[LogEntry {
+            command: vec![],
+            term,
+            client_serial_id: 0,
+        }]);
+
         drop(state);
 
         self.leader_send_heartbeat();
@@ -1767,6 +1781,8 @@ impl<SM: StateMachine> Server<SM> {
                     state.notifications.remove(index);
                 }
             }
+
+            state.log(format!("Entries applied: {}.", state.volatile.last_applied));
         }
     }
 
@@ -1776,7 +1792,7 @@ impl<SM: StateMachine> Server<SM> {
         self.rpc_manager.start();
 
         let mut state = self.state.lock().unwrap();
-	state.reset_election_timeout();
+        state.reset_election_timeout();
         if self.config.cluster.len() == 1 {
             state.transition(Condition::Leader, 0, 0);
         }
@@ -1831,47 +1847,48 @@ impl<SM: StateMachine> Server<SM> {
         // All condition operations.
         self.apply_entries();
 
-	// Read from the backlog at least once and for at most 5ms.
-	let until = Instant::now() + Duration::from_millis(5);
-	loop {
+        // Read from the backlog at least once and for at most 5ms.
+        let until = Instant::now() + Duration::from_millis(5);
+        loop {
             if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
-		let state = self.state.lock().unwrap();
+                let state = self.state.lock().unwrap();
 
-		// "If a server receives a request with a stale term
-		// number, it rejects the request." - Reference [0] Page 5.
-		// Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
-		let stale = msg.term() < state.durable.current_term;
+                // "If a server receives a request with a stale term
+                // number, it rejects the request." - Reference [0] Page 5.
+                // Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
+                let stale = msg.term() < state.durable.current_term;
 
-		state.log(format!(
+                state.log(format!(
                     "{} message from {}: {:?}.",
                     if stale { "Dropping stale" } else { "Received" },
                     msg.from,
                     msg.body,
-		));
-		drop(state);
-		if stale {
+                ));
+                drop(state);
+                if stale {
                     continue;
-		}
+                }
 
-		if let Some((response, from)) = self.handle_message(msg) {
+                if let Some((response, from)) = self.handle_message(msg) {
                     let state = self.state.lock().unwrap();
                     let condition = state.volatile.condition;
                     let log_length = state.durable.next_log_index;
                     drop(state);
 
-                    self.rpc_manager.send(log_length, condition, from, &response);
-		}
+                    self.rpc_manager
+                        .send(log_length, condition, from, &response);
+                }
             }
 
-	    if Instant::now() > until {
-		break;
-	    }
-	}
+            if Instant::now() > until {
+                break;
+            }
+        }
 
         let took = (Instant::now() - t1).as_millis();
         if took > 0 {
-	    let state = self.state.lock().unwrap();
-	    state.log(format!("WARNING! Tick completed in {}ms.", took));
+            let state = self.state.lock().unwrap();
+            state.log(format!("WARNING! Tick completed in {}ms.", took));
         }
     }
 
@@ -2820,7 +2837,7 @@ mod e2e_tests {
 
                 random_seed: per_server_random_seed_generator.generate_seed(),
             };
-	    println!("Seed for {i}: {:?}.", config.random_seed);
+            println!("Seed for {i}: {:?}.", config.random_seed);
 
             let sm = server_tests::TestStateMachine {};
             servers.push(Server::new(&tmpdir.dir, sm, config));
@@ -2908,6 +2925,69 @@ mod e2e_tests {
         _ = assert_leader_converge(&mut servers, tick_freq, 0);
     }
 
+    fn wait_for_all_applied(
+        servers: &mut Vec<Server<server_tests::TestStateMachine>>,
+        tick_freq: Duration,
+        skip_id: u128,
+    ) {
+        let mut applied = vec![false; servers.len()];
+        let mut applied_at = vec![0; servers.len()];
+        for _ in 0..100 {
+            for (i, server) in servers.iter_mut().enumerate() {
+                if server.config.server_id == skip_id {
+                    continue;
+                }
+
+                server.tick();
+
+                let mut state = server.state.lock().unwrap();
+                let mut committed = state.volatile.commit_index + 1;
+                while committed > 0 {
+                    committed -= 1;
+
+                    let exists_in_log =
+                        state.durable.log_at_index(committed).command == "abc".as_bytes().to_vec();
+                    if exists_in_log {
+                        println!("Exists for {i} in log at entry: {committed}.");
+                        // It should not exist twice in a different location.
+                        if applied[i] {
+                            assert_eq!(applied_at[i], committed);
+                        }
+                        applied[i] = true;
+                        applied_at[i] = committed;
+                    }
+                }
+            }
+
+            // End the check as soon as we can so tests don't take
+            // unnecessarily long.
+            let mut all_applied = true;
+            for (i, server) in servers.iter().enumerate() {
+                if server.config.server_id == skip_id {
+                    continue;
+                }
+
+                if !applied[i] {
+                    all_applied = false;
+                    break;
+                }
+            }
+            if all_applied {
+                break;
+            }
+
+            std::thread::sleep(tick_freq);
+        }
+
+        for i in 0..applied.len() {
+            if servers[i].config.server_id == skip_id {
+                continue;
+            }
+
+            assert!(applied[i]);
+        }
+    }
+
     #[test]
     fn test_apply() {
         // Skipping server 0 does nothing since 0 is not a valid
@@ -2966,35 +3046,7 @@ mod e2e_tests {
             // required for committing, remember).  Actually this case
             // isn't meaningful unless we expanded the cluster size to
             // 5 because then a quorum would be 3.
-            let mut applied = vec![false; servers.len()];
-            for _ in 0..100 {
-                for (i, server) in servers.iter_mut().enumerate() {
-                    if server.config.server_id == skip_id {
-                        continue;
-                    }
-
-                    server.tick();
-
-                    let mut state = server.state.lock().unwrap();
-                    if state.volatile.commit_index == 1 {
-                        assert_eq!(
-                            state.durable.log_at_index(1).command,
-                            "abc".as_bytes().to_vec()
-                        );
-                        applied[i] = true;
-                    }
-                }
-
-                std::thread::sleep(tick_freq);
-            }
-
-            for i in 0..applied.len() {
-                if servers[i].config.server_id == skip_id {
-                    continue;
-                }
-
-                assert!(applied[i]);
-            }
+            wait_for_all_applied(&mut servers, tick_freq, skip_id);
 
             println!("\n\nBringing skipped server back.\n\n");
 
@@ -3007,27 +3059,8 @@ mod e2e_tests {
             // ALL servers in the cluster should have the message.
             // That is, a downed server should catch up with message
             // it missed when it does come back up.
-            for _ in 0..100 {
-                for (i, server) in servers.iter_mut().enumerate() {
-                    server.tick();
-
-                    let mut state = server.state.lock().unwrap();
-                    if state.volatile.commit_index == 1 {
-                        assert_eq!(
-                            state.durable.log_at_index(1).command,
-                            "abc".as_bytes().to_vec()
-                        );
-                        applied[i] = true;
-                    }
-                }
-
-                std::thread::sleep(tick_freq);
-            }
-
-            for i in 0..applied.len() {
-                println!("Applied? {i}.");
-                assert!(applied[i]);
-            }
+            let skip_id = 0; // 0 is so that none are skipped since 0 isn't a valid id.
+            wait_for_all_applied(&mut servers, tick_freq, skip_id);
         }
     }
 }
