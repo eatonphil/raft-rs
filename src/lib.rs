@@ -2988,79 +2988,90 @@ mod e2e_tests {
         }
     }
 
-    #[test]
-    fn test_apply() {
-        // Skipping server 0 does nothing since 0 is not a valid
-        // server id. Skipping `1` checks to make sure application
-        // still happens even with 2/3 servers up.
-        for skip_id in [0, 1].into_iter() {
-            let tmpdir = server_tests::TmpDir::new();
-            let port = 20033;
-            let (mut servers, tick_freq) = test_cluster(&tmpdir, port);
+    fn test_apply_skip_id(skip_id: u128, port: u16) {
+	let tmpdir = server_tests::TmpDir::new();
+        let (mut servers, tick_freq) = test_cluster(&tmpdir, port);
+
+        for server in servers.iter_mut() {
+            if server.config.server_id == skip_id as u128 {
+                server.stop();
+            }
+        }
+
+        let leader_id = assert_leader_converge(&mut servers, tick_freq, skip_id);
+        assert_ne!(leader_id, skip_id);
+
+        let cmds = vec!["abc".as_bytes().to_vec()];
+        let cmd_ids = vec![1];
+        let channel = 'channel: {
+            for server in servers.iter_mut() {
+                if server.config.server_id == leader_id {
+                    break 'channel server.apply(cmds, cmd_ids);
+                }
+            }
+
+            unreachable!("Invalid leader.");
+        };
+
+        // Message should be applied in cluster within 20 ticks.
+        for _ in 0..20 {
+            if let Ok(result) = channel.try_recv() {
+                if let ApplyResult::Ok(msg) = result {
+                    assert_eq!(msg, "abc".as_bytes().to_vec());
+                } else {
+                    panic!("Expected ok result.");
+                }
+                break;
+            }
 
             for server in servers.iter_mut() {
-                if server.config.server_id == skip_id as u128 {
-                    server.stop();
+                if server.config.server_id == skip_id {
+                    continue;
                 }
+
+                server.tick();
             }
 
-            let leader_id = assert_leader_converge(&mut servers, tick_freq, skip_id);
-            assert_ne!(leader_id, skip_id);
-
-            let cmds = vec!["abc".as_bytes().to_vec()];
-            let cmd_ids = vec![1];
-            let channel = 'channel: {
-                for server in servers.iter_mut() {
-                    if server.config.server_id == leader_id {
-                        break 'channel server.apply(cmds, cmd_ids);
-                    }
-                }
-
-                unreachable!("Invalid leader.");
-            };
-
-            // Message should be applied in cluster within 20 ticks.
-            for _ in 0..20 {
-                if let Ok(result) = channel.try_recv() {
-                    if let ApplyResult::Ok(msg) = result {
-                        assert_eq!(msg, "abc".as_bytes().to_vec());
-                    } else {
-                        panic!("Expected ok result.");
-                    }
-                    break;
-                }
-
-                for server in servers.iter_mut() {
-                    if server.config.server_id == skip_id {
-                        continue;
-                    }
-
-                    server.tick();
-                }
-
-                std::thread::sleep(tick_freq);
-            }
-
-            // Within another 100 ticks, all (but skipped) servers
-            // should have applied the same message. (Only 2/3 are
-            // required for committing, remember).  Actually this case
-            // isn't meaningful unless we expanded the cluster size to
-            // 5 because then a quorum would be 3.
-            wait_for_all_applied(&mut servers, tick_freq, skip_id);
-
-            println!("\n\nBringing skipped server back.\n\n");
-
-            drop(servers);
-            let (mut servers, tick_freq) = test_cluster(&tmpdir, port);
-
-            _ = assert_leader_converge(&mut servers, tick_freq, skip_id);
-
-            // And within another 100 ticks where we DONT SKIP skip_id,
-            // ALL servers in the cluster should have the message.
-            // That is, a downed server should catch up with message
-            // it missed when it does come back up.
-            let skip_id = 0; // 0 is so that none are skipped since 0 isn't a valid id.
-            wait_for_all_applied(&mut servers, tick_freq, skip_id);
+            std::thread::sleep(tick_freq);
         }
+
+        // Within another 100 ticks, all (but skipped) servers
+        // should have applied the same message. (Only 2/3 are
+        // required for committing, remember).  Actually this case
+        // isn't meaningful unless we expanded the cluster size to
+        // 5 because then a quorum would be 3.
+        wait_for_all_applied(&mut servers, tick_freq, skip_id);
+
+        println!("\n\nBringing skipped server back.\n\n");
+
+        drop(servers);
+        let (mut servers, tick_freq) = test_cluster(&tmpdir, port);
+
+        _ = assert_leader_converge(&mut servers, tick_freq, skip_id);
+
+        // And within another 100 ticks where we DONT SKIP skip_id,
+        // ALL servers in the cluster should have the message.
+        // That is, a downed server should catch up with message
+        // it missed when it does come back up.
+        let skip_id = 0; // 0 is so that none are skipped since 0 isn't a valid id.
+        wait_for_all_applied(&mut servers, tick_freq, skip_id);
+    }
+
+    #[test]
+    fn test_apply_none_down() {
+	let port = 20033;
+	// Skipping server 0 does nothing since 0 is not a valid
+	// server id.
+	let skip_id = 0;
+	test_apply_skip_id(skip_id, port);
+    }
+
+    #[test]
+    fn test_apply_one_down() {
+	let port = 20036;
+	 // Skipping `1` checks to make sure application
+	// still happens even with 2/3 servers up.
+	let skip_id = 1;
+	test_apply_skip_id(skip_id, port);
     }
 }
