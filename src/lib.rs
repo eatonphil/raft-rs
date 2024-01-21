@@ -2989,7 +2989,7 @@ mod e2e_tests {
     }
 
     fn test_apply_skip_id(skip_id: u128, port: u16) {
-	let tmpdir = server_tests::TmpDir::new();
+        let tmpdir = server_tests::TmpDir::new();
         let (mut servers, tick_freq) = test_cluster(&tmpdir, port);
 
         for server in servers.iter_mut() {
@@ -3059,19 +3059,19 @@ mod e2e_tests {
 
     #[test]
     fn test_apply_none_down() {
-	let port = 20033;
-	// Skipping server 0 does nothing since 0 is not a valid
-	// server id.
-	let skip_id = 0;
-	test_apply_skip_id(skip_id, port);
+        let port = 20033;
+        // Skipping server 0 does nothing since 0 is not a valid
+        // server id.
+        let skip_id = 0;
+        test_apply_skip_id(skip_id, port);
     }
 
     #[test]
     fn test_apply_one_down() {
-	let port = 20036;
-	 // Skipping `1` checks to make sure application
-	// still happens even with 2/3 servers up.
-	let skip_id = 1;
-	test_apply_skip_id(skip_id, port);
+        let port = 20036;
+        // Skipping `1` checks to make sure application
+        // still happens even with 2/3 servers up.
+        let skip_id = 1;
+        test_apply_skip_id(skip_id, port);
     }
 }
