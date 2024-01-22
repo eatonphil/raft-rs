@@ -618,7 +618,7 @@ struct State {
 
 impl State {
     fn log<S: AsRef<str> + std::fmt::Display>(&self, msg: S) {
-	self.logger.log(
+        self.logger.log(
             self.durable.current_term,
             self.durable.next_log_index,
             self.volatile.condition,
@@ -1038,7 +1038,7 @@ impl RPCMessage {
 #[derive(Clone)]
 struct Logger {
     server_id: u128,
-    debug: bool
+    debug: bool,
 }
 
 impl Logger {
@@ -1049,11 +1049,11 @@ impl Logger {
         condition: Condition,
         msg: S,
     ) {
-	if !self.debug {
-	    return;
-	}
+        if !self.debug {
+            return;
+        }
 
-	println!(
+        println!(
             "[S: {: <3} T: {: <3} L: {: <3} C: {}] {}",
             self.server_id,
             term,
@@ -1084,7 +1084,7 @@ impl RPCManager {
             mpsc::Receiver<RPCMessage>,
         ) = mpsc::channel();
         RPCManager {
-	    logger,
+            logger,
             cluster,
             server_id,
             stream_sender,
@@ -1106,9 +1106,9 @@ impl RPCManager {
     fn start(&mut self) {
         let address = self.address_from_id(self.server_id);
         let listener = match std::net::TcpListener::bind(address) {
-	    Ok(l) => l,
-	    Err(e) => panic!("Could not bind to {address}: {e}."),
-	};
+            Ok(l) => l,
+            Err(e) => panic!("Could not bind to {address}: {e}."),
+        };
 
         let thread_stop = self.stop_mutex.clone();
         let thread_stream_sender = self.stream_sender.clone();
@@ -1914,12 +1914,15 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         let cluster_size = config.cluster.len();
-	let logger = Logger{server_id: config.server_id, debug: config.logger_debug};
+        let logger = Logger {
+            server_id: config.server_id,
+            debug: config.logger_debug,
+        };
         let rpc_manager = RPCManager::new(config.server_id, config.cluster.clone(), logger.clone());
         let election_frequency = config.election_frequency;
 
         let rand = Random::new(config.random_seed);
-	let id = config.server_id;
+        let id = config.server_id;
         Server {
             rpc_manager,
             config,
@@ -2199,7 +2202,12 @@ mod server_tests {
         }
     }
 
-    pub fn new_test_server(tmp: &TmpDir, port: u16, servers: usize, debug: bool) -> Server<TestStateMachine> {
+    pub fn new_test_server(
+        tmp: &TmpDir,
+        port: u16,
+        servers: usize,
+        debug: bool,
+    ) -> Server<TestStateMachine> {
         let mut cluster = vec![];
         for i in 0..servers {
             cluster.push(ServerConfig {
@@ -2215,7 +2223,7 @@ mod server_tests {
             election_frequency: Duration::from_secs(10),
 
             random_seed: [0; 4],
-	    logger_debug: debug,
+            logger_debug: debug,
         };
 
         let sm = TestStateMachine {};
@@ -2225,11 +2233,11 @@ mod server_tests {
     #[test]
     fn test_rpc_manager() {
         let tmpdir = &TmpDir::new();
-	let debug = false;
+        let debug = false;
         let server = new_test_server(&tmpdir, 20010, 2, debug);
 
-	let server_id = server.config.cluster[0].id;
-	let logger = Logger{server_id, debug};
+        let server_id = server.config.cluster[0].id;
+        let logger = Logger { server_id, debug };
         let mut rpcm = RPCManager::new(server_id, server.config.cluster.clone(), logger);
         rpcm.start();
 
@@ -2262,7 +2270,7 @@ mod server_tests {
     #[test]
     fn test_single_server_apply_end_to_end() {
         let tmpdir = &TmpDir::new();
-	let debug = false;
+        let debug = false;
         let mut server = new_test_server(&tmpdir, 20002, 1, debug);
 
         // First test apply doesn't work as not a leader.
@@ -2286,7 +2294,7 @@ mod server_tests {
     #[test]
     fn test_handle_request_vote_request() {
         let tmpdir = &TmpDir::new();
-	let debug = false;
+        let debug = false;
         let mut server = new_test_server(&tmpdir, 20003, 1, debug);
         server.init();
 
@@ -2320,7 +2328,7 @@ mod server_tests {
     #[test]
     fn test_handle_request_vote_response() {
         let tmpdir = &TmpDir::new();
-	let debug = false;
+        let debug = false;
         let mut server = new_test_server(&tmpdir, 20004, 1, debug);
         server.init();
 
@@ -2339,7 +2347,7 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_request_all_new_data() {
         let tmpdir = &TmpDir::new();
-	let debug = false;
+        let debug = false;
         let mut server = new_test_server(&tmpdir, 20007, 1, debug);
         server.init();
 
@@ -2389,7 +2397,7 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_request_overwrite() {
         let tmpdir = &TmpDir::new();
-	let debug = false;
+        let debug = false;
         let mut server = new_test_server(&tmpdir, 20008, 1, debug);
         server.init();
 
@@ -2452,7 +2460,7 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_request() {
         let tmpdir = &TmpDir::new();
-	let debug = false;
+        let debug = false;
         let mut server = new_test_server(&tmpdir, 20005, 1, debug);
         server.init();
 
@@ -2489,7 +2497,7 @@ mod server_tests {
     #[test]
     fn test_handle_append_entries_response() {
         let tmpdir = &TmpDir::new();
-	let debug = false;
+        let debug = false;
         let mut server = new_test_server(&tmpdir, 20006, 2, debug);
         server.init();
 
@@ -2835,7 +2843,7 @@ mod e2e_tests {
     fn test_cluster(
         tmpdir: &server_tests::TmpDir,
         port: u16,
-	debug: bool,
+        debug: bool,
     ) -> (Vec<Server<server_tests::TestStateMachine>>, Duration) {
         let random_seed = get_seed();
         let tick_freq = Duration::from_millis(1);
@@ -2861,7 +2869,7 @@ mod e2e_tests {
 
                 random_seed: per_server_random_seed_generator.generate_seed(),
 
-		logger_debug: debug,
+                logger_debug: debug,
             };
             println!("Seed for {i}: {:?}.", config.random_seed);
 
@@ -2911,7 +2919,7 @@ mod e2e_tests {
     #[test]
     fn test_converge_leader_no_entries() {
         let tmpdir = server_tests::TmpDir::new();
-	let debug = false;
+        let debug = false;
         let (mut servers, tick_freq) = test_cluster(&tmpdir, 20030, debug);
 
         let old_leader = assert_leader_converge(&mut servers, tick_freq, 0);
@@ -3017,7 +3025,7 @@ mod e2e_tests {
 
     fn test_apply_skip_id(skip_id: u128, port: u16) {
         let tmpdir = server_tests::TmpDir::new();
-	let debug = false;
+        let debug = false;
         let (mut servers, tick_freq) = test_cluster(&tmpdir, port, debug);
 
         for server in servers.iter_mut() {
@@ -3105,155 +3113,155 @@ mod e2e_tests {
 
     #[test]
     fn test_bulk() {
-	let port = 20039;
-	let tmpdir = server_tests::TmpDir::new();
-	let debug = false;
-	let (mut servers, tick_freq) = test_cluster(&tmpdir, port, debug);
+        let port = 20039;
+        let tmpdir = server_tests::TmpDir::new();
+        let debug = false;
+        let (mut servers, tick_freq) = test_cluster(&tmpdir, port, debug);
 
-	let mut input_senders = vec![];
-	let mut output_receivers = vec![];
+        let mut input_senders = vec![];
+        let mut output_receivers = vec![];
 
-	while servers.len() > 0 {
-	    let (input_sender, input_receiver): (
-		mpsc::Sender<Vec<Vec<u8>>>,
-		mpsc::Receiver<Vec<Vec<u8>>>,
-	    ) = mpsc::channel();
-	    input_senders.push(input_sender);
+        while servers.len() > 0 {
+            let (input_sender, input_receiver): (
+                mpsc::Sender<Vec<Vec<u8>>>,
+                mpsc::Receiver<Vec<Vec<u8>>>,
+            ) = mpsc::channel();
+            input_senders.push(input_sender);
 
-	    let (output_sender, output_receiver): (
-		mpsc::Sender<ApplyResult>,
-		mpsc::Receiver<ApplyResult>,
-	    ) = mpsc::channel();
-	    output_receivers.push(output_receiver);
+            let (output_sender, output_receiver): (
+                mpsc::Sender<ApplyResult>,
+                mpsc::Receiver<ApplyResult>,
+            ) = mpsc::channel();
+            output_receivers.push(output_receiver);
 
-	    let mut server = servers.pop().unwrap();
+            let mut server = servers.pop().unwrap();
 
             std::thread::spawn(move || {
-		let mut client_serial_id = 0;
-		let mut cluster_receivers = vec![];
-		loop {
-		    if let Ok(msgs) = input_receiver.try_recv() {
-			// Gracefully shut down when we receive an
-			// empty message, so that we can gracefully
-			// shut down when we're done in this test.
-			if msgs.len() == 0 {
-			    println!("Shutting server down.");
-			    server.stop();
-			    drop(server);
-			    return;
-			}
+                let mut client_serial_id = 0;
+                let mut cluster_receivers = vec![];
+                loop {
+                    if let Ok(msgs) = input_receiver.try_recv() {
+                        // Gracefully shut down when we receive an
+                        // empty message, so that we can gracefully
+                        // shut down when we're done in this test.
+                        if msgs.len() == 0 {
+                            println!("Shutting server down.");
+                            server.stop();
+                            drop(server);
+                            return;
+                        }
 
-			let mut ids = vec![];
-			for _ in 0..msgs.len() {
-			    client_serial_id += 1;
-			    ids.push(client_serial_id);
-			}
-			let receiver = server.apply(msgs, ids);
-			cluster_receivers.push(receiver);
-		    }
+                        let mut ids = vec![];
+                        for _ in 0..msgs.len() {
+                            client_serial_id += 1;
+                            ids.push(client_serial_id);
+                        }
+                        let receiver = server.apply(msgs, ids);
+                        cluster_receivers.push(receiver);
+                    }
 
-		    for cluster_receiver in cluster_receivers.iter() {
-			if let Ok(result) = cluster_receiver.try_recv() {
-			    output_sender.send(result).unwrap();
-			}
-		    }
+                    for cluster_receiver in cluster_receivers.iter() {
+                        if let Ok(result) = cluster_receiver.try_recv() {
+                            output_sender.send(result).unwrap();
+                        }
+                    }
 
-		    server.tick();
-		    std::thread::sleep(tick_freq);
-		}
-	    });
-	}
+                    server.tick();
+                    std::thread::sleep(tick_freq);
+                }
+            });
+        }
 
-	println!("Started servers.");
+        println!("Started servers.");
 
-	// 1 Million batches of 10 preallocate before inserting into
-	// cluster so that we don't measure allocation time.
-	let mut batches = vec![];
-	let BATCHES = 1000;
-	const BATCH_SIZE: usize = 10;
-	for i in 0..BATCHES {
-	    let mut batch = vec![vec![]; BATCH_SIZE];
-	    for j in 0..BATCH_SIZE {
-		batch[j] = format!("{}", i * BATCH_SIZE + j).as_bytes().to_vec();
-	    }
-	    batches.push(batch);
-	}
+        // 1 Million batches of 10 preallocate before inserting into
+        // cluster so that we don't measure allocation time.
+        let mut batches = vec![];
+        let BATCHES = 1000;
+        const BATCH_SIZE: usize = 10;
+        for i in 0..BATCHES {
+            let mut batch = vec![vec![]; BATCH_SIZE];
+            for j in 0..BATCH_SIZE {
+                batch[j] = format!("{}", i * BATCH_SIZE + j).as_bytes().to_vec();
+            }
+            batches.push(batch);
+        }
 
-	println!("Created batches.");
+        println!("Created batches.");
 
-	// Insert batches.
-	let t1 = Instant::now();
-	for batch in batches.iter() {
-	    for input_sender in input_senders.iter() {
-		// TODO: Could we do this to not need the clone.
-		input_sender.send(batch.clone()).unwrap();
-	    }
-	}
+        // Insert batches.
+        let t1 = Instant::now();
+        for batch in batches.iter() {
+            for input_sender in input_senders.iter() {
+                // TODO: Could we do this to not need the clone.
+                input_sender.send(batch.clone()).unwrap();
+            }
+        }
 
-	println!("Submitted batches.");
+        println!("Submitted batches.");
 
-	// Wait for completion.
-	let mut seen = 0;
-	while seen < BATCHES {
-	    for receiver in output_receivers.iter() {
-		if let Ok(result) = receiver.try_recv() {
-		    match result {
-			ApplyResult::NotALeader => { /* Do nothing. */ },
-			ApplyResult::Ok(_) => {
-			    seen += 1;
-			}
-		    }
-		}
-	    }
-	}
+        // Wait for completion.
+        let mut seen = 0;
+        while seen < BATCHES {
+            for receiver in output_receivers.iter() {
+                if let Ok(result) = receiver.try_recv() {
+                    match result {
+                        ApplyResult::NotALeader => { /* Do nothing. */ }
+                        ApplyResult::Ok(_) => {
+                            seen += 1;
+                        }
+                    }
+                }
+            }
+        }
 
-	let t = (Instant::now() - t1).as_secs_f64();
-	println!(
-	    "All batches complete in {}s. Throughput: {}/s.",
-	    t,
-	    (BATCHES as f64 * BATCH_SIZE as f64) / t,
-	);
+        let t = (Instant::now() - t1).as_secs_f64();
+        println!(
+            "All batches complete in {}s. Throughput: {}/s.",
+            t,
+            (BATCHES as f64 * BATCH_SIZE as f64) / t,
+        );
 
-	// TODO: Remaining tests.
-	if true {
-	    return;
-	}
+        // TODO: Remaining tests.
+        if true {
+            return;
+        }
 
-	// Now shut down all servers.
-	for sender in input_senders.iter() {
-	    sender.send(vec![]).unwrap();
-	}
-	// Each thread ticks for 2 seconds so give ours 4 seconds to wait.
-	std::thread::sleep(Duration::from_millis(4));
+        // Now shut down all servers.
+        for sender in input_senders.iter() {
+            sender.send(vec![]).unwrap();
+        }
+        // Each thread ticks for 2 seconds so give ours 4 seconds to wait.
+        std::thread::sleep(Duration::from_millis(4));
 
-	// Now check that batches are in all servers and in the
-	// correct order and with nothing else.
-	let (servers, _) = test_cluster(&tmpdir, port, debug);
-	for server in servers.iter() {
-	    let mut state = server.state.lock().unwrap();
-	    let mut match_index: u64 = 0;
-	    let mut checked_index = 0;
+        // Now check that batches are in all servers and in the
+        // correct order and with nothing else.
+        let (servers, _) = test_cluster(&tmpdir, port, debug);
+        for server in servers.iter() {
+            let mut state = server.state.lock().unwrap();
+            let mut match_index: u64 = 0;
+            let mut checked_index = 0;
 
-	    while match_index > BATCH_SIZE as u64 * BATCHES as u64 {
-		let expected_msg = format!("{}", match_index).as_bytes().to_vec();
-		let e = state.durable.log_at_index(checked_index);
+            while match_index > BATCH_SIZE as u64 * BATCHES as u64 {
+                let expected_msg = format!("{}", match_index).as_bytes().to_vec();
+                let e = state.durable.log_at_index(checked_index);
 
-		// It must only EITHER be 1) the one we expect or 2) an empty command.
-		if e.command == expected_msg {
-		    match_index += 1; 
-		} else {
-		    assert_eq!(e.command.len(), 0);
-		}
+                // It must only EITHER be 1) the one we expect or 2) an empty command.
+                if e.command == expected_msg {
+                    match_index += 1;
+                } else {
+                    assert_eq!(e.command.len(), 0);
+                }
 
-		checked_index += 1;
-	    }
+                checked_index += 1;
+            }
 
-	    // All remaining entries must be empty messages.
-	    while checked_index < state.durable.next_log_index - 1 {
-		let e = state.durable.log_at_index(checked_index);
-		assert_eq!(e.command.len(), 0);
-		checked_index += 1;
-	    }
-	}
+            // All remaining entries must be empty messages.
+            while checked_index < state.durable.next_log_index - 1 {
+                let e = state.durable.log_at_index(checked_index);
+                assert_eq!(e.command.len(), 0);
+                checked_index += 1;
+            }
+        }
     }
 }
