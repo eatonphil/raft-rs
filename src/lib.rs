@@ -76,7 +76,7 @@ impl PageCache {
 
     #[allow(dead_code)]
     fn len(&self) -> usize {
-        return self.page_cache.len();
+        self.page_cache.len()
     }
 
     fn read(&mut self, offset: u64, buf_into: &mut [u8; PAGESIZE as usize]) {
@@ -141,9 +141,9 @@ impl PageCache {
 
         // Store super_buf in pagecache.
         let mut i: u64 = 0;
-        while i < to_read as u64 {
+        while i < to_read {
             buf_into.copy_from_slice(&super_buf[i as usize..(i + PAGESIZE) as usize]);
-            self.insert_or_replace_in_cache(offset + i as u64, *buf_into);
+            self.insert_or_replace_in_cache(offset + i, *buf_into);
             i += PAGESIZE;
         }
 
@@ -573,12 +573,12 @@ impl DurableState {
         let mut count = 0;
         for i in 0..self.next_log_index {
             let e = self.log_at_index(i);
-            if e.command.len() > 0 {
+            if !e.command.is_empty() {
                 count += 1;
             }
         }
 
-        return count;
+        count
     }
 
     fn append(&mut self, entries: &mut [LogEntry]) {
