@@ -90,11 +90,11 @@ impl PageCache {
             return;
         }
 
-	if true {
-	    self.file.read_exact_at(&mut buf_into[0..], offset).unwrap();
-	    self.insert_or_replace_in_cache(offset, *buf_into);
-	    return;
-	}
+        if true {
+            self.file.read_exact_at(&mut buf_into[0..], offset).unwrap();
+            self.insert_or_replace_in_cache(offset, *buf_into);
+            return;
+        }
 
         // Try to always read 64KiB at a time.
         const SUPER_BUF_SIZE: usize = 65536;
@@ -114,14 +114,14 @@ impl PageCache {
                 break;
             }
 
-	    if next_offset + SUPER_BUF_SIZE as u64 > file_size {
-		if file_size < SUPER_BUF_SIZE as u64 {
-		    read_offset = 0;
-		} else {
-		    read_offset = file_size - SUPER_BUF_SIZE as u64;
-		}
-		break;
-	    }
+            if next_offset + SUPER_BUF_SIZE as u64 > file_size {
+                if file_size < SUPER_BUF_SIZE as u64 {
+                    read_offset = 0;
+                } else {
+                    read_offset = file_size - SUPER_BUF_SIZE as u64;
+                }
+                break;
+            }
 
             read_offset = next_offset;
         }
@@ -130,7 +130,7 @@ impl PageCache {
         // Make sure offset + PAGESIZE is within read_offset + to_read.
         assert_eq!(to_read % PAGESIZE, 0);
         assert!(offset >= read_offset);
-	//println!("{offset} + {PAGESIZE} <= {read_offset} + {to_read} of {file_size}");
+        //println!("{offset} + {PAGESIZE} <= {read_offset} + {to_read} of {file_size}");
         assert!(offset + PAGESIZE <= read_offset + to_read);
         assert!(read_offset + PAGESIZE <= file_size);
 
@@ -360,7 +360,7 @@ impl LogEntry {
 
         buffer[0] = 1; // Entry start marker.
         buffer[5..13].copy_from_slice(&self.term.to_le_bytes());
-	buffer[13..21].copy_from_slice(&self.index.to_le_bytes());
+        buffer[13..21].copy_from_slice(&self.index.to_le_bytes());
         buffer[21..37].copy_from_slice(&self.client_serial_id.to_le_bytes());
         buffer[37..53].copy_from_slice(&self.client_id.to_le_bytes());
         buffer[53..61].copy_from_slice(&command_length.to_le_bytes());
@@ -408,7 +408,7 @@ impl LogEntry {
     fn recover_metadata(page: &[u8; PAGESIZE as usize]) -> (LogEntry, u32, usize) {
         assert_eq!(page[0], 1); // Start of entry marker.
         let term = u64::from_le_bytes(page[5..13].try_into().unwrap());
-	let index = u64::from_le_bytes(page[13..21].try_into().unwrap());
+        let index = u64::from_le_bytes(page[13..21].try_into().unwrap());
         let client_serial_id = u128::from_le_bytes(page[21..37].try_into().unwrap());
         let client_id = u128::from_le_bytes(page[37..53].try_into().unwrap());
         let command_length = u64::from_le_bytes(page[53..61].try_into().unwrap()) as usize;
@@ -423,7 +423,7 @@ impl LogEntry {
 
         (
             LogEntry {
-		index,
+                index,
                 term,
                 command,
                 client_serial_id,
@@ -527,7 +527,7 @@ impl DurableState {
         if let Ok(m) = self.pagecache.file.metadata() {
             if m.len() == 0 {
                 self.append(&mut [LogEntry {
-		    index: 0,
+                    index: 0,
                     term: 0,
                     command: vec![],
                     client_serial_id: 0,
@@ -603,8 +603,8 @@ impl DurableState {
         if !entries.is_empty() {
             // Write out all new logs.
             for entry in entries.iter_mut() {
-		entry.index = self.next_log_index;
-		//println!("Entry at {} has index: {}.", self.next_log_offset, entry.index);
+                entry.index = self.next_log_index;
+                //println!("Entry at {} has index: {}.", self.next_log_offset, entry.index);
                 self.next_log_index += 1;
 
                 assert!(self.next_log_offset >= PAGESIZE);
@@ -652,56 +652,59 @@ impl DurableState {
             return self.next_log_offset;
         }
 
-	//println!("Looking for {index}.");
+        //println!("Looking for {index}.");
 
         assert!(index < self.next_log_index);
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
-	// Rather than linear search backwards, we store the index in
-	// the page itself and then do a binary search on disk.
-	let mut l = PAGESIZE;
-	let mut r = self.next_log_offset - PAGESIZE;
-	//println!("l is {l}, r is {r}");
+        // Rather than linear search backwards, we store the index in
+        // the page itself and then do a binary search on disk.
+        let mut l = PAGESIZE;
+        let mut r = self.next_log_offset - PAGESIZE;
+        //println!("l is {l}, r is {r}");
         while l <= r {
             let mut m = l + (r - l) / 2;
-	    // Round up to the nearest page.
-	    m += m % PAGESIZE;
-	    //println!("M is {m}.");
-	    assert_eq!(m % PAGESIZE, 0);
+            // Round up to the nearest page.
+            m += m % PAGESIZE;
+            //println!("M is {m}.");
+            assert_eq!(m % PAGESIZE, 0);
 
-	    // Look for a start of entry page.
-	    self.pagecache.read(m, &mut page);
-	    while page[0] != 1 {
+            // Look for a start of entry page.
+            self.pagecache.read(m, &mut page);
+            while page[0] != 1 {
                 m -= PAGESIZE;
-		self.pagecache.read(m, &mut page);
+                self.pagecache.read(m, &mut page);
             }
 
-	    // TODO: Bad idea to hardcode the offset.
-	    let current_index = u64::from_le_bytes(page[13..21].try_into().unwrap());
-	    //println!("Index found at {m} is: {current_index}. Looking for {index}.");
-	    if current_index == index {
-		return m;
-	    }
+            // TODO: Bad idea to hardcode the offset.
+            let current_index = u64::from_le_bytes(page[13..21].try_into().unwrap());
+            //println!("Index found at {m} is: {current_index}. Looking for {index}.");
+            if current_index == index {
+                return m;
+            }
 
-	    if current_index < index {
-		// Read until the next entry, set m to the next entry.
-		page[0] = 0;
-		m += PAGESIZE;
-		self.pagecache.read(m, &mut page);
-		while page[0] != 1 {
-		    m += PAGESIZE;
-		    self.pagecache.read(m, &mut page);
-		}
+            if current_index < index {
+                // Read until the next entry, set m to the next entry.
+                page[0] = 0;
+                m += PAGESIZE;
+                self.pagecache.read(m, &mut page);
+                while page[0] != 1 {
+                    m += PAGESIZE;
+                    self.pagecache.read(m, &mut page);
+                }
 
-		l = m;
-	    } else {
-		r = m - PAGESIZE;
-	    }
+                l = m;
+            } else {
+                r = m - PAGESIZE;
+            }
 
-	    //println!("l is {l}, r is {r}. index is {index}");
+            //println!("l is {l}, r is {r}. index is {index}");
         }
 
-	unreachable!("Could not find index {index} with log length: {}.", self.next_log_index);
+        unreachable!(
+            "Could not find index {index} with log length: {}.",
+            self.next_log_index
+        );
     }
 
     fn log_at_index(&mut self, i: u64) -> LogEntry {
@@ -1273,28 +1276,28 @@ impl RPCManager {
         let thread_stop = self.stop_mutex.clone();
         let thread_stream_sender = self.stream_sender.clone();
         std::thread::spawn(move || {
-	    loop {
-		let listener = match std::net::TcpListener::bind(address) {
-		    Ok(l) => l,
-		    Err(e) => panic!("Could not bind to {address}: {e}."),
-		};
+            loop {
+                let listener = match std::net::TcpListener::bind(address) {
+                    Ok(l) => l,
+                    Err(e) => panic!("Could not bind to {address}: {e}."),
+                };
 
-		for stream in listener.incoming().flatten() {
+                for stream in listener.incoming().flatten() {
                     // For this logic to be triggered, we must create a
                     // connection to our own server after setting
                     // `thread_stop` to `true`.
                     let stop = thread_stop.lock().unwrap();
                     if *stop {
-			return;
+                        return;
                     }
 
                     let bufreader = BufReader::new(stream);
                     match RPCMessage::decode(bufreader) {
-			Ok(msg) => thread_stream_sender.send(msg).unwrap(),
-			Err(msg) => panic!("Could not read request. Error: {}.", msg),
+                        Ok(msg) => thread_stream_sender.send(msg).unwrap(),
+                        Err(msg) => panic!("Could not read request. Error: {}.", msg),
                     }
-		}
-	    }
+                }
+            }
         });
     }
 
@@ -1387,7 +1390,7 @@ impl<SM: StateMachine> Server<SM> {
             assert_ne!(id, 0);
 
             entries.push(LogEntry {
-		index: 0,
+                index: 0,
                 term: state.durable.current_term,
                 command: commands[i].clone(),
                 client_serial_id: id,
@@ -1678,17 +1681,17 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-	let log_length = state.durable.next_log_index;
-	let mut max_common = log_length;
-	for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
-	    if self.config.server_index == server_index {
-		continue;
-	    }
+        let log_length = state.durable.next_log_index;
+        let mut max_common = log_length;
+        for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
+            if self.config.server_index == server_index {
+                continue;
+            }
 
-	    if match_index < max_common {
-		max_common = match_index;
-	    }
-	}
+            if match_index < max_common {
+                max_common = match_index;
+            }
+        }
 
         // Check from front to back.
         for i in (0..max_common).rev() {
@@ -1879,7 +1882,7 @@ impl<SM: StateMachine> Server<SM> {
         // [0] Page 13
         let term = state.durable.current_term;
         state.durable.append(&mut [LogEntry {
-	    index: 0,
+            index: 0,
             command: vec![],
             term,
             client_serial_id: 0,
@@ -2165,7 +2168,7 @@ mod server_tests {
         assert_eq!(
             durable.log_at_index(0),
             LogEntry {
-		index: 0,
+                index: 0,
                 term: 0,
                 command: vec![],
                 client_serial_id: 0,
@@ -2180,7 +2183,7 @@ mod server_tests {
         assert_eq!(
             durable.log_at_index(0),
             LogEntry {
-		index: 0,
+                index: 0,
                 term: 0,
                 command: vec![],
                 client_serial_id: 0,
@@ -2196,7 +2199,7 @@ mod server_tests {
         assert_eq!(
             durable.log_at_index(0),
             LogEntry {
-		index: 0,
+                index: 0,
                 term: 0,
                 command: vec![],
                 client_serial_id: 0,
@@ -2211,7 +2214,7 @@ mod server_tests {
         assert_eq!(
             durable.log_at_index(0),
             LogEntry {
-		index: 0,
+                index: 0,
                 term: 0,
                 command: vec![],
                 client_serial_id: 0,
@@ -2226,14 +2229,14 @@ mod server_tests {
 
         let mut v = Vec::<LogEntry>::new();
         v.push(LogEntry {
-	    index: 1,
+            index: 1,
             term: 0,
             command: "abcdef123456".as_bytes().to_vec(),
             client_serial_id: 0,
             client_id: 0,
         });
         v.push(LogEntry {
-	    index: 2,
+            index: 2,
             term: 0,
             command: "foobar".as_bytes().to_vec(),
             client_serial_id: 0,
@@ -2265,21 +2268,21 @@ mod server_tests {
         let longcommand2 = b"a".repeat(PAGESIZE as usize);
         let longcommand3 = b"a".repeat(1 + PAGESIZE as usize);
         v.push(LogEntry {
-	    index: 3,
+            index: 3,
             command: longcommand.to_vec(),
             term: 0,
             client_serial_id: 0,
             client_id: 0,
         });
         v.push(LogEntry {
-	    index: 4,
+            index: 4,
             command: longcommand2.to_vec(),
             term: 0,
             client_serial_id: 0,
             client_id: 0,
         });
         v.push(LogEntry {
-	    index: 5,
+            index: 5,
             command: longcommand3.to_vec(),
             term: 0,
             client_serial_id: 0,
@@ -2316,14 +2319,14 @@ mod server_tests {
                     prev_log_term: 193,
                     entries: vec![
                         LogEntry {
-			    index: 0,
+                            index: 0,
                             term: 88,
                             command: "hey there".into(),
                             client_serial_id: 102,
                             client_id: 1,
                         },
                         LogEntry {
-			    index: 0,
+                            index: 0,
                             term: 90,
                             command: "blub".into(),
                             client_serial_id: 19,
@@ -2567,7 +2570,7 @@ mod server_tests {
         drop(state);
 
         let e = LogEntry {
-	    index: 0,
+            index: 0,
             term: 0,
             command: "hey there".as_bytes().to_vec(),
             client_serial_id: 0,
@@ -2619,7 +2622,7 @@ mod server_tests {
         drop(state);
 
         let mut entries = vec![LogEntry {
-	    index: 0,
+            index: 0,
             term: 0,
             command: "abc".as_bytes().to_vec(),
             client_serial_id: 0,
@@ -2632,7 +2635,7 @@ mod server_tests {
         drop(state);
 
         let e = LogEntry {
-	    index: 0,
+            index: 0,
             // New term differing from what is stored although
             // inserted at index `1` should cause overwrite.
             term: 1,
@@ -3352,7 +3355,7 @@ mod e2e_tests {
         let mut input_senders = vec![];
         let mut output_receivers = vec![];
 
-	const BATCHES: usize = 10;
+        const BATCHES: usize = 10;
         const BATCH_SIZE: usize = 10;
 
         while servers.len() > 0 {
@@ -3471,14 +3474,14 @@ mod e2e_tests {
             (BATCHES as f64 * BATCH_SIZE as f64) / t,
         );
 
-	if let Ok(skip_check) = std::env::var("SKIP_CHECK") {
-	    if skip_check == "1" {
-		return;
-	    }
-	}
+        if let Ok(skip_check) = std::env::var("SKIP_CHECK") {
+            if skip_check == "1" {
+                return;
+            }
+        }
 
-	// Give them time to all apply logs.
-	std::thread::sleep(Duration::from_millis(5000));
+        // Give them time to all apply logs.
+        std::thread::sleep(Duration::from_millis(5000));
 
         // Now shut down all servers.
         for sender in input_senders.iter() {
@@ -3496,7 +3499,10 @@ mod e2e_tests {
             let mut match_index: u64 = 0;
             let mut checked_index = 0;
 
-	    assert_eq!(state.durable.debug_client_entry_count(), BATCH_SIZE as u64 * BATCHES as u64);
+            assert_eq!(
+                state.durable.debug_client_entry_count(),
+                BATCH_SIZE as u64 * BATCHES as u64
+            );
 
             while match_index < BATCH_SIZE as u64 * BATCHES as u64 {
                 let expected_msg = match_index.to_le_bytes().to_vec();
