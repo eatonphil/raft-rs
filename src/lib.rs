@@ -28,6 +28,11 @@ struct PageCache {
     // Page cache. Maps file offset to page.
     page_cache: std::collections::VecDeque<(u64, [u8; PAGESIZE as usize])>,
     page_cache_size: usize,
+
+    // For buffering actual writes to disk.
+    buffer: Vec<u8>,
+    buffer_write_at: Option<u64>,
+    buffer_write_at_offset: u64,
 }
 
 impl PageCache {
@@ -36,6 +41,10 @@ impl PageCache {
             file,
             page_cache_size,
             page_cache: std::collections::VecDeque::new(),
+
+            buffer: vec![],
+            buffer_write_at: None,
+            buffer_write_at_offset: 0,
         }
     }
 
@@ -52,10 +61,14 @@ impl PageCache {
             }
         }
 
+        // If it's already in the cache, just overwrite it.
         if let Some(index) = index_in_cache {
-            self.page_cache.remove(index);
+            if self.page_cache[index].1 != page {
+                self.page_cache[index] = (offset, page);
+            }
             return;
         }
+
         self.page_cache.push_back((offset, page));
 
         if self.page_cache.len() == self.page_cache_size + 1 {
@@ -77,11 +90,34 @@ impl PageCache {
     }
 
     fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
-        self.file.write_all_at(&page, offset).unwrap();
+        if self.buffer_write_at == None {
+            self.buffer_write_at = Some(offset);
+            self.buffer_write_at_offset = offset;
+        } else {
+            // Make sure we're always doing sequential writes in
+            // between self.flush() calle.
+            assert_eq!(self.buffer_write_at_offset, offset - PAGESIZE);
+            self.buffer_write_at_offset = offset;
+        }
+
+        assert_ne!(self.buffer_write_at, None);
+
+        let mut cursor = std::io::Cursor::new(&mut self.buffer);
+        let mut bufwriter = BufWriter::new(&mut cursor);
+        bufwriter.write_all(&page).unwrap();
+        drop(bufwriter);
+        drop(cursor);
+
         self.insert_or_replace_in_cache(offset, page);
     }
 
-    fn sync(&self) {
+    fn sync(&mut self) {
+        self.file
+            .write_all_at(&self.buffer, self.buffer_write_at.unwrap())
+            .unwrap();
+        self.buffer.clear();
+        self.buffer_write_at = None;
+        self.buffer_write_at_offset = 0;
         self.file.sync_all().unwrap();
     }
 }
@@ -289,19 +325,7 @@ impl LogEntry {
             pages += 1;
         }
 
-        writer.flush().unwrap();
-
         pages
-    }
-
-    fn encode_to_pagecache(
-        &self,
-        buffer: &mut [u8; PAGESIZE as usize],
-        pagecache: &mut PageCache,
-        offset: u64,
-    ) -> u64 {
-        let writer = PageCacheIO { offset, pagecache };
-        self.encode(buffer, writer)
     }
 
     fn recover_metadata(page: &[u8; PAGESIZE as usize]) -> (LogEntry, u32, usize) {
@@ -470,18 +494,30 @@ impl DurableState {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
         self.next_log_offset = self.offset_from_index(from_index);
+        // This is extremely important. Sometimes the log must be
+        // truncated. This is what does the truncation. Existing
+        // messages are not necessarily overwritten. But metadata for
+        // what the current last log index is always correct.
         self.next_log_index = from_index;
 
-        // Write out all new logs.
-        for entry in entries.iter() {
-            self.next_log_index += 1;
+        let mut writer = PageCacheIO {
+            offset: self.next_log_offset,
+            pagecache: &mut self.pagecache,
+        };
+        if entries.len() > 0 {
+            // Write out all new logs.
+            for entry in entries.iter() {
+                self.next_log_index += 1;
 
-            assert!(self.next_log_offset >= PAGESIZE);
-            let pages =
-                entry.encode_to_pagecache(&mut buffer, &mut self.pagecache, self.next_log_offset);
-            self.next_log_offset += pages * PAGESIZE;
+                assert!(self.next_log_offset >= PAGESIZE);
 
-            self.last_log_term = entry.term;
+                let pages = entry.encode(&mut buffer, &mut writer);
+                self.next_log_offset += pages * PAGESIZE;
+
+                self.last_log_term = entry.term;
+            }
+
+            writer.flush().unwrap();
         }
 
         // Write log length metadata.
@@ -889,6 +925,7 @@ impl AppendEntriesRequest {
         for entry in self.entries.iter() {
             entry.encode(&mut buffer, &mut encoder.writer);
         }
+        encoder.writer.flush().unwrap();
     }
 }
 
@@ -3178,7 +3215,7 @@ mod e2e_tests {
         // cluster so that we don't measure allocation time.
         let mut batches = vec![];
         let BATCHES = 1000;
-        const BATCH_SIZE: usize = 10;
+        const BATCH_SIZE: usize = 100;
         for i in 0..BATCHES {
             let mut batch = vec![vec![]; BATCH_SIZE];
             for j in 0..BATCH_SIZE {
@@ -3217,7 +3254,8 @@ mod e2e_tests {
 
         let t = (Instant::now() - t1).as_secs_f64();
         println!(
-            "All batches complete in {}s. Throughput: {}/s.",
+            "All batches (total entries: {}) complete in {}s. Throughput: {}/s.",
+            BATCHES * BATCH_SIZE,
             t,
             (BATCHES as f64 * BATCH_SIZE as f64) / t,
         );
