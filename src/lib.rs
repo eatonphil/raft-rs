@@ -8,7 +8,7 @@ use std::os::unix::prelude::FileExt;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const PAGESIZE: u64 = 4096;
+const PAGESIZE: u64 = 512;
 
 #[derive(Debug, PartialEq)]
 pub enum ApplyResult {
@@ -26,7 +26,7 @@ struct PageCache {
     file: std::fs::File,
 
     // Page cache. Maps file offset to page.
-    page_cache: std::collections::VecDeque<(u64, [u8; PAGESIZE as usize])>,
+    page_cache: std::collections::HashMap<u64, [u8; PAGESIZE as usize]>,
     page_cache_size: usize,
 
     // For buffering actual writes to disk.
@@ -37,10 +37,15 @@ struct PageCache {
 
 impl PageCache {
     fn new(file: std::fs::File, page_cache_size: usize) -> PageCache {
+        let mut page_cache = std::collections::HashMap::new();
+        // Allocate the space up front! The page cache should never
+        // allocate after this. This is a big deal.
+        page_cache.reserve(page_cache_size + 1);
+
         PageCache {
             file,
             page_cache_size,
-            page_cache: std::collections::VecDeque::new(),
+            page_cache,
 
             buffer: vec![],
             buffer_write_at: None,
@@ -53,40 +58,75 @@ impl PageCache {
             return;
         }
 
-        let mut index_in_cache: Option<usize> = None;
-        for (index, (existing_offset, _)) in self.page_cache.iter().enumerate() {
-            if *existing_offset == offset {
-                index_in_cache = Some(index);
-                break;
-            }
-        }
-
         // If it's already in the cache, just overwrite it.
-        if let Some(index) = index_in_cache {
-            if self.page_cache[index].1 != page {
-                self.page_cache[index] = (offset, page);
-            }
+        if self.page_cache.contains_key(&offset) {
+            self.page_cache.insert(offset, page);
             return;
         }
 
-        self.page_cache.push_back((offset, page));
+        self.page_cache.insert(offset, page);
 
         if self.page_cache.len() == self.page_cache_size + 1 {
-            self.page_cache.pop_front();
+            self.page_cache.remove(&offset);
         }
     }
 
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        return self.page_cache.len();
+    }
+
     fn read(&mut self, offset: u64, buf_into: &mut [u8; PAGESIZE as usize]) {
+        // For now, must to read() while a `write()` is ongoing. See
+        // the comment in `self.write()`.
+        assert_eq!(self.buffer_write_at, None);
+
         assert_eq!(buf_into.len(), PAGESIZE as usize);
-        for (existing_offset, page) in self.page_cache.iter() {
-            if *existing_offset == offset {
-                buf_into.copy_from_slice(page);
-                return;
-            }
+        if let Some(page) = self.page_cache.get(&offset) {
+            buf_into.copy_from_slice(page);
+            return;
         }
 
-        self.file.read_exact_at(buf_into, offset).unwrap();
-        self.insert_or_replace_in_cache(offset, *buf_into);
+        // Try to always read 64KiB at a time.
+        const SUPER_BUF_SIZE: usize = 65536;
+
+        // TODO: Track file size ourselves?
+        let file_size = self.file.metadata().unwrap().len();
+
+        // Find the 64KiB chunk (or as big as we can) where `offset` falls inside.
+        let mut read_offset = 0;
+        while read_offset < offset {
+            if read_offset + SUPER_BUF_SIZE as u64 > file_size {
+                break;
+            }
+
+            read_offset += SUPER_BUF_SIZE as u64;
+        }
+        let to_read = std::cmp::min(file_size - read_offset, SUPER_BUF_SIZE as u64);
+
+        // Make sure offset + PAGESIZE is within read_offset + to_read.
+        assert_eq!(to_read % PAGESIZE, 0);
+        assert!(offset >= read_offset);
+        assert!(read_offset + PAGESIZE <= read_offset + to_read);
+
+        let mut super_buf = vec![0; to_read as usize];
+        self.file
+            .read_exact_at(&mut super_buf, read_offset)
+            .unwrap();
+
+        // Store super_buf in pagecache.
+        let mut i: u64 = 0;
+        while i < to_read as u64 {
+            buf_into.copy_from_slice(&super_buf[i as usize..(i + PAGESIZE) as usize]);
+            self.insert_or_replace_in_cache(offset + i as u64, *buf_into);
+            i += PAGESIZE;
+        }
+
+        // Return the requested page.
+        let offset_in_super_buf = (offset - read_offset) as usize;
+        buf_into.copy_from_slice(
+            &super_buf[offset_in_super_buf..offset_in_super_buf + PAGESIZE as usize],
+        );
     }
 
     fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
@@ -95,17 +135,22 @@ impl PageCache {
             self.buffer_write_at_offset = offset;
         } else {
             // Make sure we're always doing sequential writes in
-            // between self.flush() calle.
+            // between self.flush() call.
             assert_eq!(self.buffer_write_at_offset, offset - PAGESIZE);
             self.buffer_write_at_offset = offset;
         }
 
         assert_ne!(self.buffer_write_at, None);
 
-        let mut cursor = std::io::Cursor::new(&mut self.buffer);
-        let mut bufwriter = BufWriter::new(&mut cursor);
-        bufwriter.write_all(&page).unwrap();
-        drop(bufwriter);
+        // TODO: It is potentially unsafe if we are doing reads
+        // inbetween writes. That isn't possible in the current
+        // code. The case to worry about would be `self.write()`
+        // before `self.sync()` where the pagecache gets filled up and
+        // this particular page isn't in the pagecache and hasn't yet
+        // been written to disk. The only correct thing to do would be
+        // for `self.read()` to also check `self.buffer` before
+        // reading from disk.
+        self.buffer.extend(page);
 
         self.insert_or_replace_in_cache(offset, page);
     }
@@ -143,14 +188,16 @@ mod pagecache_tests {
             let third_page = [b'c'; PAGESIZE as usize];
             let mut p = PageCache::new(file, cache_size);
             p.write(0, first_page);
-            assert!(p.page_cache.len() <= cache_size);
+            assert!(p.len() <= cache_size);
             if cache_size > 0 {
-                assert!(p.page_cache.len() > 0);
+                assert!(p.len() > 0);
             }
+            p.sync();
+
             p.write(PAGESIZE * 2, third_page);
-            assert!(p.page_cache.len() <= cache_size);
+            assert!(p.len() <= cache_size);
             if cache_size > 0 {
-                assert!(p.page_cache.len() > 0);
+                assert!(p.len() > 0);
             }
             p.sync();
 
@@ -177,21 +224,21 @@ mod pagecache_tests {
             let mut p = PageCache::new(file, cache_size);
             let mut page = [0; PAGESIZE as usize];
             p.read(0, &mut page);
-            assert!(p.page_cache.len() <= cache_size);
+            assert!(p.len() <= cache_size);
             if cache_size > 0 {
-                assert!(p.page_cache.len() > 0);
+                assert!(p.len() > 0);
             }
             assert_eq!(page, first_page);
             p.read(PAGESIZE, &mut page);
-            assert!(p.page_cache.len() <= cache_size);
+            assert!(p.len() <= cache_size);
             if cache_size > 0 {
-                assert!(p.page_cache.len() > 0);
+                assert!(p.len() > 0);
             }
             assert_eq!(page, second_page);
             p.read(PAGESIZE * 2, &mut page);
-            assert!(p.page_cache.len() <= cache_size);
+            assert!(p.len() <= cache_size);
             if cache_size > 0 {
-                assert!(p.page_cache.len() > 0);
+                assert!(p.len() > 0);
             }
             assert_eq!(page, third_page);
         }
@@ -431,7 +478,7 @@ impl DurableState {
             last_log_term: 0,
             next_log_index: 0,
             next_log_offset: PAGESIZE,
-            pagecache: PageCache::new(file, 1000),
+            pagecache: PageCache::new(file, 100_000),
 
             current_term: 0,
             voted_for: 0,
@@ -2089,7 +2136,7 @@ mod server_tests {
         let prev_offset = durable.next_log_offset;
         drop(durable);
 
-        // Start up and restore. Should have two entries.
+        // Start up and restore. Should have three entries.
         let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(prev_offset, durable.next_log_offset);
@@ -2907,7 +2954,6 @@ mod e2e_tests {
 
                 logger_debug: debug,
             };
-            println!("Seed for {i}: {:?}.", config.random_seed);
 
             let sm = server_tests::TestStateMachine {};
             servers.push(Server::new(&tmpdir.dir, sm, config));
@@ -3213,7 +3259,7 @@ mod e2e_tests {
         // 1 Million batches of 10 preallocate before inserting into
         // cluster so that we don't measure allocation time.
         let mut batches = vec![];
-        let BATCHES = 1000;
+        const BATCHES: usize = 1000;
         const BATCH_SIZE: usize = 100;
         for i in 0..BATCHES {
             let mut batch = vec![vec![]; BATCH_SIZE];
