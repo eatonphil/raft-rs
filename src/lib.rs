@@ -90,7 +90,7 @@ impl PageCache {
     }
 
     fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
-        if self.buffer_write_at == None {
+        if self.buffer_write_at.is_none() {
             self.buffer_write_at = Some(offset);
             self.buffer_write_at_offset = offset;
         } else {
@@ -106,7 +106,6 @@ impl PageCache {
         let mut bufwriter = BufWriter::new(&mut cursor);
         bufwriter.write_all(&page).unwrap();
         drop(bufwriter);
-        drop(cursor);
 
         self.insert_or_replace_in_cache(offset, page);
     }
@@ -355,7 +354,7 @@ impl LogEntry {
 
     fn recover_overflow(
         page: &[u8; PAGESIZE as usize],
-        command: &mut Vec<u8>,
+        command: &mut [u8],
         command_read: usize,
     ) -> usize {
         let to_read = command.len() - command_read;
@@ -504,7 +503,7 @@ impl DurableState {
             offset: self.next_log_offset,
             pagecache: &mut self.pagecache,
         };
-        if entries.len() > 0 {
+        if !entries.is_empty() {
             // Write out all new logs.
             for entry in entries.iter() {
                 self.next_log_index += 1;
