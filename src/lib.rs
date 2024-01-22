@@ -13,14 +13,13 @@ const PAGESIZE: u64 = 512;
 #[derive(Debug, PartialEq)]
 pub enum ApplyResult {
     NotALeader,
-    Ok(Vec<u8>),
+    Ok,
 }
 
 pub trait StateMachine {
     fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>>;
 }
 
-// FIFO-based cache of file pages.
 struct PageCache {
     // Backing file.
     file: std::fs::File,
@@ -59,16 +58,20 @@ impl PageCache {
         }
 
         // If it's already in the cache, just overwrite it.
-        if self.page_cache.contains_key(&offset) {
-            self.page_cache.insert(offset, page);
+        if let Some(existing) = self.page_cache.get(&offset) {
+            if page != *existing {
+                self.page_cache.insert(offset, page);
+            }
             return;
         }
 
-        self.page_cache.insert(offset, page);
-
-        if self.page_cache.len() == self.page_cache_size + 1 {
-            self.page_cache.remove(&offset);
+        // TODO: Come up with a better cache policy.
+        if self.page_cache.len() == self.page_cache_size {
+            self.page_cache.clear();
         }
+
+        // Otherwise insert and evict something if we're out of space.
+        self.page_cache.insert(offset, page);
     }
 
     #[allow(dead_code)]
@@ -87,6 +90,11 @@ impl PageCache {
             return;
         }
 
+	if true {
+	    self.file.read_exact_at(&mut buf_into[0..], offset).unwrap();
+	    return;
+	}
+
         // Try to always read 64KiB at a time.
         const SUPER_BUF_SIZE: usize = 65536;
 
@@ -95,19 +103,35 @@ impl PageCache {
 
         // Find the 64KiB chunk (or as big as we can) where `offset` falls inside.
         let mut read_offset = 0;
-        while read_offset < offset {
-            if read_offset + SUPER_BUF_SIZE as u64 > file_size {
+        loop {
+            let next_offset = read_offset + SUPER_BUF_SIZE as u64;
+            if next_offset >= file_size {
                 break;
             }
 
-            read_offset += SUPER_BUF_SIZE as u64;
+            if next_offset > offset {
+                break;
+            }
+
+	    if next_offset + SUPER_BUF_SIZE as u64 > file_size {
+		if file_size < SUPER_BUF_SIZE as u64 {
+		    read_offset = 0;
+		} else {
+		    read_offset = file_size - SUPER_BUF_SIZE as u64;
+		}
+		break;
+	    }
+
+            read_offset = next_offset;
         }
         let to_read = std::cmp::min(file_size - read_offset, SUPER_BUF_SIZE as u64);
 
         // Make sure offset + PAGESIZE is within read_offset + to_read.
         assert_eq!(to_read % PAGESIZE, 0);
         assert!(offset >= read_offset);
-        assert!(read_offset + PAGESIZE <= read_offset + to_read);
+	//println!("{offset} + {PAGESIZE} <= {read_offset} + {to_read} of {file_size}");
+        assert!(offset + PAGESIZE <= read_offset + to_read);
+        assert!(read_offset + PAGESIZE <= file_size);
 
         let mut super_buf = vec![0; to_read as usize];
         self.file
@@ -295,8 +319,9 @@ impl<'this> Write for PageCacheIO<'this> {
 // |  1 - 5                       | Checksum           |
 // |  5 - 13                      | Term               |
 // | 13 - 29                      | Client Serial Id   |
-// | 29 - 37                      | Command Length     |
-// | 37 - (37 + $Command Length$) | Command            |
+// | 29 - 45                      | Client Id          |
+// | 45 - 53                      | Command Length     |
+// | 53 - (53 + $Command Length$) | Command            |
 //
 // $Entry Start$ is `1` when the page is the start of an entry, not an
 // overflow page.
@@ -307,6 +332,7 @@ struct LogEntry {
     command: Vec<u8>,
     term: u64,
     client_serial_id: u128,
+    client_id: u128,
 }
 
 impl PartialEq for LogEntry {
@@ -317,7 +343,7 @@ impl PartialEq for LogEntry {
 
 impl LogEntry {
     fn command_first_page(command_length: usize) -> usize {
-        let page_minus_metadata = (PAGESIZE - 37) as usize;
+        let page_minus_metadata = (PAGESIZE - 53) as usize;
         if command_length <= page_minus_metadata {
             command_length
         } else {
@@ -332,15 +358,16 @@ impl LogEntry {
         buffer[0] = 1; // Entry start marker.
         buffer[5..13].copy_from_slice(&self.term.to_le_bytes());
         buffer[13..29].copy_from_slice(&self.client_serial_id.to_le_bytes());
-        buffer[29..37].copy_from_slice(&command_length.to_le_bytes());
+        buffer[29..45].copy_from_slice(&self.client_id.to_le_bytes());
+        buffer[45..53].copy_from_slice(&command_length.to_le_bytes());
 
         let mut checksum = CRC32C::new();
-        checksum.update(&buffer[5..37]);
+        checksum.update(&buffer[5..53]);
         checksum.update(&self.command);
         buffer[1..5].copy_from_slice(&checksum.sum().to_le_bytes());
 
         let command_first_page = LogEntry::command_first_page(command_length);
-        buffer[37..37 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
+        buffer[53..53 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
         command_length - command_first_page
     }
 
@@ -378,7 +405,8 @@ impl LogEntry {
         assert_eq!(page[0], 1); // Start of entry marker.
         let term = u64::from_le_bytes(page[5..13].try_into().unwrap());
         let client_serial_id = u128::from_le_bytes(page[13..29].try_into().unwrap());
-        let command_length = u64::from_le_bytes(page[29..37].try_into().unwrap()) as usize;
+        let client_id = u128::from_le_bytes(page[29..45].try_into().unwrap());
+        let command_length = u64::from_le_bytes(page[45..53].try_into().unwrap()) as usize;
         let stored_checksum = u32::from_le_bytes(page[1..5].try_into().unwrap());
 
         // recover_metadata() will only decode the first page's worth of
@@ -386,13 +414,14 @@ impl LogEntry {
         // additional pages.
         let command_first_page = LogEntry::command_first_page(command_length);
         let mut command = vec![0; command_length];
-        command[0..command_first_page].copy_from_slice(&page[37..37 + command_first_page]);
+        command[0..command_first_page].copy_from_slice(&page[53..53 + command_first_page]);
 
         (
             LogEntry {
                 term,
                 command,
                 client_serial_id,
+                client_id,
             },
             stored_checksum,
             command_first_page,
@@ -429,7 +458,7 @@ impl LogEntry {
 
         let (mut entry, stored_checksum, command_read) = LogEntry::recover_metadata(&page);
         let mut actual_checksum = CRC32C::new();
-        actual_checksum.update(&page[5..37]);
+        actual_checksum.update(&page[5..53]);
 
         let mut read = command_read;
         while read < entry.command.len() {
@@ -465,7 +494,7 @@ struct DurableState {
 }
 
 impl DurableState {
-    fn new(data_directory: &std::path::Path, id: u128) -> DurableState {
+    fn new(data_directory: &std::path::Path, id: u128, page_cache_size: usize) -> DurableState {
         let mut filename = data_directory.to_path_buf();
         filename.push(format!("server_{}.data", id));
         let file = std::fs::File::options()
@@ -478,7 +507,7 @@ impl DurableState {
             last_log_term: 0,
             next_log_index: 0,
             next_log_offset: PAGESIZE,
-            pagecache: PageCache::new(file, 100_000),
+            pagecache: PageCache::new(file, page_cache_size),
 
             current_term: 0,
             voted_for: 0,
@@ -495,6 +524,7 @@ impl DurableState {
                     term: 0,
                     command: vec![],
                     client_serial_id: 0,
+                    client_id: 0,
                 }]);
                 return;
             }
@@ -529,6 +559,18 @@ impl DurableState {
             self.next_log_offset = new_offset;
             scanned += 1;
         }
+    }
+
+    fn debug_client_entry_count(&mut self) -> u64 {
+        let mut count = 0;
+        for i in 0..self.next_log_index - 1 {
+            let e = self.log_at_index(i);
+            if e.command.len() > 0 {
+                count += 1;
+            }
+        }
+
+        return count;
     }
 
     fn append(&mut self, entries: &[LogEntry]) {
@@ -695,7 +737,6 @@ struct State {
 
     // Non-Raft state.
     stopped: bool,
-    notifications: Vec<(u128, mpsc::Sender<ApplyResult>)>,
 }
 
 impl State {
@@ -1188,29 +1229,32 @@ impl RPCManager {
 
     fn start(&mut self) {
         let address = self.address_from_id(self.server_id);
-        let listener = match std::net::TcpListener::bind(address) {
-            Ok(l) => l,
-            Err(e) => panic!("Could not bind to {address}: {e}."),
-        };
 
         let thread_stop = self.stop_mutex.clone();
         let thread_stream_sender = self.stream_sender.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                // For this logic to be triggered, we must create a
-                // connection to our own server after setting
-                // `thread_stop` to `true`.
-                let stop = thread_stop.lock().unwrap();
-                if *stop {
-                    break;
-                }
+	    loop {
+		let listener = match std::net::TcpListener::bind(address) {
+		    Ok(l) => l,
+		    Err(e) => panic!("Could not bind to {address}: {e}."),
+		};
 
-                let bufreader = BufReader::new(stream);
-                match RPCMessage::decode(bufreader) {
-                    Ok(msg) => thread_stream_sender.send(msg).unwrap(),
-                    Err(msg) => panic!("Could not read request. Error: {}.", msg),
-                }
-            }
+		for stream in listener.incoming().flatten() {
+                    // For this logic to be triggered, we must create a
+                    // connection to our own server after setting
+                    // `thread_stop` to `true`.
+                    let stop = thread_stop.lock().unwrap();
+                    if *stop {
+			return;
+                    }
+
+                    let bufreader = BufReader::new(stream);
+                    match RPCMessage::decode(bufreader) {
+			Ok(msg) => thread_stream_sender.send(msg).unwrap(),
+			Err(msg) => panic!("Could not read request. Error: {}.", msg),
+                    }
+		}
+	    }
         });
     }
 
@@ -1266,6 +1310,8 @@ pub struct Config {
 
     // Logger.
     logger_debug: bool,
+
+    page_cache_size: usize,
 }
 
 pub struct Server<SM: StateMachine> {
@@ -1275,6 +1321,9 @@ pub struct Server<SM: StateMachine> {
     rpc_manager: RPCManager,
 
     state: Mutex<State>,
+
+    client_id: u128,
+    apply_sender: mpsc::Sender<Vec<u8>>,
 }
 
 impl<SM: StateMachine> Drop for Server<SM> {
@@ -1284,40 +1333,31 @@ impl<SM: StateMachine> Drop for Server<SM> {
 }
 
 impl<SM: StateMachine> Server<SM> {
-    pub fn apply(
-        &mut self,
-        commands: Vec<Vec<u8>>,
-        command_ids: Vec<u128>,
-    ) -> mpsc::Receiver<ApplyResult> {
+    pub fn apply(&mut self, commands: Vec<Vec<u8>>, command_ids: Vec<u128>) -> ApplyResult {
         assert_eq!(commands.len(), command_ids.len());
-        let (result_sender, result_receiver): (
-            mpsc::Sender<ApplyResult>,
-            mpsc::Receiver<ApplyResult>,
-        ) = mpsc::channel();
 
         // Append commands to local durable state if leader.
         let mut state = self.state.lock().unwrap();
         if state.volatile.condition != Condition::Leader {
-            result_sender.send(ApplyResult::NotALeader).unwrap();
-            return result_receiver;
+            return ApplyResult::NotALeader;
         }
 
         let mut entries = Vec::with_capacity(commands.len());
         for (i, &id) in command_ids.iter().enumerate() {
             assert_ne!(id, 0);
-            state.notifications.push((id, result_sender.clone()));
 
             entries.push(LogEntry {
                 term: state.durable.current_term,
                 command: commands[i].clone(),
                 client_serial_id: id,
+                client_id: self.client_id,
             });
         }
 
         state.durable.append(&entries);
 
         // TODO: How to handle timeouts?
-        result_receiver
+        ApplyResult::Ok
     }
 
     fn handle_request_vote_request(
@@ -1687,7 +1727,7 @@ impl<SM: StateMachine> Server<SM> {
                 };
 
             let mut entries = vec![];
-            if state.durable.next_log_index >= next_index {
+            if state.durable.next_log_index > next_index {
                 let max_entries = 0xFF; // Length must fit into a byte.
                 for i in 0..max_entries {
                     let index = i + next_index;
@@ -1791,6 +1831,7 @@ impl<SM: StateMachine> Server<SM> {
             command: vec![],
             term,
             client_serial_id: 0,
+            client_id: 0,
         }]);
 
         drop(state);
@@ -1860,19 +1901,8 @@ impl<SM: StateMachine> Server<SM> {
             let results = self.sm.apply(to_apply);
             for (i, result) in results.into_iter().enumerate() {
                 let e = state.durable.log_at_index(starting_index + i as u64);
-                let mut notification_to_drop = None;
-                for (notification, (client_serial_id, sender)) in
-                    state.notifications.iter().enumerate()
-                {
-                    if *client_serial_id == e.client_serial_id {
-                        notification_to_drop = Some(notification);
-                        sender.send(ApplyResult::Ok(result)).unwrap();
-                        break;
-                    }
-                }
-
-                if let Some(index) = notification_to_drop {
-                    state.notifications.remove(index);
+                if e.client_id == self.client_id {
+                    self.apply_sender.send(result).unwrap();
                 }
             }
 
@@ -1991,10 +2021,18 @@ impl<SM: StateMachine> Server<SM> {
         state.durable.restore();
     }
 
-    pub fn new(data_directory: &std::path::Path, sm: SM, config: Config) -> Server<SM> {
+    pub fn new(
+        client_id: u128,
+        data_directory: &std::path::Path,
+        sm: SM,
+        config: Config,
+    ) -> (Server<SM>, mpsc::Receiver<Vec<u8>>) {
         for server in config.cluster.iter() {
             assert_ne!(server.id, 0);
         }
+
+        // 0 is reserved for control messages.
+        assert!(client_id > 0);
 
         let cluster_size = config.cluster.len();
         let logger = Logger {
@@ -2006,19 +2044,30 @@ impl<SM: StateMachine> Server<SM> {
 
         let rand = Random::new(config.random_seed);
         let id = config.server_id;
-        Server {
-            rpc_manager,
-            config,
-            sm,
+        let page_cache_size = config.page_cache_size;
 
-            state: Mutex::new(State {
-                durable: DurableState::new(data_directory, id),
-                volatile: VolatileState::new(cluster_size, election_frequency, rand),
-                logger,
-                stopped: false,
-                notifications: Vec::new(),
-            }),
-        }
+        let (apply_sender, apply_receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) =
+            mpsc::channel();
+
+        (
+            Server {
+                client_id,
+
+                rpc_manager,
+                config,
+                sm,
+
+                apply_sender,
+
+                state: Mutex::new(State {
+                    durable: DurableState::new(data_directory, id, page_cache_size),
+                    volatile: VolatileState::new(cluster_size, election_frequency, rand),
+                    logger,
+                    stopped: false,
+                }),
+            },
+            apply_receiver,
+        )
     }
 }
 
@@ -2048,7 +2097,7 @@ mod server_tests {
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.dir).unwrap();
+            //std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
@@ -2056,7 +2105,7 @@ mod server_tests {
     fn test_update_and_restore() {
         let tmp = TmpDir::new();
 
-        let mut durable = DurableState::new(&tmp.dir, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1, 1);
         durable.restore();
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, 0);
@@ -2066,7 +2115,8 @@ mod server_tests {
             LogEntry {
                 term: 0,
                 command: vec![],
-                client_serial_id: 0
+                client_serial_id: 0,
+                client_id: 0,
             }
         );
 
@@ -2079,12 +2129,13 @@ mod server_tests {
             LogEntry {
                 term: 0,
                 command: vec![],
-                client_serial_id: 0
+                client_serial_id: 0,
+                client_id: 0,
             }
         );
         drop(durable);
 
-        let mut durable = DurableState::new(&tmp.dir, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1, 1);
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, 0);
         assert_eq!(durable.next_log_index, 0);
@@ -2093,7 +2144,8 @@ mod server_tests {
             LogEntry {
                 term: 0,
                 command: vec![],
-                client_serial_id: 0
+                client_serial_id: 0,
+                client_id: 0,
             }
         );
 
@@ -2106,7 +2158,8 @@ mod server_tests {
             LogEntry {
                 term: 0,
                 command: vec![],
-                client_serial_id: 0
+                client_serial_id: 0,
+                client_id: 0,
             }
         );
     }
@@ -2120,15 +2173,17 @@ mod server_tests {
             term: 0,
             command: "abcdef123456".as_bytes().to_vec(),
             client_serial_id: 0,
+            client_id: 0,
         });
         v.push(LogEntry {
             term: 0,
             command: "foobar".as_bytes().to_vec(),
             client_serial_id: 0,
+            client_id: 0,
         });
 
         // Write two entries and shut down.
-        let mut durable = DurableState::new(&tmp.dir, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1, 1);
         durable.restore();
         assert_eq!(durable.next_log_index, 1);
         durable.append(&v);
@@ -2137,7 +2192,7 @@ mod server_tests {
         drop(durable);
 
         // Start up and restore. Should have three entries.
-        let mut durable = DurableState::new(&tmp.dir, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1, 1);
         durable.restore();
         assert_eq!(prev_offset, durable.next_log_offset);
         assert_eq!(durable.next_log_index, 3);
@@ -2155,16 +2210,19 @@ mod server_tests {
             command: longcommand.to_vec(),
             term: 0,
             client_serial_id: 0,
+            client_id: 0,
         });
         v.push(LogEntry {
             command: longcommand2.to_vec(),
             term: 0,
             client_serial_id: 0,
+            client_id: 0,
         });
         v.push(LogEntry {
             command: longcommand3.to_vec(),
             term: 0,
             client_serial_id: 0,
+            client_id: 0,
         });
         durable.append(&v);
 
@@ -2177,7 +2235,7 @@ mod server_tests {
         drop(durable);
 
         // Start up and restore. Should now have 8 entries.
-        let mut durable = DurableState::new(&tmp.dir, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1, 1);
         durable.restore();
         assert_eq!(durable.next_log_index, 8);
         for (i, entry) in all.iter().enumerate() {
@@ -2200,11 +2258,13 @@ mod server_tests {
                             term: 88,
                             command: "hey there".into(),
                             client_serial_id: 102,
+                            client_id: 1,
                         },
                         LogEntry {
                             term: 90,
                             command: "blub".into(),
                             client_serial_id: 19,
+                            client_id: 1,
                         },
                     ],
                     leader_commit: 95,
@@ -2285,12 +2345,12 @@ mod server_tests {
         }
     }
 
-    pub fn new_test_server(
+    pub fn test_server(
         tmp: &TmpDir,
         port: u16,
         servers: usize,
         debug: bool,
-    ) -> Server<TestStateMachine> {
+    ) -> (Server<TestStateMachine>, mpsc::Receiver<Vec<u8>>) {
         let mut cluster = vec![];
         for i in 0..servers {
             cluster.push(ServerConfig {
@@ -2307,17 +2367,18 @@ mod server_tests {
 
             random_seed: [0; 4],
             logger_debug: debug,
+            page_cache_size: 100,
         };
 
         let sm = TestStateMachine {};
-        return Server::new(&tmp.dir, sm, config);
+        return Server::new(1, &tmp.dir, sm, config);
     }
 
     #[test]
     fn test_rpc_manager() {
         let tmpdir = &TmpDir::new();
         let debug = false;
-        let server = new_test_server(&tmpdir, 20010, 2, debug);
+        let (server, _) = test_server(&tmpdir, 20010, 2, debug);
 
         let server_id = server.config.cluster[0].id;
         let logger = Logger { server_id, debug };
@@ -2354,31 +2415,34 @@ mod server_tests {
     fn test_single_server_apply_end_to_end() {
         let tmpdir = &TmpDir::new();
         let debug = false;
-        let mut server = new_test_server(&tmpdir, 20002, 1, debug);
+        let (mut server, result_receiver) = test_server(&tmpdir, 20002, 1, debug);
 
         // First test apply doesn't work as not a leader.
-        let result_receiver = server.apply(vec![vec![]], vec![1]);
+        let apply_result = server.apply(vec![vec![]], vec![1]);
         // Use try_recv() not recv() since recv() would block so the
         // test would hang if the logic were ever wrong. try_recv() is
         // correct since the message *must* at this point be available
         // to read.
-        assert_eq!(result_receiver.try_recv().unwrap(), ApplyResult::NotALeader);
+        assert_eq!(apply_result, ApplyResult::NotALeader);
 
         // Now after initializing (realizing there's only one server, so is leader), try again.
         server.init();
 
-        let result_receiver = server.apply(vec!["abc".as_bytes().to_vec()], vec![1]);
+        let apply_result = server.apply(vec!["abc".as_bytes().to_vec()], vec![1]);
+        assert_eq!(apply_result, ApplyResult::Ok);
+
         server.tick();
+
         // See above note about try_recv() vs recv().
         let result = result_receiver.try_recv().unwrap();
-        assert_eq!(result, ApplyResult::Ok("abc".as_bytes().to_vec()));
+        assert_eq!(result, "abc".as_bytes().to_vec());
     }
 
     #[test]
     fn test_handle_request_vote_request() {
         let tmpdir = &TmpDir::new();
         let debug = false;
-        let mut server = new_test_server(&tmpdir, 20003, 1, debug);
+        let (mut server, _) = test_server(&tmpdir, 20003, 1, debug);
         server.init();
 
         let msg = RequestVoteRequest {
@@ -2412,7 +2476,7 @@ mod server_tests {
     fn test_handle_request_vote_response() {
         let tmpdir = &TmpDir::new();
         let debug = false;
-        let mut server = new_test_server(&tmpdir, 20004, 1, debug);
+        let (mut server, _) = test_server(&tmpdir, 20004, 1, debug);
         server.init();
 
         let msg = RequestVoteResponse {
@@ -2431,7 +2495,7 @@ mod server_tests {
     fn test_handle_append_entries_request_all_new_data() {
         let tmpdir = &TmpDir::new();
         let debug = false;
-        let mut server = new_test_server(&tmpdir, 20007, 1, debug);
+        let (mut server, _) = test_server(&tmpdir, 20007, 1, debug);
         server.init();
 
         // Must be a follower to accept entries.
@@ -2443,6 +2507,7 @@ mod server_tests {
             term: 0,
             command: "hey there".as_bytes().to_vec(),
             client_serial_id: 0,
+            client_id: 1,
         };
         let msg = AppendEntriesRequest {
             request_id: 90,
@@ -2481,7 +2546,7 @@ mod server_tests {
     fn test_handle_append_entries_request_overwrite() {
         let tmpdir = &TmpDir::new();
         let debug = false;
-        let mut server = new_test_server(&tmpdir, 20008, 1, debug);
+        let (mut server, _) = test_server(&tmpdir, 20008, 1, debug);
         server.init();
 
         // Must be a follower to accept entries.
@@ -2493,6 +2558,7 @@ mod server_tests {
             term: 0,
             command: "abc".as_bytes().to_vec(),
             client_serial_id: 0,
+            client_id: 1,
         }];
 
         let mut state = server.state.lock().unwrap();
@@ -2506,6 +2572,7 @@ mod server_tests {
             term: 1,
             command: "hey there".as_bytes().to_vec(),
             client_serial_id: 0,
+            client_id: 1,
         };
         let msg = AppendEntriesRequest {
             request_id: 100,
@@ -2544,7 +2611,7 @@ mod server_tests {
     fn test_handle_append_entries_request() {
         let tmpdir = &TmpDir::new();
         let debug = false;
-        let mut server = new_test_server(&tmpdir, 20005, 1, debug);
+        let (mut server, _) = test_server(&tmpdir, 20005, 1, debug);
         server.init();
 
         let msg = AppendEntriesRequest {
@@ -2581,7 +2648,7 @@ mod server_tests {
     fn test_handle_append_entries_response() {
         let tmpdir = &TmpDir::new();
         let debug = false;
-        let mut server = new_test_server(&tmpdir, 20006, 2, debug);
+        let (mut server, _) = test_server(&tmpdir, 20006, 2, debug);
         server.init();
 
         let mut state = server.state.lock().unwrap();
@@ -2927,7 +2994,11 @@ mod e2e_tests {
         tmpdir: &server_tests::TmpDir,
         port: u16,
         debug: bool,
-    ) -> (Vec<Server<server_tests::TestStateMachine>>, Duration) {
+    ) -> (
+        Vec<Server<server_tests::TestStateMachine>>,
+        Vec<mpsc::Receiver<Vec<u8>>>,
+        Duration,
+    ) {
         let random_seed = get_seed();
         let tick_freq = Duration::from_millis(1);
 
@@ -2940,7 +3011,16 @@ mod e2e_tests {
             })
         }
 
+        let page_cache_size = match std::env::var("PAGECACHE") {
+            Ok(var) => match var.parse::<usize>() {
+                Ok(size) => size,
+                _ => 1000,
+            },
+            _ => 1000,
+        };
+
         let mut servers = vec![];
+        let mut results_receivers = vec![];
         let mut per_server_random_seed_generator = Random::new(random_seed);
         for i in 0..SERVERS {
             let config = Config {
@@ -2953,14 +3033,17 @@ mod e2e_tests {
                 random_seed: per_server_random_seed_generator.generate_seed(),
 
                 logger_debug: debug,
+                page_cache_size,
             };
 
             let sm = server_tests::TestStateMachine {};
-            servers.push(Server::new(&tmpdir.dir, sm, config));
+            let (server, results_receiver) = Server::new(1, &tmpdir.dir, sm, config);
+            servers.push(server);
+            results_receivers.push(results_receiver);
             servers[i as usize].init();
         }
 
-        return (servers, tick_freq);
+        return (servers, results_receivers, tick_freq);
     }
 
     fn assert_leader_converge(
@@ -3002,7 +3085,7 @@ mod e2e_tests {
     fn test_converge_leader_no_entries() {
         let tmpdir = server_tests::TmpDir::new();
         let debug = false;
-        let (mut servers, tick_freq) = test_cluster(&tmpdir, 20030, debug);
+        let (mut servers, _, tick_freq) = test_cluster(&tmpdir, 20030, debug);
 
         let old_leader = assert_leader_converge(&mut servers, tick_freq, 0);
 
@@ -3108,7 +3191,7 @@ mod e2e_tests {
     fn test_apply_skip_id(skip_id: u128, port: u16) {
         let tmpdir = server_tests::TmpDir::new();
         let debug = false;
-        let (mut servers, tick_freq) = test_cluster(&tmpdir, port, debug);
+        let (mut servers, results_receivers, tick_freq) = test_cluster(&tmpdir, port, debug);
 
         for server in servers.iter_mut() {
             if server.config.server_id == skip_id as u128 {
@@ -3121,10 +3204,10 @@ mod e2e_tests {
 
         let cmds = vec!["abc".as_bytes().to_vec()];
         let cmd_ids = vec![1];
-        let channel = 'channel: {
-            for server in servers.iter_mut() {
+        let (apply_result, result_receiver) = 'apply_result: {
+            for (i, server) in servers.iter_mut().enumerate() {
                 if server.config.server_id == leader_id {
-                    break 'channel server.apply(cmds, cmd_ids);
+                    break 'apply_result (server.apply(cmds, cmd_ids), &results_receivers[i]);
                 }
             }
 
@@ -3133,13 +3216,13 @@ mod e2e_tests {
 
         // Message should be applied in cluster within 20 ticks.
         for _ in 0..20 {
-            if let Ok(result) = channel.try_recv() {
-                if let ApplyResult::Ok(msg) = result {
+            if let ApplyResult::Ok = apply_result {
+                if let Ok(msg) = result_receiver.try_recv() {
                     assert_eq!(msg, "abc".as_bytes().to_vec());
-                } else {
-                    panic!("Expected ok result.");
+                    break;
                 }
-                break;
+            } else {
+                panic!("Expected ok result.");
             }
 
             for server in servers.iter_mut() {
@@ -3163,7 +3246,7 @@ mod e2e_tests {
         println!("\n\nBringing skipped server back.\n\n");
 
         drop(servers);
-        let (mut servers, tick_freq) = test_cluster(&tmpdir, port, debug);
+        let (mut servers, _, tick_freq) = test_cluster(&tmpdir, port, debug);
 
         _ = assert_leader_converge(&mut servers, tick_freq, skip_id);
 
@@ -3197,16 +3280,19 @@ mod e2e_tests {
     fn test_bulk() {
         let port = 20039;
         let tmpdir = server_tests::TmpDir::new();
-        let debug = false;
-        let (mut servers, tick_freq) = test_cluster(&tmpdir, port, debug);
+        let debug = true;
+        let (mut servers, result_receivers, tick_freq) = test_cluster(&tmpdir, port, debug);
 
         let mut input_senders = vec![];
         let mut output_receivers = vec![];
 
+        const BATCHES: usize = 10;
+        const BATCH_SIZE: usize = 1000;
+
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
-                mpsc::Sender<Vec<Vec<u8>>>,
-                mpsc::Receiver<Vec<Vec<u8>>>,
+                mpsc::Sender<(Vec<Vec<u8>>, Vec<u128>)>,
+                mpsc::Receiver<(Vec<Vec<u8>>, Vec<u128>)>,
             ) = mpsc::channel();
             input_senders.push(input_sender);
 
@@ -3219,36 +3305,29 @@ mod e2e_tests {
             let mut server = servers.pop().unwrap();
 
             std::thread::spawn(move || {
-                let mut client_serial_id = 0;
-                let mut cluster_receivers = vec![];
                 loop {
-                    if let Ok(msgs) = input_receiver.try_recv() {
-                        // Gracefully shut down when we receive an
-                        // empty message, so that we can gracefully
-                        // shut down when we're done in this test.
-                        if msgs.len() == 0 {
-                            println!("Shutting server down.");
-                            server.stop();
-                            drop(server);
-                            return;
-                        }
+                    loop {
+                        if let Ok((msgs, ids)) = input_receiver.try_recv() {
+                            // println!("Server received message: {:?}, {:?}.", msgs, ids);
+                            // Gracefully shut down when we receive an
+                            // empty message, so that we can gracefully
+                            // shut down when we're done in this test.
+                            if msgs.len() == 0 {
+                                println!("Shutting server down.");
+                                server.stop();
+                                drop(server);
+                                return;
+                            }
 
-                        let mut ids = vec![];
-                        for _ in 0..msgs.len() {
-                            client_serial_id += 1;
-                            ids.push(client_serial_id);
-                        }
-                        let receiver = server.apply(msgs, ids);
-                        cluster_receivers.push(receiver);
-                    }
-
-                    for cluster_receiver in cluster_receivers.iter() {
-                        if let Ok(result) = cluster_receiver.try_recv() {
+                            let result = server.apply(msgs, ids);
                             output_sender.send(result).unwrap();
+                        } else {
+                            break;
                         }
                     }
 
                     server.tick();
+
                     std::thread::sleep(tick_freq);
                 }
             });
@@ -3259,12 +3338,11 @@ mod e2e_tests {
         // 1 Million batches of 10 preallocate before inserting into
         // cluster so that we don't measure allocation time.
         let mut batches = vec![];
-        const BATCHES: usize = 1000;
-        const BATCH_SIZE: usize = 100;
         for i in 0..BATCHES {
             let mut batch = vec![vec![]; BATCH_SIZE];
             for j in 0..BATCH_SIZE {
-                batch[j] = format!("{}", i * BATCH_SIZE + j).as_bytes().to_vec();
+                let msg = i * BATCH_SIZE + j;
+                batch[j] = msg.to_le_bytes().to_vec();
             }
             batches.push(batch);
         }
@@ -3273,10 +3351,37 @@ mod e2e_tests {
 
         // Insert batches.
         let t1 = Instant::now();
+        let mut client_serial_id: u128 = 1;
+        let mut ids = vec![0; BATCH_SIZE];
         for batch in batches.iter() {
-            for input_sender in input_senders.iter() {
-                // TODO: Could we do this to not need the clone.
-                input_sender.send(batch.clone()).unwrap();
+            for i in 0..ids.len() {
+                ids[i] = client_serial_id + i as u128;
+            }
+            // Need to keep submitting each individual batch until it
+            // is handled by someone who is a leader.
+            'batch: loop {
+                for input_sender in input_senders.iter() {
+                    // TODO: Could we do this to not need the clone.
+                    input_sender.send((batch.clone(), ids.clone())).unwrap();
+                }
+
+                for receiver in output_receivers.iter() {
+                    'inner: loop {
+                        if let Ok(result) = receiver.try_recv() {
+                            match result {
+                                ApplyResult::NotALeader => {
+                                    break 'inner;
+                                }
+                                // Otherwise keep checking until we hear it's ok.
+                                ApplyResult::Ok => {
+                                    client_serial_id += BATCH_SIZE as u128;
+                                    println!("Submitted: {}.", client_serial_id - 1);
+                                    break 'batch;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -3284,15 +3389,10 @@ mod e2e_tests {
 
         // Wait for completion.
         let mut seen = 0;
-        while seen < BATCHES {
-            for receiver in output_receivers.iter() {
-                if let Ok(result) = receiver.try_recv() {
-                    match result {
-                        ApplyResult::NotALeader => { /* Do nothing. */ }
-                        ApplyResult::Ok(_) => {
-                            seen += 1;
-                        }
-                    }
+        while seen < BATCHES * BATCH_SIZE {
+            for receiver in result_receivers.iter() {
+                if receiver.try_recv().is_ok() {
+                    seen += 1;
                 }
             }
         }
@@ -3305,28 +3405,29 @@ mod e2e_tests {
             (BATCHES as f64 * BATCH_SIZE as f64) / t,
         );
 
-        // TODO: Remaining tests.
-        if true {
-            return;
-        }
+	// Give them time to all apply logs.
+	std::thread::sleep(Duration::from_millis(5000));
 
         // Now shut down all servers.
         for sender in input_senders.iter() {
-            sender.send(vec![]).unwrap();
+            sender.send((vec![], vec![])).unwrap();
         }
-        // Each thread ticks for 2 seconds so give ours 4 seconds to wait.
-        std::thread::sleep(Duration::from_millis(4));
+
+        // Each thread ticks for 1ms so give ours 2s to wait.
+        std::thread::sleep(Duration::from_millis(2000));
 
         // Now check that batches are in all servers and in the
         // correct order and with nothing else.
-        let (servers, _) = test_cluster(&tmpdir, port, debug);
+        let (servers, _, _) = test_cluster(&tmpdir, port, debug);
         for server in servers.iter() {
             let mut state = server.state.lock().unwrap();
             let mut match_index: u64 = 0;
             let mut checked_index = 0;
 
-            while match_index > BATCH_SIZE as u64 * BATCHES as u64 {
-                let expected_msg = format!("{}", match_index).as_bytes().to_vec();
+	    assert_eq!(state.durable.debug_client_entry_count(), BATCH_SIZE as u64 * BATCHES as u64);
+
+            while match_index < BATCH_SIZE as u64 * BATCHES as u64 {
+                let expected_msg = match_index.to_le_bytes().to_vec();
                 let e = state.durable.log_at_index(checked_index);
 
                 // It must only EITHER be 1) the one we expect or 2) an empty command.
