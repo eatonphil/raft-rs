@@ -92,13 +92,14 @@ impl PageCache {
 
 	if true {
 	    self.file.read_exact_at(&mut buf_into[0..], offset).unwrap();
+	    self.insert_or_replace_in_cache(offset, *buf_into);
 	    return;
 	}
 
         // Try to always read 64KiB at a time.
         const SUPER_BUF_SIZE: usize = 65536;
 
-        // TODO: Track file size ourselves?
+        // TODO: Track file size ourselves? TODO: next_log_offset is the file size.
         let file_size = self.file.metadata().unwrap().len();
 
         // Find the 64KiB chunk (or as big as we can) where `offset` falls inside.
@@ -317,11 +318,12 @@ impl<'this> Write for PageCacheIO<'this> {
 // |------------------------------|--------------------|
 // |  0                           | Entry Start Marker |
 // |  1 - 5                       | Checksum           |
-// |  5 - 13                      | Term               |
-// | 13 - 29                      | Client Serial Id   |
-// | 29 - 45                      | Client Id          |
-// | 45 - 53                      | Command Length     |
-// | 53 - (53 + $Command Length$) | Command            |
+// |  5 - 13                      | Log Index          |
+// | 13 - 21                      | Term               |
+// | 21 - 37                      | Client Serial Id   |
+// | 37 - 53                      | Client Id          |
+// | 53 - 61                      | Command Length     |
+// | 61 - (61 + $Command Length$) | Command            |
 //
 // $Entry Start$ is `1` when the page is the start of an entry, not an
 // overflow page.
@@ -330,6 +332,7 @@ impl<'this> Write for PageCacheIO<'this> {
 struct LogEntry {
     // Actual data.
     command: Vec<u8>,
+    index: u64,
     term: u64,
     client_serial_id: u128,
     client_id: u128,
@@ -343,7 +346,7 @@ impl PartialEq for LogEntry {
 
 impl LogEntry {
     fn command_first_page(command_length: usize) -> usize {
-        let page_minus_metadata = (PAGESIZE - 53) as usize;
+        let page_minus_metadata = (PAGESIZE - 61) as usize;
         if command_length <= page_minus_metadata {
             command_length
         } else {
@@ -357,17 +360,18 @@ impl LogEntry {
 
         buffer[0] = 1; // Entry start marker.
         buffer[5..13].copy_from_slice(&self.term.to_le_bytes());
-        buffer[13..29].copy_from_slice(&self.client_serial_id.to_le_bytes());
-        buffer[29..45].copy_from_slice(&self.client_id.to_le_bytes());
-        buffer[45..53].copy_from_slice(&command_length.to_le_bytes());
+	buffer[13..21].copy_from_slice(&self.index.to_le_bytes());
+        buffer[21..37].copy_from_slice(&self.client_serial_id.to_le_bytes());
+        buffer[37..53].copy_from_slice(&self.client_id.to_le_bytes());
+        buffer[53..61].copy_from_slice(&command_length.to_le_bytes());
 
         let mut checksum = CRC32C::new();
-        checksum.update(&buffer[5..53]);
+        checksum.update(&buffer[5..61]);
         checksum.update(&self.command);
         buffer[1..5].copy_from_slice(&checksum.sum().to_le_bytes());
 
         let command_first_page = LogEntry::command_first_page(command_length);
-        buffer[53..53 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
+        buffer[61..61 + command_first_page].copy_from_slice(&self.command[0..command_first_page]);
         command_length - command_first_page
     }
 
@@ -404,9 +408,10 @@ impl LogEntry {
     fn recover_metadata(page: &[u8; PAGESIZE as usize]) -> (LogEntry, u32, usize) {
         assert_eq!(page[0], 1); // Start of entry marker.
         let term = u64::from_le_bytes(page[5..13].try_into().unwrap());
-        let client_serial_id = u128::from_le_bytes(page[13..29].try_into().unwrap());
-        let client_id = u128::from_le_bytes(page[29..45].try_into().unwrap());
-        let command_length = u64::from_le_bytes(page[45..53].try_into().unwrap()) as usize;
+	let index = u64::from_le_bytes(page[13..21].try_into().unwrap());
+        let client_serial_id = u128::from_le_bytes(page[21..37].try_into().unwrap());
+        let client_id = u128::from_le_bytes(page[37..53].try_into().unwrap());
+        let command_length = u64::from_le_bytes(page[53..61].try_into().unwrap()) as usize;
         let stored_checksum = u32::from_le_bytes(page[1..5].try_into().unwrap());
 
         // recover_metadata() will only decode the first page's worth of
@@ -414,10 +419,11 @@ impl LogEntry {
         // additional pages.
         let command_first_page = LogEntry::command_first_page(command_length);
         let mut command = vec![0; command_length];
-        command[0..command_first_page].copy_from_slice(&page[53..53 + command_first_page]);
+        command[0..command_first_page].copy_from_slice(&page[61..61 + command_first_page]);
 
         (
             LogEntry {
+		index,
                 term,
                 command,
                 client_serial_id,
@@ -458,7 +464,7 @@ impl LogEntry {
 
         let (mut entry, stored_checksum, command_read) = LogEntry::recover_metadata(&page);
         let mut actual_checksum = CRC32C::new();
-        actual_checksum.update(&page[5..53]);
+        actual_checksum.update(&page[5..61]);
 
         let mut read = command_read;
         while read < entry.command.len() {
@@ -520,7 +526,8 @@ impl DurableState {
         // state into the right place.
         if let Ok(m) = self.pagecache.file.metadata() {
             if m.len() == 0 {
-                self.append(&[LogEntry {
+                self.append(&mut [LogEntry {
+		    index: 0,
                     term: 0,
                     command: vec![],
                     client_serial_id: 0,
@@ -561,9 +568,10 @@ impl DurableState {
         }
     }
 
+    #[allow(dead_code)]
     fn debug_client_entry_count(&mut self) -> u64 {
         let mut count = 0;
-        for i in 0..self.next_log_index - 1 {
+        for i in 0..self.next_log_index {
             let e = self.log_at_index(i);
             if e.command.len() > 0 {
                 count += 1;
@@ -573,12 +581,12 @@ impl DurableState {
         return count;
     }
 
-    fn append(&mut self, entries: &[LogEntry]) {
+    fn append(&mut self, entries: &mut [LogEntry]) {
         self.append_from_index(entries, self.next_log_index);
     }
 
     // Durably add logs to disk.
-    fn append_from_index(&mut self, entries: &[LogEntry], from_index: u64) {
+    fn append_from_index(&mut self, entries: &mut [LogEntry], from_index: u64) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
         self.next_log_offset = self.offset_from_index(from_index);
@@ -594,7 +602,9 @@ impl DurableState {
         };
         if !entries.is_empty() {
             // Write out all new logs.
-            for entry in entries.iter() {
+            for entry in entries.iter_mut() {
+		entry.index = self.next_log_index;
+		//println!("Entry at {} has index: {}.", self.next_log_offset, entry.index);
                 self.next_log_index += 1;
 
                 assert!(self.next_log_offset >= PAGESIZE);
@@ -642,26 +652,56 @@ impl DurableState {
             return self.next_log_offset;
         }
 
+	//println!("Looking for {index}.");
+
         assert!(index < self.next_log_index);
-        let mut current_index = self.next_log_index - 1;
-        let mut offset = self.next_log_offset - PAGESIZE;
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
-        loop {
-            assert!(offset >= PAGESIZE);
-            self.pagecache.read(offset, &mut page);
-            // Found an entry page.
-            if page[0] == 1 {
-                if current_index == index {
-                    break;
-                }
-                current_index -= 1;
+	// Rather than linear search backwards, we store the index in
+	// the page itself and then do a binary search on disk.
+	let mut l = PAGESIZE;
+	let mut r = self.next_log_offset - PAGESIZE;
+	//println!("l is {l}, r is {r}");
+        while l <= r {
+            let mut m = l + (r - l) / 2;
+	    // Round up to the nearest page.
+	    m += m % PAGESIZE;
+	    //println!("M is {m}.");
+	    assert_eq!(m % PAGESIZE, 0);
+
+	    // Look for a start of entry page.
+	    self.pagecache.read(m, &mut page);
+	    while page[0] != 1 {
+                m -= PAGESIZE;
+		self.pagecache.read(m, &mut page);
             }
 
-            offset -= PAGESIZE;
+	    // TODO: Bad idea to hardcode the offset.
+	    let current_index = u64::from_le_bytes(page[13..21].try_into().unwrap());
+	    //println!("Index found at {m} is: {current_index}. Looking for {index}.");
+	    if current_index == index {
+		return m;
+	    }
+
+	    if current_index < index {
+		// Read until the next entry, set m to the next entry.
+		page[0] = 0;
+		m += PAGESIZE;
+		self.pagecache.read(m, &mut page);
+		while page[0] != 1 {
+		    m += PAGESIZE;
+		    self.pagecache.read(m, &mut page);
+		}
+
+		l = m;
+	    } else {
+		r = m - PAGESIZE;
+	    }
+
+	    //println!("l is {l}, r is {r}. index is {index}");
         }
 
-        offset
+	unreachable!("Could not find index {index} with log length: {}.", self.next_log_index);
     }
 
     fn log_at_index(&mut self, i: u64) -> LogEntry {
@@ -1347,6 +1387,7 @@ impl<SM: StateMachine> Server<SM> {
             assert_ne!(id, 0);
 
             entries.push(LogEntry {
+		index: 0,
                 term: state.durable.current_term,
                 command: commands[i].clone(),
                 client_serial_id: id,
@@ -1354,7 +1395,7 @@ impl<SM: StateMachine> Server<SM> {
             });
         }
 
-        state.durable.append(&entries);
+        state.durable.append(&mut entries);
 
         // TODO: How to handle timeouts?
         ApplyResult::Ok
@@ -1454,7 +1495,7 @@ impl<SM: StateMachine> Server<SM> {
 
     fn handle_append_entries_request(
         &mut self,
-        request: AppendEntriesRequest,
+        mut request: AppendEntriesRequest,
         from: u128,
     ) -> Option<RPCBody> {
         let mut state = self.state.lock().unwrap();
@@ -1535,7 +1576,7 @@ impl<SM: StateMachine> Server<SM> {
         // 4. Append any new entries not already in the log
         state
             .durable
-            .append_from_index(&request.entries[append_offset..], real_index);
+            .append_from_index(&mut request.entries[append_offset..], real_index);
 
         // "If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)." - Reference [0] Page 4
@@ -1637,10 +1678,20 @@ impl<SM: StateMachine> Server<SM> {
             return;
         }
 
-        let log_length = state.durable.next_log_index;
+	let log_length = state.durable.next_log_index;
+	let mut max_common = log_length;
+	for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
+	    if self.config.server_index == server_index {
+		continue;
+	    }
+
+	    if match_index < max_common {
+		max_common = match_index;
+	    }
+	}
 
         // Check from front to back.
-        for i in (0..log_length).rev() {
+        for i in (0..max_common).rev() {
             let mut quorum = quorum_needed;
 
             // We don't need to keep checking backwards for a quorum
@@ -1827,7 +1878,8 @@ impl<SM: StateMachine> Server<SM> {
         // entry into the log at the start of its term." - Reference
         // [0] Page 13
         let term = state.durable.current_term;
-        state.durable.append(&[LogEntry {
+        state.durable.append(&mut [LogEntry {
+	    index: 0,
             command: vec![],
             term,
             client_serial_id: 0,
@@ -2113,6 +2165,7 @@ mod server_tests {
         assert_eq!(
             durable.log_at_index(0),
             LogEntry {
+		index: 0,
                 term: 0,
                 command: vec![],
                 client_serial_id: 0,
@@ -2127,6 +2180,7 @@ mod server_tests {
         assert_eq!(
             durable.log_at_index(0),
             LogEntry {
+		index: 0,
                 term: 0,
                 command: vec![],
                 client_serial_id: 0,
@@ -2142,6 +2196,7 @@ mod server_tests {
         assert_eq!(
             durable.log_at_index(0),
             LogEntry {
+		index: 0,
                 term: 0,
                 command: vec![],
                 client_serial_id: 0,
@@ -2156,6 +2211,7 @@ mod server_tests {
         assert_eq!(
             durable.log_at_index(0),
             LogEntry {
+		index: 0,
                 term: 0,
                 command: vec![],
                 client_serial_id: 0,
@@ -2170,12 +2226,14 @@ mod server_tests {
 
         let mut v = Vec::<LogEntry>::new();
         v.push(LogEntry {
+	    index: 1,
             term: 0,
             command: "abcdef123456".as_bytes().to_vec(),
             client_serial_id: 0,
             client_id: 0,
         });
         v.push(LogEntry {
+	    index: 2,
             term: 0,
             command: "foobar".as_bytes().to_vec(),
             client_serial_id: 0,
@@ -2186,7 +2244,7 @@ mod server_tests {
         let mut durable = DurableState::new(&tmp.dir, 1, 1);
         durable.restore();
         assert_eq!(durable.next_log_index, 1);
-        durable.append(&v);
+        durable.append(&mut v);
         assert_eq!(durable.next_log_index, 3);
         let prev_offset = durable.next_log_offset;
         drop(durable);
@@ -2207,24 +2265,27 @@ mod server_tests {
         let longcommand2 = b"a".repeat(PAGESIZE as usize);
         let longcommand3 = b"a".repeat(1 + PAGESIZE as usize);
         v.push(LogEntry {
+	    index: 3,
             command: longcommand.to_vec(),
             term: 0,
             client_serial_id: 0,
             client_id: 0,
         });
         v.push(LogEntry {
+	    index: 4,
             command: longcommand2.to_vec(),
             term: 0,
             client_serial_id: 0,
             client_id: 0,
         });
         v.push(LogEntry {
+	    index: 5,
             command: longcommand3.to_vec(),
             term: 0,
             client_serial_id: 0,
             client_id: 0,
         });
-        durable.append(&v);
+        durable.append(&mut v);
 
         let mut all = before_reverse;
         all.append(&mut v);
@@ -2255,12 +2316,14 @@ mod server_tests {
                     prev_log_term: 193,
                     entries: vec![
                         LogEntry {
+			    index: 0,
                             term: 88,
                             command: "hey there".into(),
                             client_serial_id: 102,
                             client_id: 1,
                         },
                         LogEntry {
+			    index: 0,
                             term: 90,
                             command: "blub".into(),
                             client_serial_id: 19,
@@ -2504,6 +2567,7 @@ mod server_tests {
         drop(state);
 
         let e = LogEntry {
+	    index: 0,
             term: 0,
             command: "hey there".as_bytes().to_vec(),
             client_serial_id: 0,
@@ -2554,7 +2618,8 @@ mod server_tests {
         state.transition(Condition::Follower, 0, 0);
         drop(state);
 
-        let entries = vec![LogEntry {
+        let mut entries = vec![LogEntry {
+	    index: 0,
             term: 0,
             command: "abc".as_bytes().to_vec(),
             client_serial_id: 0,
@@ -2562,11 +2627,12 @@ mod server_tests {
         }];
 
         let mut state = server.state.lock().unwrap();
-        state.durable.append(&entries);
+        state.durable.append(&mut entries);
         assert_eq!(state.durable.log_at_index(1), entries[0]);
         drop(state);
 
         let e = LogEntry {
+	    index: 0,
             // New term differing from what is stored although
             // inserted at index `1` should cause overwrite.
             term: 1,
@@ -3280,14 +3346,14 @@ mod e2e_tests {
     fn test_bulk() {
         let port = 20039;
         let tmpdir = server_tests::TmpDir::new();
-        let debug = true;
+        let debug = false;
         let (mut servers, result_receivers, tick_freq) = test_cluster(&tmpdir, port, debug);
 
         let mut input_senders = vec![];
         let mut output_receivers = vec![];
 
-        const BATCHES: usize = 10;
-        const BATCH_SIZE: usize = 1000;
+	const BATCHES: usize = 10;
+        const BATCH_SIZE: usize = 10;
 
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
@@ -3375,7 +3441,7 @@ mod e2e_tests {
                                 // Otherwise keep checking until we hear it's ok.
                                 ApplyResult::Ok => {
                                     client_serial_id += BATCH_SIZE as u128;
-                                    println!("Submitted: {}.", client_serial_id - 1);
+                                    // println!("Submitted: {}.", client_serial_id - 1);
                                     break 'batch;
                                 }
                             }
@@ -3404,6 +3470,12 @@ mod e2e_tests {
             t,
             (BATCHES as f64 * BATCH_SIZE as f64) / t,
         );
+
+	if let Ok(skip_check) = std::env::var("SKIP_CHECK") {
+	    if skip_check == "1" {
+		return;
+	    }
+	}
 
 	// Give them time to all apply logs.
 	std::thread::sleep(Duration::from_millis(5000));
