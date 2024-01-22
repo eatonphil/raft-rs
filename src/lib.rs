@@ -1931,7 +1931,7 @@ impl<SM: StateMachine> Server<SM> {
             state: Mutex::new(State {
                 durable: DurableState::new(data_directory, id),
                 volatile: VolatileState::new(cluster_size, election_frequency, rand),
-                logger: logger,
+                logger,
                 stopped: false,
                 notifications: Vec::new(),
             }),
