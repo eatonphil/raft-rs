@@ -3357,8 +3357,8 @@ mod e2e_tests {
         let mut input_senders = vec![];
         let mut output_receivers = vec![];
 
-        const BATCHES: usize = 200;
-        const BATCH_SIZE: usize = 500;
+        const BATCHES: usize = 100;
+        const BATCH_SIZE: usize = 1000;
 
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
@@ -3491,7 +3491,7 @@ mod e2e_tests {
         }
 
         // Give them time to all apply logs.
-        std::thread::sleep(Duration::from_millis(5000));
+        std::thread::sleep(Duration::from_millis(10000));
 
         // Now shut down all servers.
         for sender in input_senders.iter() {
@@ -3509,6 +3509,7 @@ mod e2e_tests {
             let mut match_index: u64 = 0;
             let mut checked_index = 0;
 
+	    println!("Checking for {}.", server.config.server_id);
             assert_eq!(
                 state.durable.debug_client_entry_count(),
                 BATCH_SIZE as u64 * BATCHES as u64
