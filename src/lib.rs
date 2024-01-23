@@ -2029,37 +2029,37 @@ impl<SM: StateMachine> Server<SM> {
         // Read from the backlog at least once and for at most 5ms.
         let until = Instant::now() + Duration::from_millis(5);
         loop {
-	    if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
-		let state = self.state.lock().unwrap();
+            if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
+                let state = self.state.lock().unwrap();
 
-		// "If a server receives a request with a stale term
-		// number, it rejects the request." - Reference [0] Page 5.
-		// Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
-		let stale = msg.term() < state.durable.current_term;
+                // "If a server receives a request with a stale term
+                // number, it rejects the request." - Reference [0] Page 5.
+                // Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
+                let stale = msg.term() < state.durable.current_term;
 
-		state.log(format!(
+                state.log(format!(
                     "{} message from {}: {:?}.",
                     if stale { "Dropping stale" } else { "Received" },
                     msg.from,
                     msg.body,
-		));
-		drop(state);
-		if stale {
+                ));
+                drop(state);
+                if stale {
                     continue;
-		}
+                }
 
-		if let Some((response, from)) = self.handle_message(msg) {
+                if let Some((response, from)) = self.handle_message(msg) {
                     let state = self.state.lock().unwrap();
                     let condition = state.volatile.condition;
                     let log_length = state.durable.next_log_index;
                     drop(state);
 
                     self.rpc_manager
-			.send(log_length, condition, from, &response);
-		}
-	    } else {
-		break;
-	    }
+                        .send(log_length, condition, from, &response);
+                }
+            } else {
+                break;
+            }
 
             if Instant::now() > until {
                 break;
@@ -3455,28 +3455,26 @@ mod e2e_tests {
         println!("Submitted batches.");
 
         // Wait for completion.
-	let (sender, receiver) = mpsc::channel();
-	while result_receivers.len() > 0 {
-	    let receiver = result_receivers.pop().unwrap();
-	    let sender_clone = sender.clone();
-	    std::thread::spawn(move || {
-		loop {
-		    if let Ok(_) = receiver.recv() {
-			sender_clone.send(1).unwrap();
-			continue;
-		    }
+        let (sender, receiver) = mpsc::channel();
+        while result_receivers.len() > 0 {
+            let receiver = result_receivers.pop().unwrap();
+            let sender_clone = sender.clone();
+            std::thread::spawn(move || loop {
+                if let Ok(_) = receiver.recv() {
+                    sender_clone.send(1).unwrap();
+                    continue;
+                }
 
-		    return;
-		}
-	    });
+                return;
+            });
         }
 
-	let mut seen = 0;
-	while seen < BATCHES * BATCH_SIZE {
-	    if let Ok(_) = receiver.recv() {
-		seen += 1;
-	    }
-	}
+        let mut seen = 0;
+        while seen < BATCHES * BATCH_SIZE {
+            if let Ok(_) = receiver.recv() {
+                seen += 1;
+            }
+        }
 
         let t = (Instant::now() - t1).as_secs_f64();
         println!(
