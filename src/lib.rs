@@ -90,68 +90,8 @@ impl PageCache {
             return;
         }
 
-        if true {
-            self.file.read_exact_at(&mut buf_into[0..], offset).unwrap();
-            self.insert_or_replace_in_cache(offset, *buf_into);
-            return;
-        }
-
-        // Try to always read 64KiB at a time.
-        const SUPER_BUF_SIZE: usize = 65536;
-
-        // TODO: Track file size ourselves? TODO: next_log_offset is the file size.
-        let file_size = self.file.metadata().unwrap().len();
-
-        // Find the 64KiB chunk (or as big as we can) where `offset` falls inside.
-        let mut read_offset = 0;
-        loop {
-            let next_offset = read_offset + SUPER_BUF_SIZE as u64;
-            if next_offset >= file_size {
-                break;
-            }
-
-            if next_offset > offset {
-                break;
-            }
-
-            if next_offset + SUPER_BUF_SIZE as u64 > file_size {
-                if file_size < SUPER_BUF_SIZE as u64 {
-                    read_offset = 0;
-                } else {
-                    read_offset = file_size - SUPER_BUF_SIZE as u64;
-                }
-                break;
-            }
-
-            read_offset = next_offset;
-        }
-        let to_read = std::cmp::min(file_size - read_offset, SUPER_BUF_SIZE as u64);
-
-        // Make sure offset + PAGESIZE is within read_offset + to_read.
-        assert_eq!(to_read % PAGESIZE, 0);
-        assert!(offset >= read_offset);
-        //println!("{offset} + {PAGESIZE} <= {read_offset} + {to_read} of {file_size}");
-        assert!(offset + PAGESIZE <= read_offset + to_read);
-        assert!(read_offset + PAGESIZE <= file_size);
-
-        let mut super_buf = vec![0; to_read as usize];
-        self.file
-            .read_exact_at(&mut super_buf, read_offset)
-            .unwrap();
-
-        // Store super_buf in pagecache.
-        let mut i: u64 = 0;
-        while i < to_read {
-            buf_into.copy_from_slice(&super_buf[i as usize..(i + PAGESIZE) as usize]);
-            self.insert_or_replace_in_cache(offset + i, *buf_into);
-            i += PAGESIZE;
-        }
-
-        // Return the requested page.
-        let offset_in_super_buf = (offset - read_offset) as usize;
-        buf_into.copy_from_slice(
-            &super_buf[offset_in_super_buf..offset_in_super_buf + PAGESIZE as usize],
-        );
+        self.file.read_exact_at(&mut buf_into[0..], offset).unwrap();
+        self.insert_or_replace_in_cache(offset, *buf_into);
     }
 
     fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
@@ -3359,6 +3299,7 @@ mod e2e_tests {
 
         const BATCHES: usize = 100;
         const BATCH_SIZE: usize = 1000;
+	const INNER_BATCH:usize = 10;
 
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
@@ -3408,8 +3349,11 @@ mod e2e_tests {
         for i in 0..BATCHES {
             let mut batch = vec![vec![]; BATCH_SIZE];
             for j in 0..BATCH_SIZE {
-                let msg = i * BATCH_SIZE + j;
-                batch[j] = msg.to_le_bytes().to_vec();
+		batch[j] = vec![];
+		for k in 0..INNER_BATCH {
+                    let msg = i * BATCH_SIZE + j * BATCH_SIZE + k;
+                    batch[j].extend(msg.to_le_bytes().to_vec());
+		}
             }
             batches.push(batch);
         }
@@ -3472,16 +3416,16 @@ mod e2e_tests {
         let mut seen = 0;
         while seen < BATCHES * BATCH_SIZE {
             if let Ok(_) = receiver.recv() {
-                seen += 1;
+                seen += INNER_BATCH;
             }
         }
 
         let t = (Instant::now() - t1).as_secs_f64();
         println!(
             "All batches (total entries: {}) complete in {}s. Throughput: {}/s.",
-            BATCHES * BATCH_SIZE,
+            BATCHES * BATCH_SIZE * INNER_BATCH,
             t,
-            (BATCHES as f64 * BATCH_SIZE as f64) / t,
+            (BATCHES as f64 * BATCH_SIZE as f64 * INNER_BATCH as f64) / t,
         );
 
         if let Ok(skip_check) = std::env::var("SKIP_CHECK") {
@@ -3515,13 +3459,16 @@ mod e2e_tests {
                 BATCH_SIZE as u64 * BATCHES as u64
             );
 
-            while match_index < BATCH_SIZE as u64 * BATCHES as u64 {
-                let expected_msg = match_index.to_le_bytes().to_vec();
+            while match_index < BATCH_SIZE as u64 * BATCHES as u64 * INNER_BATCH as u64 {
+                let mut expected_msg = vec![];
+		for _ in 0..INNER_BATCH {
+		    expected_msg.extend(match_index.to_le_bytes().to_vec());
+		}
                 let e = state.durable.log_at_index(checked_index);
 
                 // It must only EITHER be 1) the one we expect or 2) an empty command.
                 if e.command == expected_msg {
-                    match_index += 1;
+                    match_index += INNER_BATCH as u64;
                 } else {
                     assert_eq!(e.command.len(), 0);
                 }
