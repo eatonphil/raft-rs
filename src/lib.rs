@@ -2029,35 +2029,37 @@ impl<SM: StateMachine> Server<SM> {
         // Read from the backlog at least once and for at most 5ms.
         let until = Instant::now() + Duration::from_millis(5);
         loop {
-            if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
-                let state = self.state.lock().unwrap();
+	    if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
+		let state = self.state.lock().unwrap();
 
-                // "If a server receives a request with a stale term
-                // number, it rejects the request." - Reference [0] Page 5.
-                // Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
-                let stale = msg.term() < state.durable.current_term;
+		// "If a server receives a request with a stale term
+		// number, it rejects the request." - Reference [0] Page 5.
+		// Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
+		let stale = msg.term() < state.durable.current_term;
 
-                state.log(format!(
+		state.log(format!(
                     "{} message from {}: {:?}.",
                     if stale { "Dropping stale" } else { "Received" },
                     msg.from,
                     msg.body,
-                ));
-                drop(state);
-                if stale {
+		));
+		drop(state);
+		if stale {
                     continue;
-                }
+		}
 
-                if let Some((response, from)) = self.handle_message(msg) {
+		if let Some((response, from)) = self.handle_message(msg) {
                     let state = self.state.lock().unwrap();
                     let condition = state.volatile.condition;
                     let log_length = state.durable.next_log_index;
                     drop(state);
 
                     self.rpc_manager
-                        .send(log_length, condition, from, &response);
-                }
-            }
+			.send(log_length, condition, from, &response);
+		}
+	    } else {
+		break;
+	    }
 
             if Instant::now() > until {
                 break;
@@ -3350,13 +3352,13 @@ mod e2e_tests {
         let port = 20039;
         let tmpdir = server_tests::TmpDir::new();
         let debug = false;
-        let (mut servers, result_receivers, tick_freq) = test_cluster(&tmpdir, port, debug);
+        let (mut servers, mut result_receivers, tick_freq) = test_cluster(&tmpdir, port, debug);
 
         let mut input_senders = vec![];
         let mut output_receivers = vec![];
 
-        const BATCHES: usize = 10;
-        const BATCH_SIZE: usize = 10;
+        const BATCHES: usize = 200;
+        const BATCH_SIZE: usize = 500;
 
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
@@ -3375,24 +3377,20 @@ mod e2e_tests {
 
             std::thread::spawn(move || {
                 loop {
-                    loop {
-                        if let Ok((msgs, ids)) = input_receiver.try_recv() {
-                            // println!("Server received message: {:?}, {:?}.", msgs, ids);
-                            // Gracefully shut down when we receive an
-                            // empty message, so that we can gracefully
-                            // shut down when we're done in this test.
-                            if msgs.len() == 0 {
-                                println!("Shutting server down.");
-                                server.stop();
-                                drop(server);
-                                return;
-                            }
-
-                            let result = server.apply(msgs, ids);
-                            output_sender.send(result).unwrap();
-                        } else {
-                            break;
+                    for (msgs, ids) in input_receiver.try_iter() {
+                        // println!("Server received message: {:?}, {:?}.", msgs, ids);
+                        // Gracefully shut down when we receive an
+                        // empty message, so that we can gracefully
+                        // shut down when we're done in this test.
+                        if msgs.len() == 0 {
+                            println!("Shutting server down.");
+                            server.stop();
+                            drop(server);
+                            return;
                         }
+
+                        let result = server.apply(msgs, ids);
+                        output_sender.send(result).unwrap();
                     }
 
                     server.tick();
@@ -3457,14 +3455,28 @@ mod e2e_tests {
         println!("Submitted batches.");
 
         // Wait for completion.
-        let mut seen = 0;
-        while seen < BATCHES * BATCH_SIZE {
-            for receiver in result_receivers.iter() {
-                if receiver.try_recv().is_ok() {
-                    seen += 1;
-                }
-            }
+	let (sender, receiver) = mpsc::channel();
+	while result_receivers.len() > 0 {
+	    let receiver = result_receivers.pop().unwrap();
+	    let sender_clone = sender.clone();
+	    std::thread::spawn(move || {
+		loop {
+		    if let Ok(_) = receiver.recv() {
+			sender_clone.send(1).unwrap();
+			continue;
+		    }
+
+		    return;
+		}
+	    });
         }
+
+	let mut seen = 0;
+	while seen < BATCHES * BATCH_SIZE {
+	    if let Ok(_) = receiver.recv() {
+		seen += 1;
+	    }
+	}
 
         let t = (Instant::now() - t1).as_secs_f64();
         println!(
