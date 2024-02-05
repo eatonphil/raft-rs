@@ -1622,11 +1622,11 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         let log_length = state.durable.next_log_index;
-	// NOTE: Maybe the starting point to check can be optimized
-	// but be careful.  One iteration tried to do the highest
-	// common match_index. The problem is that if one node is
-	// down, the highest common index may even be 0 even though
-	// the cluster *could* make progress.
+        // NOTE: Maybe the starting point to check can be optimized
+        // but be careful.  One iteration tried to do the highest
+        // common match_index. The problem is that if one node is
+        // down, the highest common index may even be 0 even though
+        // the cluster *could* make progress.
 
         // Check from front to back.
         for i in (0..log_length).rev() {
@@ -2243,9 +2243,9 @@ mod server_tests {
             assert_eq!(durable.log_at_index(1 + i as u64), *entry);
         }
 
-	// Check in reverse as well.
-	for (i, entry) in all.iter().rev().enumerate() {
-	    let real_index = all.len() - i;
+        // Check in reverse as well.
+        for (i, entry) in all.iter().rev().enumerate() {
+            let real_index = all.len() - i;
             assert_eq!(durable.log_at_index(real_index as u64), *entry);
         }
     }
@@ -3141,7 +3141,7 @@ mod e2e_tests {
         servers: &mut Vec<Server<server_tests::TestStateMachine>>,
         tick_freq: Duration,
         skip_id: u128,
-	waiting_for: &Vec<u8>,
+        waiting_for: &Vec<u8>,
     ) {
         let mut applied = vec![false; servers.len()];
         let mut applied_at = vec![0; servers.len()];
@@ -3157,9 +3157,9 @@ mod e2e_tests {
                 let mut checked = state.volatile.commit_index + 1;
                 while checked > 0 {
                     checked -= 1;
-		    println!("Checking index: {checked}.");
+                    println!("Checking index: {checked}.");
 
-		    let log = state.durable.log_at_index(checked);
+                    let log = state.durable.log_at_index(checked);
                     let exists_in_log = log.command == *waiting_for;
                     if exists_in_log {
                         println!("Exists for {i} in log at entry: {checked}.");
@@ -3170,9 +3170,9 @@ mod e2e_tests {
                         applied[i] = true;
                         applied_at[i] = checked;
                     } else {
-			// There shouldn't be any other non-empty data.
-			assert_eq!(log.command.len(), 0);
-		    }
+                        // There shouldn't be any other non-empty data.
+                        assert_eq!(log.command.len(), 0);
+                    }
                 }
             }
 
@@ -3219,7 +3219,7 @@ mod e2e_tests {
         let leader_id = assert_leader_converge(&mut servers, tick_freq, skip_id);
         assert_ne!(leader_id, skip_id);
 
-	let msg = "abc".as_bytes().to_vec();
+        let msg = "abc".as_bytes().to_vec();
         let cmds = vec![msg.clone()];
         let cmd_ids = vec![1];
         let (apply_result, result_receiver) = 'apply_result: {
@@ -3275,8 +3275,8 @@ mod e2e_tests {
         let skip_id = 0; // 0 is so that none are skipped since 0 isn't a valid id.
         wait_for_all_applied(&mut servers, tick_freq, skip_id, &msg);
 
-	// Explicitly keep this around so the cluster sending results doesn't panic.
-	drop(senders);
+        // Explicitly keep this around so the cluster sending results doesn't panic.
+        drop(senders);
     }
 
     #[test]
@@ -3309,7 +3309,7 @@ mod e2e_tests {
 
         const BATCHES: usize = 100;
         const BATCH_SIZE: usize = 1000;
-	const INNER_BATCH:usize = 10;
+        const INNER_BATCH: usize = 10;
 
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
@@ -3359,11 +3359,11 @@ mod e2e_tests {
         for i in 0..BATCHES {
             let mut batch = vec![vec![]; BATCH_SIZE];
             for j in 0..BATCH_SIZE {
-		batch[j] = vec![];
-		for k in 0..INNER_BATCH {
+                batch[j] = vec![];
+                for k in 0..INNER_BATCH {
                     let msg = i * BATCH_SIZE + j * BATCH_SIZE + k;
                     batch[j].extend(msg.to_le_bytes().to_vec());
-		}
+                }
             }
             batches.push(batch);
         }
@@ -3463,7 +3463,7 @@ mod e2e_tests {
             let mut match_index: u64 = 0;
             let mut checked_index = 0;
 
-	    println!("Checking for {}.", server.config.server_id);
+            println!("Checking for {}.", server.config.server_id);
             assert_eq!(
                 state.durable.debug_client_entry_count(),
                 BATCH_SIZE as u64 * BATCHES as u64
@@ -3471,9 +3471,9 @@ mod e2e_tests {
 
             while match_index < BATCH_SIZE as u64 * BATCHES as u64 * INNER_BATCH as u64 {
                 let mut expected_msg = vec![];
-		for _ in 0..INNER_BATCH {
-		    expected_msg.extend(match_index.to_le_bytes().to_vec());
-		}
+                for _ in 0..INNER_BATCH {
+                    expected_msg.extend(match_index.to_le_bytes().to_vec());
+                }
                 let e = state.durable.log_at_index(checked_index);
 
                 // It must only EITHER be 1) the one we expect or 2) an empty command.
