@@ -2085,7 +2085,7 @@ mod server_tests {
     // Delete the temp directory when it goes out of scope.
     impl Drop for TmpDir {
         fn drop(&mut self) {
-            //std::fs::remove_dir_all(&self.dir).unwrap();
+            std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
 
