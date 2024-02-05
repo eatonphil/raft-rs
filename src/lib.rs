@@ -3110,13 +3110,14 @@ mod e2e_tests {
         // 1 Million batches of 10 preallocate before inserting into
         // cluster so that we don't measure allocation time.
         let mut batches = vec![];
-        for i in 0..BATCHES {
+        let mut msg: u64 = 0;
+        for _ in 0..BATCHES {
             let mut batch = vec![vec![]; BATCH_SIZE];
             for j in 0..BATCH_SIZE {
                 batch[j] = vec![];
-                for k in 0..INNER_BATCH {
-                    let msg = i * BATCH_SIZE + j * BATCH_SIZE + k;
+                for _ in 0..INNER_BATCH {
                     batch[j].extend(msg.to_le_bytes().to_vec());
+                    msg += 1;
                 }
             }
             batches.push(batch);
