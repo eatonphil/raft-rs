@@ -271,19 +271,6 @@ impl DurableState {
         }
     }
 
-    #[allow(dead_code)]
-    fn debug_client_entry_count(&mut self) -> u64 {
-        let mut count = 0;
-        for i in 0..self.next_log_index {
-            let e = self.log_at_index(i);
-            if !e.command.is_empty() {
-                count += 1;
-            }
-        }
-
-        count
-    }
-
     fn append(&mut self, entries: &mut [LogEntry]) {
         self.append_from_index(entries, self.next_log_index);
     }
@@ -1955,10 +1942,5 @@ impl Random {
     fn generate_percent(&mut self) -> f32 {
         let u = self.generate_u32();
         (u as f64 / u32::MAX as f64) as f32
-    }
-
-    #[allow(dead_code)]
-    fn generate_seed(&mut self) -> [u64; 4] {
-        [self.next(), self.next(), self.next(), self.next()]
     }
 }
