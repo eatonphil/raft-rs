@@ -1992,9 +1992,9 @@ impl<SM: StateMachine> Server<SM> {
                     .send(log_length, condition, from, &response);
             }
 
-	    if Instant::now() > until {
+            if Instant::now() > until {
                 break;
-	    }
+            }
         }
 
         let took = (Instant::now() - t1).as_millis();
@@ -3471,7 +3471,7 @@ mod e2e_tests {
                     expected_msg.extend((i as u64 + match_index).to_le_bytes().to_vec());
                 }
                 let e = state.durable.log_at_index(checked_index);
-		println!("{checked_index}: {:?} ?= {:?}", e.command, expected_msg);
+                println!("{checked_index}: {:?} ?= {:?}", e.command, expected_msg);
 
                 // It must only EITHER be 1) the one we expect or 2) an empty command.
                 if e.command == expected_msg {
