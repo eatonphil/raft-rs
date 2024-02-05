@@ -420,7 +420,7 @@ impl DurableState {
     fn log_at_index(&mut self, i: u64) -> LogEntry {
         let offset = self.offset_from_index(i);
         self.file.seek(std::io::SeekFrom::Start(offset)).unwrap();
-        
+
         LogEntry::decode(&mut self.file)
     }
 }
