@@ -1963,42 +1963,38 @@ impl<SM: StateMachine> Server<SM> {
 
         // Read from the backlog at least once and for at most 5ms.
         let until = Instant::now() + Duration::from_millis(5);
-        loop {
-            if let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
+        while let Ok(msg) = self.rpc_manager.stream_receiver.try_recv() {
+            let state = self.state.lock().unwrap();
+
+            // "If a server receives a request with a stale term
+            // number, it rejects the request." - Reference [0] Page 5.
+            // Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
+            let stale = msg.term() < state.durable.current_term;
+
+            state.log(format!(
+                "{} message from {}: {:?}.",
+                if stale { "Dropping stale" } else { "Received" },
+                msg.from,
+                msg.body,
+            ));
+            drop(state);
+            if stale {
+                continue;
+            }
+
+            if let Some((response, from)) = self.handle_message(msg) {
                 let state = self.state.lock().unwrap();
-
-                // "If a server receives a request with a stale term
-                // number, it rejects the request." - Reference [0] Page 5.
-                // Also: https://github.com/ongardie/raft.tla/blob/974fff7236545912c035ff8041582864449d0ffe/raft.tla#L413.
-                let stale = msg.term() < state.durable.current_term;
-
-                state.log(format!(
-                    "{} message from {}: {:?}.",
-                    if stale { "Dropping stale" } else { "Received" },
-                    msg.from,
-                    msg.body,
-                ));
+                let condition = state.volatile.condition;
+                let log_length = state.durable.next_log_index;
                 drop(state);
-                if stale {
-                    continue;
-                }
 
-                if let Some((response, from)) = self.handle_message(msg) {
-                    let state = self.state.lock().unwrap();
-                    let condition = state.volatile.condition;
-                    let log_length = state.durable.next_log_index;
-                    drop(state);
-
-                    self.rpc_manager
-                        .send(log_length, condition, from, &response);
-                }
-            } else {
-                break;
+                self.rpc_manager
+                    .send(log_length, condition, from, &response);
             }
 
-            if Instant::now() > until {
+	    if Instant::now() > until {
                 break;
-            }
+	    }
         }
 
         let took = (Instant::now() - t1).as_millis();
