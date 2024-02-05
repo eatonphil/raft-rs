@@ -1391,19 +1391,14 @@ impl<SM: StateMachine> Server<SM> {
         }
 
         let log_length = state.durable.next_log_index;
-        let mut max_common = log_length;
-        for (server_index, &match_index) in state.volatile.match_index.iter().enumerate() {
-            if self.config.server_index == server_index {
-                continue;
-            }
-
-            if match_index < max_common {
-                max_common = match_index;
-            }
-        }
+	// NOTE: Maybe the starting point to check can be optimized
+	// but be careful.  One iteration tried to do the highest
+	// common match_index. The problem is that if one node is
+	// down, the highest common index may even be 0 even though
+	// the cluster *could* make progress.
 
         // Check from front to back.
-        for i in (0..max_common).rev() {
+        for i in (0..log_length).rev() {
             let mut quorum = quorum_needed;
 
             // We don't need to keep checking backwards for a quorum
@@ -2010,6 +2005,12 @@ mod server_tests {
         assert_eq!(durable.next_log_index, 8);
         for (i, entry) in all.iter().enumerate() {
             assert_eq!(durable.log_at_index(1 + i as u64), *entry);
+        }
+
+	// Check in reverse as well.
+	for (i, entry) in all.iter().rev().enumerate() {
+	    let real_index = all.len() - i;
+            assert_eq!(durable.log_at_index(real_index as u64), *entry);
         }
     }
 
@@ -2894,6 +2895,7 @@ mod e2e_tests {
         servers: &mut Vec<Server<server_tests::TestStateMachine>>,
         tick_freq: Duration,
         skip_id: u128,
+	waiting_for: &Vec<u8>,
     ) {
         let mut applied = vec![false; servers.len()];
         let mut applied_at = vec![0; servers.len()];
@@ -2906,21 +2908,25 @@ mod e2e_tests {
                 server.tick();
 
                 let mut state = server.state.lock().unwrap();
-                let mut committed = state.volatile.commit_index + 1;
-                while committed > 0 {
-                    committed -= 1;
+                let mut checked = state.volatile.commit_index + 1;
+                while checked > 0 {
+                    checked -= 1;
+		    println!("Checking index: {checked}.");
 
-                    let exists_in_log =
-                        state.durable.log_at_index(committed).command == "abc".as_bytes().to_vec();
+		    let log = state.durable.log_at_index(checked);
+                    let exists_in_log = log.command == *waiting_for;
                     if exists_in_log {
-                        println!("Exists for {i} in log at entry: {committed}.");
+                        println!("Exists for {i} in log at entry: {checked}.");
                         // It should not exist twice in a different location.
                         if applied[i] {
-                            assert_eq!(applied_at[i], committed);
+                            assert_eq!(applied_at[i], checked);
                         }
                         applied[i] = true;
-                        applied_at[i] = committed;
-                    }
+                        applied_at[i] = checked;
+                    } else {
+			// There shouldn't be any other non-empty data.
+			assert_eq!(log.command.len(), 0);
+		    }
                 }
             }
 
@@ -2955,7 +2961,7 @@ mod e2e_tests {
 
     fn test_apply_skip_id(skip_id: u128, port: u16) {
         let tmpdir = server_tests::TmpDir::new();
-        let debug = false;
+        let debug = std::env::var("RAFT_DEBUG").unwrap_or("".into()) == "true";
         let (mut servers, results_receivers, tick_freq) = test_cluster(&tmpdir, port, debug);
 
         for server in servers.iter_mut() {
@@ -2967,7 +2973,8 @@ mod e2e_tests {
         let leader_id = assert_leader_converge(&mut servers, tick_freq, skip_id);
         assert_ne!(leader_id, skip_id);
 
-        let cmds = vec!["abc".as_bytes().to_vec()];
+	let msg = "abc".as_bytes().to_vec();
+        let cmds = vec![msg.clone()];
         let cmd_ids = vec![1];
         let (apply_result, result_receiver) = 'apply_result: {
             for (i, server) in servers.iter_mut().enumerate() {
@@ -2982,8 +2989,8 @@ mod e2e_tests {
         // Message should be applied in cluster within 20 ticks.
         for _ in 0..20 {
             if let ApplyResult::Ok = apply_result {
-                if let Ok(msg) = result_receiver.try_recv() {
-                    assert_eq!(msg, "abc".as_bytes().to_vec());
+                if let Ok(received) = result_receiver.try_recv() {
+                    assert_eq!(received, msg.clone());
                     break;
                 }
             } else {
@@ -3006,12 +3013,12 @@ mod e2e_tests {
         // required for committing, remember).  Actually this case
         // isn't meaningful unless we expanded the cluster size to
         // 5 because then a quorum would be 3.
-        wait_for_all_applied(&mut servers, tick_freq, skip_id);
+        wait_for_all_applied(&mut servers, tick_freq, skip_id, &msg);
 
         println!("\n\nBringing skipped server back.\n\n");
 
         drop(servers);
-        let (mut servers, _, tick_freq) = test_cluster(&tmpdir, port, debug);
+        let (mut servers, senders, tick_freq) = test_cluster(&tmpdir, port, debug);
 
         _ = assert_leader_converge(&mut servers, tick_freq, skip_id);
 
@@ -3020,7 +3027,10 @@ mod e2e_tests {
         // That is, a downed server should catch up with message
         // it missed when it does come back up.
         let skip_id = 0; // 0 is so that none are skipped since 0 isn't a valid id.
-        wait_for_all_applied(&mut servers, tick_freq, skip_id);
+        wait_for_all_applied(&mut servers, tick_freq, skip_id, &msg);
+
+	// Explicitly keep this around so the cluster sending results doesn't panic.
+	drop(senders);
     }
 
     #[test]
