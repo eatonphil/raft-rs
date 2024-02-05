@@ -10,16 +10,6 @@ use std::time::{Duration, Instant};
 
 const PAGESIZE: u64 = 512;
 
-#[derive(Debug, PartialEq)]
-pub enum ApplyResult {
-    NotALeader,
-    Ok,
-}
-
-pub trait StateMachine {
-    fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>>;
-}
-
 struct PageCache {
     // Backing file.
     file: std::fs::File,
@@ -544,7 +534,6 @@ impl DurableState {
             // Write out all new logs.
             for entry in entries.iter_mut() {
                 entry.index = self.next_log_index;
-                //println!("Entry at {} has index: {}.", self.next_log_offset, entry.index);
                 self.next_log_index += 1;
 
                 assert!(self.next_log_offset >= PAGESIZE);
@@ -593,8 +582,6 @@ impl DurableState {
             return self.next_log_offset;
         }
 
-        //println!("Looking for {index}.");
-
         assert!(index < self.next_log_index);
         let mut page: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
 
@@ -602,12 +589,10 @@ impl DurableState {
         // the page itself and then do a binary search on disk.
         let mut l = PAGESIZE;
         let mut r = self.next_log_offset - PAGESIZE;
-        //println!("l is {l}, r is {r}");
         while l <= r {
             let mut m = l + (r - l) / 2;
             // Round up to the nearest page.
             m += m % PAGESIZE;
-            //println!("M is {m}.");
             assert_eq!(m % PAGESIZE, 0);
 
             // Look for a start of entry page.
@@ -619,7 +604,6 @@ impl DurableState {
 
             // TODO: Bad idea to hardcode the offset.
             let current_index = u64::from_le_bytes(page[13..21].try_into().unwrap());
-            //println!("Index found at {m} is: {current_index}. Looking for {index}.");
             if current_index == index {
                 return m;
             }
@@ -638,8 +622,6 @@ impl DurableState {
             } else {
                 r = m - PAGESIZE;
             }
-
-            //println!("l is {l}, r is {r}. index is {index}");
         }
 
         unreachable!(
@@ -1272,6 +1254,16 @@ impl RPCManager {
         let bufwriter = BufWriter::new(stream.try_clone().unwrap());
         message.encode(server_id, bufwriter);
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ApplyResult {
+    NotALeader,
+    Ok,
+}
+
+pub trait StateMachine {
+    fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>>;
 }
 
 #[derive(Copy, Clone)]
