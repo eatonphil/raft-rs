@@ -550,6 +550,7 @@ impl DurableState {
                 assert!(self.next_log_offset >= PAGESIZE);
 
                 let pages = entry.encode(&mut buffer, &mut writer);
+		println!("Wrote {:?} at {}.", entry.command, entry.index);
                 self.next_log_offset += pages * PAGESIZE;
 
                 self.last_log_term = entry.term;
@@ -3305,7 +3306,7 @@ mod e2e_tests {
 
         const BATCHES: usize = 10;
         const BATCH_SIZE: usize = 10;
-        const INNER_BATCH: usize = 20;
+        const INNER_BATCH: usize = 10;
 
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
@@ -3352,13 +3353,14 @@ mod e2e_tests {
         // 1 Million batches of 10 preallocate before inserting into
         // cluster so that we don't measure allocation time.
         let mut batches = vec![];
-        for i in 0..BATCHES {
+	let mut msg: u64 = 0;
+        for _ in 0..BATCHES {
             let mut batch = vec![vec![]; BATCH_SIZE];
             for j in 0..BATCH_SIZE {
                 batch[j] = vec![];
-                for k in 0..INNER_BATCH {
-                    let msg = i * BATCH_SIZE + j * BATCH_SIZE + k;
+                for _ in 0..INNER_BATCH {
                     batch[j].extend(msg.to_le_bytes().to_vec());
+		    msg += 1;
                 }
             }
             batches.push(batch);
@@ -3471,12 +3473,13 @@ mod e2e_tests {
                     expected_msg.extend((i as u64 + match_index).to_le_bytes().to_vec());
                 }
                 let e = state.durable.log_at_index(checked_index);
-                println!("{checked_index}: {:?} ?= {:?}", e.command, expected_msg);
 
                 // It must only EITHER be 1) the one we expect or 2) an empty command.
                 if e.command == expected_msg {
+		    println!("Found {checked_index}: {:?} ?= {:?}", e.command, expected_msg);
                     match_index += INNER_BATCH as u64;
                 } else {
+		    println!("Checking {checked_index}: {:?} ?= {:?}", e.command, expected_msg);
                     assert_eq!(e.command.len(), 0);
                 }
 
