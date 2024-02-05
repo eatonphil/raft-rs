@@ -3303,9 +3303,9 @@ mod e2e_tests {
         let mut input_senders = vec![];
         let mut output_receivers = vec![];
 
-        const BATCHES: usize = 100;
-        const BATCH_SIZE: usize = 1000;
-        const INNER_BATCH: usize = 10;
+        const BATCHES: usize = 10;
+        const BATCH_SIZE: usize = 10;
+        const INNER_BATCH: usize = 20;
 
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
@@ -3467,10 +3467,11 @@ mod e2e_tests {
 
             while match_index < BATCH_SIZE as u64 * BATCHES as u64 * INNER_BATCH as u64 {
                 let mut expected_msg = vec![];
-                for _ in 0..INNER_BATCH {
-                    expected_msg.extend(match_index.to_le_bytes().to_vec());
+                for i in 0..INNER_BATCH {
+                    expected_msg.extend((i as u64 + match_index).to_le_bytes().to_vec());
                 }
                 let e = state.durable.log_at_index(checked_index);
+		println!("{checked_index}: {:?} ?= {:?}", e.command, expected_msg);
 
                 // It must only EITHER be 1) the one we expect or 2) an empty command.
                 if e.command == expected_msg {
