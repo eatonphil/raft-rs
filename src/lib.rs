@@ -1,7 +1,8 @@
 // References:
 // [0] In Search of an Understandable Consensus Algorithm (Extended Version) -- https://raft.github.io/raft.pdf
 
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryInto;
+use std::io::Seek;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::prelude::FileExt;
@@ -18,226 +19,6 @@ pub enum ApplyResult {
 
 pub trait StateMachine {
     fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>>;
-}
-
-struct PageCache {
-    // Backing file.
-    file: std::fs::File,
-
-    // Page cache. Maps file offset to page.
-    page_cache: std::collections::HashMap<u64, [u8; PAGESIZE as usize]>,
-    page_cache_size: usize,
-
-    // For buffering actual writes to disk.
-    buffer: Vec<u8>,
-    buffer_write_at: Option<u64>,
-    buffer_write_at_offset: u64,
-}
-
-impl PageCache {
-    fn new(file: std::fs::File, page_cache_size: usize) -> PageCache {
-        let mut page_cache = std::collections::HashMap::new();
-        // Allocate the space up front! The page cache should never
-        // allocate after this. This is a big deal.
-        page_cache.reserve(page_cache_size + 1);
-
-        PageCache {
-            file,
-            page_cache_size,
-            page_cache,
-
-            buffer: vec![],
-            buffer_write_at: None,
-            buffer_write_at_offset: 0,
-        }
-    }
-
-    fn insert_or_replace_in_cache(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
-        if self.page_cache_size == 0 {
-            return;
-        }
-
-        // If it's already in the cache, just overwrite it.
-        if let Some(existing) = self.page_cache.get(&offset) {
-            if page != *existing {
-                self.page_cache.insert(offset, page);
-            }
-            return;
-        }
-
-        // TODO: Come up with a better cache policy.
-        if self.page_cache.len() == self.page_cache_size {
-            self.page_cache.clear();
-        }
-
-        // Otherwise insert and evict something if we're out of space.
-        self.page_cache.insert(offset, page);
-    }
-
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
-        self.page_cache.len()
-    }
-
-    fn read(&mut self, offset: u64, buf_into: &mut [u8; PAGESIZE as usize]) {
-        // For now, must to read() while a `write()` is ongoing. See
-        // the comment in `self.write()`.
-        assert_eq!(self.buffer_write_at, None);
-
-        assert_eq!(buf_into.len(), PAGESIZE as usize);
-        if let Some(page) = self.page_cache.get(&offset) {
-            buf_into.copy_from_slice(page);
-            return;
-        }
-
-        self.file.read_exact_at(&mut buf_into[0..], offset).unwrap();
-        self.insert_or_replace_in_cache(offset, *buf_into);
-    }
-
-    fn write(&mut self, offset: u64, page: [u8; PAGESIZE as usize]) {
-        if self.buffer_write_at.is_none() {
-            self.buffer_write_at = Some(offset);
-            self.buffer_write_at_offset = offset;
-        } else {
-            // Make sure we're always doing sequential writes in
-            // between self.flush() call.
-            assert_eq!(self.buffer_write_at_offset, offset - PAGESIZE);
-            self.buffer_write_at_offset = offset;
-        }
-
-        assert_ne!(self.buffer_write_at, None);
-
-        // TODO: It is potentially unsafe if we are doing reads
-        // inbetween writes. That isn't possible in the current
-        // code. The case to worry about would be `self.write()`
-        // before `self.sync()` where the pagecache gets filled up and
-        // this particular page isn't in the pagecache and hasn't yet
-        // been written to disk. The only correct thing to do would be
-        // for `self.read()` to also check `self.buffer` before
-        // reading from disk.
-        self.buffer.extend(page);
-
-        self.insert_or_replace_in_cache(offset, page);
-    }
-
-    fn sync(&mut self) {
-        self.file
-            .write_all_at(&self.buffer, self.buffer_write_at.unwrap())
-            .unwrap();
-        self.buffer.clear();
-        self.buffer_write_at = None;
-        self.buffer_write_at_offset = 0;
-        self.file.sync_all().unwrap();
-    }
-}
-
-#[cfg(test)]
-mod pagecache_tests {
-    use super::*;
-
-    #[test]
-    fn test_pagecache() {
-        let tests = [0, 1, 100];
-        for cache_size in tests {
-            let tmp = server_tests::TmpDir::new();
-            let mut filename = tmp.dir.to_path_buf();
-            filename.push("test.dat");
-            let file = std::fs::File::options()
-                .create(true)
-                .read(true)
-                .write(true)
-                .open(filename.clone())
-                .expect("Could not open data file.");
-
-            let first_page = [b'a'; PAGESIZE as usize];
-            let third_page = [b'c'; PAGESIZE as usize];
-            let mut p = PageCache::new(file, cache_size);
-            p.write(0, first_page);
-            assert!(p.len() <= cache_size);
-            if cache_size > 0 {
-                assert!(p.len() > 0);
-            }
-            p.sync();
-
-            p.write(PAGESIZE * 2, third_page);
-            assert!(p.len() <= cache_size);
-            if cache_size > 0 {
-                assert!(p.len() > 0);
-            }
-            p.sync();
-
-            drop(p);
-
-            let mut file = std::fs::File::options()
-                .read(true)
-                .open(filename)
-                .expect("Could not open data file.");
-            let mut all_pages = [0; 3 * PAGESIZE as usize];
-            file.read_exact(&mut all_pages).unwrap();
-
-            let second_page = [0; PAGESIZE as usize];
-            assert_eq!(all_pages[0..PAGESIZE as usize], first_page);
-            assert_eq!(
-                all_pages[PAGESIZE as usize..2 * PAGESIZE as usize],
-                second_page
-            );
-            assert_eq!(
-                all_pages[2 * PAGESIZE as usize..3 * PAGESIZE as usize],
-                third_page
-            );
-
-            let mut p = PageCache::new(file, cache_size);
-            let mut page = [0; PAGESIZE as usize];
-            p.read(0, &mut page);
-            assert!(p.len() <= cache_size);
-            if cache_size > 0 {
-                assert!(p.len() > 0);
-            }
-            assert_eq!(page, first_page);
-            p.read(PAGESIZE, &mut page);
-            assert!(p.len() <= cache_size);
-            if cache_size > 0 {
-                assert!(p.len() > 0);
-            }
-            assert_eq!(page, second_page);
-            p.read(PAGESIZE * 2, &mut page);
-            assert!(p.len() <= cache_size);
-            if cache_size > 0 {
-                assert!(p.len() > 0);
-            }
-            assert_eq!(page, third_page);
-        }
-    }
-}
-
-struct PageCacheIO<'this> {
-    offset: u64,
-    pagecache: &'this mut PageCache,
-}
-
-impl<'this> Read for &mut PageCacheIO<'this> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        assert_eq!(buf.len(), PAGESIZE as usize);
-        let fixed_buf = <&mut [u8; PAGESIZE as usize]>::try_from(buf).unwrap();
-        self.pagecache.read(self.offset, fixed_buf);
-        self.offset += PAGESIZE;
-        Ok(PAGESIZE as usize)
-    }
-}
-
-impl<'this> Write for PageCacheIO<'this> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        assert_eq!(buf.len(), PAGESIZE as usize);
-        let fixed_buf = <&[u8; PAGESIZE as usize]>::try_from(buf).unwrap();
-        self.pagecache.write(self.offset, *fixed_buf);
-        self.offset += PAGESIZE;
-        Ok(PAGESIZE as usize)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.pagecache.sync();
-        Ok(())
-    }
 }
 
 //        ON DISK FORMAT
@@ -417,14 +198,6 @@ impl LogEntry {
         assert_eq!(stored_checksum, actual_checksum.sum());
         entry
     }
-
-    fn decode_from_pagecache(pagecache: &mut PageCache, offset: u64) -> (LogEntry, u64) {
-        let mut reader = PageCacheIO { offset, pagecache };
-        let entry = LogEntry::decode(&mut reader);
-        let offset = reader.offset;
-
-        (entry, offset)
-    }
 }
 
 struct DurableState {
@@ -432,7 +205,7 @@ struct DurableState {
     last_log_term: u64,
     next_log_index: u64,
     next_log_offset: u64,
-    pagecache: PageCache,
+    file: std::fs::File,
 
     // On-disk data.
     current_term: u64,
@@ -440,7 +213,7 @@ struct DurableState {
 }
 
 impl DurableState {
-    fn new(data_directory: &std::path::Path, id: u128, page_cache_size: usize) -> DurableState {
+    fn new(data_directory: &std::path::Path, id: u128) -> DurableState {
         let mut filename = data_directory.to_path_buf();
         filename.push(format!("server_{}.data", id));
         let file = std::fs::File::options()
@@ -453,7 +226,7 @@ impl DurableState {
             last_log_term: 0,
             next_log_index: 0,
             next_log_offset: PAGESIZE,
-            pagecache: PageCache::new(file, page_cache_size),
+            file,
 
             current_term: 0,
             voted_for: 0,
@@ -464,7 +237,7 @@ impl DurableState {
         // If there's nothing to restore, calling append with the
         // required 0th empty log entry will be sufficient to get
         // state into the right place.
-        if let Ok(m) = self.pagecache.file.metadata() {
+        if let Ok(m) = self.file.metadata() {
             if m.len() == 0 {
                 self.append(&mut [LogEntry {
                     index: 0,
@@ -478,7 +251,7 @@ impl DurableState {
         }
 
         let mut metadata: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
-        self.pagecache.read(0, &mut metadata);
+        self.file.read_exact_at(&mut metadata, 0).unwrap();
 
         // Magic number check.
         assert_eq!(metadata[0..4], 0xFABEF15E_u32.to_le_bytes());
@@ -497,13 +270,13 @@ impl DurableState {
         let log_length = u64::from_le_bytes(metadata[32..40].try_into().unwrap()) as usize;
 
         let mut scanned = 0;
+        self.file.seek(std::io::SeekFrom::Start(PAGESIZE)).unwrap();
         while scanned < log_length {
             self.next_log_index += 1;
 
-            let (e, new_offset) =
-                LogEntry::decode_from_pagecache(&mut self.pagecache, self.next_log_offset);
+            let e = LogEntry::decode(&mut self.file);
             self.last_log_term = e.term;
-            self.next_log_offset = new_offset;
+            self.next_log_offset = self.file.stream_position().unwrap();
             scanned += 1;
         }
     }
@@ -536,10 +309,9 @@ impl DurableState {
         // what the current last log index is always correct.
         self.next_log_index = from_index;
 
-        let mut writer = PageCacheIO {
-            offset: self.next_log_offset,
-            pagecache: &mut self.pagecache,
-        };
+        self.file
+            .seek(std::io::SeekFrom::Start(self.next_log_offset))
+            .unwrap();
         if !entries.is_empty() {
             // Write out all new logs.
             for entry in entries.iter_mut() {
@@ -549,13 +321,11 @@ impl DurableState {
 
                 assert!(self.next_log_offset >= PAGESIZE);
 
-                let pages = entry.encode(&mut buffer, &mut writer);
+                let pages = entry.encode(&mut buffer, &mut self.file);
                 self.next_log_offset += pages * PAGESIZE;
 
                 self.last_log_term = entry.term;
             }
-
-            writer.flush().unwrap();
         }
 
         // Write log length metadata.
@@ -583,8 +353,8 @@ impl DurableState {
         let checksum = crc32c(&metadata[0..40]);
         metadata[40..44].copy_from_slice(&checksum.to_le_bytes());
 
-        self.pagecache.write(0, metadata);
-        self.pagecache.sync();
+        self.file.write_all_at(&metadata, 0).unwrap();
+        self.file.sync_all().unwrap();
     }
 
     fn offset_from_index(&mut self, index: u64) -> u64 {
@@ -610,10 +380,10 @@ impl DurableState {
             assert_eq!(m % PAGESIZE, 0);
 
             // Look for a start of entry page.
-            self.pagecache.read(m, &mut page);
+            self.file.read_exact_at(&mut page, m).unwrap();
             while page[0] != 1 {
                 m -= PAGESIZE;
-                self.pagecache.read(m, &mut page);
+                self.file.read_exact_at(&mut page, m).unwrap();
             }
 
             // TODO: Bad idea to hardcode the offset.
@@ -627,10 +397,10 @@ impl DurableState {
                 // Read until the next entry, set m to the next entry.
                 page[0] = 0;
                 m += PAGESIZE;
-                self.pagecache.read(m, &mut page);
+                self.file.read_exact_at(&mut page, m).unwrap();
                 while page[0] != 1 {
                     m += PAGESIZE;
-                    self.pagecache.read(m, &mut page);
+                    self.file.read_exact_at(&mut page, m).unwrap();
                 }
 
                 l = m;
@@ -649,7 +419,8 @@ impl DurableState {
 
     fn log_at_index(&mut self, i: u64) -> LogEntry {
         let offset = self.offset_from_index(i);
-        let (entry, _) = LogEntry::decode_from_pagecache(&mut self.pagecache, offset);
+        self.file.seek(std::io::SeekFrom::Start(offset)).unwrap();
+        let entry = LogEntry::decode(&mut self.file);
         entry
     }
 }
@@ -1293,8 +1064,6 @@ pub struct Config {
 
     // Logger.
     logger_debug: bool,
-
-    page_cache_size: usize,
 }
 
 pub struct Server<SM: StateMachine> {
@@ -1711,7 +1480,7 @@ impl<SM: StateMachine> Server<SM> {
             let prev_log_index = std::cmp::max(next_index, 1) - 1;
 
             // Handle common case where we don't need to look up a log
-            // from pagecache if we're at the latest entry.
+            // from disk if we're at the latest entry.
             let prev_log_term =
                 if prev_log_index == std::cmp::max(state.durable.next_log_index, 1) - 1 {
                     state.durable.last_log_term
@@ -2041,7 +1810,6 @@ impl<SM: StateMachine> Server<SM> {
 
         let rand = Random::new(config.random_seed);
         let id = config.server_id;
-        let page_cache_size = config.page_cache_size;
 
         let (apply_sender, apply_receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) =
             mpsc::channel();
@@ -2057,7 +1825,7 @@ impl<SM: StateMachine> Server<SM> {
                 apply_sender,
 
                 state: Mutex::new(State {
-                    durable: DurableState::new(data_directory, id, page_cache_size),
+                    durable: DurableState::new(data_directory, id),
                     volatile: VolatileState::new(cluster_size, election_frequency, rand),
                     logger,
                     stopped: false,
@@ -2102,7 +1870,7 @@ mod server_tests {
     fn test_update_and_restore() {
         let tmp = TmpDir::new();
 
-        let mut durable = DurableState::new(&tmp.dir, 1, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, 0);
@@ -2134,7 +1902,7 @@ mod server_tests {
         );
         drop(durable);
 
-        let mut durable = DurableState::new(&tmp.dir, 1, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1);
         assert_eq!(durable.current_term, 0);
         assert_eq!(durable.voted_for, 0);
         assert_eq!(durable.next_log_index, 0);
@@ -2186,7 +1954,7 @@ mod server_tests {
         });
 
         // Write two entries and shut down.
-        let mut durable = DurableState::new(&tmp.dir, 1, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(durable.next_log_index, 1);
         durable.append(&mut v);
@@ -2195,7 +1963,7 @@ mod server_tests {
         drop(durable);
 
         // Start up and restore. Should have three entries.
-        let mut durable = DurableState::new(&tmp.dir, 1, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(prev_offset, durable.next_log_offset);
         assert_eq!(durable.next_log_index, 3);
@@ -2241,7 +2009,7 @@ mod server_tests {
         drop(durable);
 
         // Start up and restore. Should now have 8 entries.
-        let mut durable = DurableState::new(&tmp.dir, 1, 1);
+        let mut durable = DurableState::new(&tmp.dir, 1);
         durable.restore();
         assert_eq!(durable.next_log_index, 8);
         for (i, entry) in all.iter().enumerate() {
@@ -2375,7 +2143,6 @@ mod server_tests {
 
             random_seed: [0; 4],
             logger_debug: debug,
-            page_cache_size: 100,
         };
 
         let sm = TestStateMachine {};
@@ -3022,14 +2789,6 @@ mod e2e_tests {
             })
         }
 
-        let page_cache_size = match std::env::var("PAGECACHE") {
-            Ok(var) => match var.parse::<usize>() {
-                Ok(size) => size,
-                _ => 1000,
-            },
-            _ => 1000,
-        };
-
         let mut servers = vec![];
         let mut results_receivers = vec![];
         let mut per_server_random_seed_generator = Random::new(random_seed);
@@ -3044,7 +2803,6 @@ mod e2e_tests {
                 random_seed: per_server_random_seed_generator.generate_seed(),
 
                 logger_debug: debug,
-                page_cache_size,
             };
 
             let sm = server_tests::TestStateMachine {};
@@ -3299,7 +3057,7 @@ mod e2e_tests {
 
         const BATCHES: usize = 100;
         const BATCH_SIZE: usize = 1000;
-	const INNER_BATCH:usize = 10;
+        const INNER_BATCH: usize = 10;
 
         while servers.len() > 0 {
             let (input_sender, input_receiver): (
@@ -3349,11 +3107,11 @@ mod e2e_tests {
         for i in 0..BATCHES {
             let mut batch = vec![vec![]; BATCH_SIZE];
             for j in 0..BATCH_SIZE {
-		batch[j] = vec![];
-		for k in 0..INNER_BATCH {
+                batch[j] = vec![];
+                for k in 0..INNER_BATCH {
                     let msg = i * BATCH_SIZE + j * BATCH_SIZE + k;
                     batch[j].extend(msg.to_le_bytes().to_vec());
-		}
+                }
             }
             batches.push(batch);
         }
@@ -3453,7 +3211,7 @@ mod e2e_tests {
             let mut match_index: u64 = 0;
             let mut checked_index = 0;
 
-	    println!("Checking for {}.", server.config.server_id);
+            println!("Checking for {}.", server.config.server_id);
             assert_eq!(
                 state.durable.debug_client_entry_count(),
                 BATCH_SIZE as u64 * BATCHES as u64
@@ -3461,9 +3219,9 @@ mod e2e_tests {
 
             while match_index < BATCH_SIZE as u64 * BATCHES as u64 * INNER_BATCH as u64 {
                 let mut expected_msg = vec![];
-		for _ in 0..INNER_BATCH {
-		    expected_msg.extend(match_index.to_le_bytes().to_vec());
-		}
+                for _ in 0..INNER_BATCH {
+                    expected_msg.extend(match_index.to_le_bytes().to_vec());
+                }
                 let e = state.durable.log_at_index(checked_index);
 
                 // It must only EITHER be 1) the one we expect or 2) an empty command.
